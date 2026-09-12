@@ -307,11 +307,6 @@ function Get-AvdLocalFileInfo {
     [pscustomobject]@{ Exists = $true; Attributes = [long]$fi.Attributes; Length = $fi.Length }
 }
 
-function Test-AvdNonEmptyFile {
-    param([Parameter(Mandatory)][string]$Path)
-    (Test-Path -LiteralPath $Path -PathType Leaf) -and (Get-Item -LiteralPath $Path -Force).Length -gt 0
-}
-
 function New-AvdTempDirectory {
     param([string]$Prefix = 'avd-sync-')
     $d = Join-Path ([System.IO.Path]::GetTempPath()) ($Prefix + [guid]::NewGuid().ToString('N'))

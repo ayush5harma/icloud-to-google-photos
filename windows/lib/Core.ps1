@@ -632,6 +632,15 @@ function Read-AvdLine {
     , $lines.ToArray()
 }
 
+# `[ -s file ]`: the file exists and is not empty. One definition for every
+# part: they share one module scope, where a second definition of a name
+# silently replaces the first.
+function Test-AvdNonEmptyFile {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Path)
+    if (-not $Path) { return $false }
+    (Test-Path -LiteralPath $Path -PathType Leaf) -and (Get-Item -LiteralPath $Path -Force).Length -gt 0
+}
+
 # Lines in a file, 0 for an empty or missing one (count_lines).
 function Measure-AvdLine {
     param([Parameter(Mandatory)][string]$Path)

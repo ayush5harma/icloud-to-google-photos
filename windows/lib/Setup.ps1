@@ -310,13 +310,6 @@ function Test-AvdOkLine {
     @((ConvertTo-AvdLf $Text).Split("`n")) -ccontains 'ok'
 }
 
-# `[ -s file ]`
-function Test-AvdNonEmptyFile {
-    param([Parameter(Mandatory)][AllowEmptyString()][string]$Path)
-    if (-not $Path) { return $false }
-    (Test-Path -LiteralPath $Path -PathType Leaf) -and (Get-Item -LiteralPath $Path -Force).Length -gt 0
-}
-
 function Get-AvdShortHash {
     param([AllowEmptyString()][string]$Hash)
     if ($Hash.Length -gt 16) { $Hash.Substring(0, 16) } else { $Hash }

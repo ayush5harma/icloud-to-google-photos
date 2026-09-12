@@ -36,6 +36,18 @@ Describe 'the config contract matches lib/config.sh' {
     }
 }
 
+Describe 'the module parts' {
+    It 'define every function once (they share one scope, where a second definition silently wins)' {
+        $names = foreach ($f in Get-ChildItem -LiteralPath (Join-Path $Root 'windows' 'lib') -Filter '*.ps1') {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
+            $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false) |
+                ForEach-Object { $_.Name }
+        }
+        $dupes = @($names | Group-Object | Where-Object Count -GT 1 | ForEach-Object Name)
+        $dupes | Should -BeNullOrEmpty
+    }
+}
+
 Describe 'the Windows tree' {
     It 'is ASCII only (no emoji, no typographic dashes; Windows PowerShell reads BOM-less UTF-8 as ANSI)' {
         foreach ($f in $WindowsFiles) {
