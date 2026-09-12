@@ -67,8 +67,20 @@ PLIST
   printf 'LOG=%q\n' "$LOG_DIR/launcher.log"
   cat <<'LAUNCH'
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$SDK_ROOT/platform-tools:/usr/bin:/bin:/usr/sbin:/sbin"
-SER="emulator-5554"
 PKG="com.google.android.apps.photos"
+
+# Which attached emulator IS ours: `adb emu avd name` answers "<name>\nOK".
+# emulator-5554 is only the first free console port, so another emulator started
+# earlier owns it, and this launcher would then bring a stranger's window
+# forward and launch Photos inside it.
+ours() {
+  local s n
+  for s in $(adb devices 2>/dev/null | awk '/^emulator-/ {print $1}'); do
+    n="$(adb -s "$s" emu avd name 2>/dev/null | head -1 | tr -d '\r\n')"
+    [ "$n" = "$AVD_NAME" ] && { printf '%s\n' "$s"; return 0; }
+  done
+  return 1
+}
 mkdir -p "$(dirname "$LOG")"
 say() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
 notify() { osascript -e "display notification \"$1\" with title \"Google Photos (AVD)\"" >/dev/null 2>&1; }
@@ -82,14 +94,20 @@ if ! pgrep -f "qemu-system.*$AVD_NAME" >/dev/null 2>&1; then
   "$SETUP" --start >>"$LOG" 2>&1 || { notify "The emulator failed to start"; exit 1; }
 fi
 
-# Wait for the device to answer before poking at it.
+# Wait for our device to attach and answer before poking at it.
+SER=""
 for _ in $(seq 1 60); do
-  [ "$(adb -s "$SER" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ] && break
-  sleep 2
+  SER="$(ours)" && [ -n "$SER" ] \
+    && [ "$(adb -s "$SER" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ] && break
+  SER=""; sleep 2
 done
+if [ -z "$SER" ]; then
+  say "no attached emulator answers to the name $AVD_NAME"
+  notify "The emulator did not come up"; exit 1
+fi
 
 adb -s "$SER" shell "monkey -p $PKG -c android.intent.category.LAUNCHER 1" >/dev/null 2>&1 \
-  && say "launched $PKG" || { say "could not launch $PKG"; notify "Could not open Google Photos"; }
+  && say "launched $PKG on $SER" || { say "could not launch $PKG"; notify "Could not open Google Photos"; }
 
 # Bring the emulator window to the front. The process is `qemu-system-...`, so
 # activating by application NAME does not work; go via its pid.

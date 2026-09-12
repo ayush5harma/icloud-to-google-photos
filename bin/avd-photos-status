@@ -16,10 +16,10 @@ set -uo pipefail
 LIB_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/../lib"
 # shellcheck disable=SC1091
 . "$LIB_DIR/config.sh"
+# shellcheck disable=SC1091
+. "$LIB_DIR/proc.sh"
 ap_load_config
 ap_seed_path "$AVD_SDK_ROOT/platform-tools"
-
-SER="emulator-5554"
 
 armed=false
 [ -f "$SENTINEL" ] && armed=true
@@ -33,17 +33,24 @@ staged=0
 
 ondev=0; uploaded=0; queued=0; failed=0; upl_age=-1
 if [ "$emu" = true ]; then
-  bounded() {
-    local out; out="$(mktemp)"
-    ( adb -s "$SER" shell "$@" >"$out" 2>/dev/null ) & local p=$! n=0
-    while kill -0 "$p" 2>/dev/null; do
-      [ "$n" -ge 6 ] && { kill -9 "$p" 2>/dev/null; break; }
-      sleep 1; n=$((n+1))
-    done
-    wait "$p" 2>/dev/null; tr -d '\r' <"$out"; rm -f "$out"
-  }
-  # On-device count is cheap and needs no root: just list the camera folder.
-  ondev="$(bounded "ls $DEST_DCIM 2>/dev/null | wc -l" | tr -dc '0-9')"
+  # ASK WHICH SERIAL IS OURS rather than assuming 5554: another emulator on this
+  # Mac would otherwise have its camera folder counted as this pipeline's
+  # backlog. An emulator that is running but cannot be resolved (still booting,
+  # or a wedged console) reports 0, which is what it is worth.
+  ser="$(ap_emulator_serial "$AVD_NAME")"
+  if [ -n "$ser" ]; then
+    bounded() {
+      local out; out="$(mktemp)"
+      ( adb -s "$ser" shell "$@" >"$out" 2>/dev/null ) & local p=$! n=0
+      while kill -0 "$p" 2>/dev/null; do
+        [ "$n" -ge 6 ] && { kill -9 "$p" 2>/dev/null; break; }
+        sleep 1; n=$((n+1))
+      done
+      wait "$p" 2>/dev/null; tr -d '\r' <"$out"; rm -f "$out"
+    }
+    # On-device count is cheap and needs no root: just list the camera folder.
+    ondev="$(bounded "ls $DEST_DCIM 2>/dev/null | wc -l" | tr -dc '0-9')"
+  fi
 fi
 
 # THE BACKLOG is staged files the ledger has not seen. `grep -c .` prints its own

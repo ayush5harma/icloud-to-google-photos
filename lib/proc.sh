@@ -63,6 +63,41 @@ dev_capture() {
   return "$_rc"
 }
 
+# ap_avd_name_of <serial> [secs]: the name of the AVD running on <serial>, via
+# adb's own `emu avd name` (which answers "<name>\nOK"). Bounded, because a
+# half-dead emulator answers this console command by never answering at all.
+ap_avd_name_of() {
+  local _ser="$1" _secs="${2:-10}" _out _pid _n=0
+  _out="$(mktemp)"
+  ( adb -s "$_ser" emu avd name >"$_out" 2>/dev/null </dev/null ) & _pid=$!
+  while kill -0 "$_pid" 2>/dev/null; do
+    if [ "$_n" -ge "$_secs" ]; then kill -9 "$_pid" 2>/dev/null; wait "$_pid" 2>/dev/null; rm -f "$_out"; return 124; fi
+    sleep 1; _n=$((_n+1))
+  done
+  wait "$_pid" 2>/dev/null
+  head -1 "$_out" | tr -d '\r\n'
+  rm -f "$_out"
+}
+
+# ap_emulator_serial <avd-name>: the adb serial whose running emulator IS
+# <avd-name>, or nothing (rc 1).
+#
+# NEVER ASSUME emulator-5554. It is only the FIRST free console port, so any
+# other emulator started earlier -- an app developer's, a CI job's, this
+# pipeline's own throwaway donor VM -- owns it instead, and every `adb -s
+# emulator-5554` in this project would then push photos into, query, prune from,
+# or `emu kill` a device that has nothing to do with the pipeline. Ask each
+# emulator its name and match.
+ap_emulator_serial() {
+  local _want="$1" _ser _name
+  while read -r _ser _; do
+    case "$_ser" in emulator-*) ;; *) continue ;; esac
+    _name="$(ap_avd_name_of "$_ser")"
+    if [ "$_name" = "$_want" ]; then printf '%s\n' "$_ser"; return 0; fi
+  done < <(adb devices 2>/dev/null | tail -n +2)
+  return 1
+}
+
 # single_flight_lock <dir> [notice-fn]: take <dir> as a lock (mkdir is the
 # portable atomic test-and-set -- macOS has no flock) and record this pid in
 # <dir>/pid. A launchd job whose calendar firings missed during sleep all land on
