@@ -101,7 +101,9 @@ if [ "$BOOTSTRAP" -eq 1 ]; then
 fi
 
 ap_seed_path "$SDK_ROOT/platform-tools"
-mkdir -p "$STAMPS"
+# Fatal: stamps/ holds the release tags AND the hashes each tag must keep
+# producing, so a run that cannot write it cannot verify anything it flashes.
+mkdir -p "$STAMPS" || { echo "ERROR: cannot create $STAMPS" >&2; exit 1; }
 
 # SINGLE INSTANCE (single_flight_lock, lib/proc.sh). The weekly agent can fire
 # while a manual run is mid-flight, and two concurrent phase_root runs race on
@@ -163,6 +165,8 @@ sdkm() {
 }
 
 stamp_get() { cat "$STAMPS/$1" 2>/dev/null; }
+# Returns the write's own status: verify_asset REFUSES an asset whose hash it
+# could not record, because a pin nobody can write is not a pin.
 stamp_set() { printf '%s' "$2" >"$STAMPS/$1"; }
 
 # Latest release JSON for a GitHub repo, memoised for an hour. Fetching each
@@ -245,8 +249,19 @@ verify_asset() {
     warn "  delete $STAMPS/sha-$key-$tag to accept the new bytes deliberately"
     return 1
   fi
-  [ -n "$want" ] || stamp_set "sha-$key-$tag" "$have"
-  step "$key $tag sha256 ${have:0:16}…${want:+ (matches the recorded hash)}"
+  if [ -z "$want" ]; then
+    # A RECORD THAT FAILS TO WRITE MUST FAIL THE CHECK. An unwritable stamps
+    # directory would otherwise disable the pin silently: every run would record
+    # nothing, find nothing recorded, and print a reassuring hash line while
+    # accepting whatever bytes arrived.
+    if ! stamp_set "sha-$key-$tag" "$have"; then
+      warn "could not record $key $tag's hash in $STAMPS — refusing it rather than pinning nothing"
+      return 1
+    fi
+    step "$key $tag sha256 ${have:0:16}… (recorded)"
+  else
+    step "$key $tag sha256 ${have:0:16}… (matches the recorded hash)"
+  fi
   return 0
 }
 
@@ -855,7 +870,14 @@ phonesky_fetch() {
   [ "$was_running" -eq 1 ] && boot_emulator
   if [ -s "$PHONESKY_CACHE" ]; then
     step "extracted Phonesky ($(( $(/usr/bin/stat -f %z "$PHONESKY_CACHE") / 1048576 )) MB)"
-    verify_asset phonesky "api$donor_api" "$PHONESKY_CACHE" || true
+    # RECORD, never refuse, on a LOCAL extraction. These bytes came out of
+    # Google's own certified image on this machine a moment ago, so they are the
+    # most trustworthy copy available; a mismatch here means the recorded hash
+    # came from a shared cache that disagrees, and the right answer is to keep
+    # what was just extracted and say so. The shared-cache path above is the
+    # opposite case -- another machine's file -- and there a mismatch is fatal.
+    verify_asset phonesky "api$donor_api" "$PHONESKY_CACHE" \
+      || warn "keeping the freshly extracted Phonesky despite that (a local extraction outranks a cached hash)"
     if [ -n "$PHONESKY_SHARED" ]; then
       mkdir -p "$(dirname "$PHONESKY_SHARED")" 2>/dev/null \
         && cp -f "$PHONESKY_CACHE" "$PHONESKY_SHARED" 2>/dev/null \
