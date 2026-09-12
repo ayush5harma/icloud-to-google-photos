@@ -24,67 +24,48 @@
 
 import AppKit
 
-// MARK: CLI mode -- run a command under this app's identity
+// MARK: CLI mode -- run the sync under this app's identity
 //
 // `PhotoSync --sync [args…]` runs avd-photos-sync as a CHILD of this binary and
-// waits for it; `--run <program> [args…]` does the same for anything. The point
-// is macOS's per-app file-provider permission: a launchd job's responsible
-// process is its own executable, so a bare /bin/bash gets "Operation not
-// permitted" on every directory of a cloud-provider mount (measured 2026-09-06:
-// six refusals in a row from launchd, while an interactive run of the same
-// script listed all 2,831 files in 12 ms) whereas a child of this app lists it
-// fine. Spawn-and-wait, NEVER exec: exec would swap this image for bash and the
-// identity with it.
+// waits for it. The point is macOS's per-app file-provider permission: a launchd
+// job's responsible process is its own executable, so a bare /bin/bash gets
+// "Operation not permitted" on every directory of a cloud-provider mount
+// (measured 2026-09-06: six refusals in a row from launchd, while an interactive
+// run of the same script listed all 2,831 files in 12 ms) whereas a child of
+// this app lists it fine. Spawn-and-wait, NEVER exec: exec would swap this image
+// for bash and the identity with it.
 //
 // FIRST THING IN THE FILE, before any global that touches AppKit:
 // `NSStatusBar.system` registers the process with LaunchServices as a running
 // copy of this app, and the UI's single-instance sweep would then terminate a
-// `--run` parent mid-sync. A CLI run must never look like a second meter.
-
-// Where the pipeline's scripts live. The launchd agents pass AVD_PHOTOS_BIN_DIR
-// (install.sh renders it in), so the app never has to guess; the rest is for a
-// hand-launched copy.
-func binDirCandidates() -> [String] {
-    let home = FileManager.default.homeDirectoryForCurrentUser.path
-    var dirs: [String] = []
-    if let d = ProcessInfo.processInfo.environment["AVD_PHOTOS_BIN_DIR"], !d.isEmpty { dirs.append(d) }
-    dirs += ["\(home)/.local/bin", "/usr/local/bin", "/opt/homebrew/bin"]
-    return dirs
-}
-
+// `--sync` parent mid-run. A CLI run must never look like a second meter.
+//
+// THERE IS NO GENERAL `--run`, AND THE SEARCH PATH IGNORES THE ENVIRONMENT.
+// A child of this app inherits the app's privacy grants, so anything that can
+// decide WHAT to run decides what gets those grants. An earlier version took the
+// directory from AVD_PHOTOS_BIN_DIR, which any caller can set
+// (`AVD_PHOTOS_BIN_DIR=/tmp/evil PhotoSync --run sh`), and a `--run` hatch that
+// accepted "one of the pipeline's own commands" was only as good as that
+// directory. Both are gone: the scripts are looked up in FIXED places only --
+// this bundle's own Resources/bin (a symlink install.sh creates before the
+// bundle is signed) and the standard user locations.
 func resolveScript(_ name: String) -> String {
-    for d in binDirCandidates() {
+    let fm = FileManager.default
+    let home = fm.homeDirectoryForCurrentUser.path
+    var dirs: [String] = []
+    if let res = Bundle.main.resourceURL?.appendingPathComponent("bin").path { dirs.append(res) }
+    dirs += ["\(home)/.local/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+    for d in dirs {
         let p = "\(d)/\(name)"
-        if FileManager.default.isExecutableFile(atPath: p) { return p }
+        if fm.isExecutableFile(atPath: p) { return p }
     }
     return ""
-}
-
-// A child of this app INHERITS the app's privacy grants -- that is the entire
-// point of --sync, and it is also why --run cannot be a general "run anything as
-// me" hatch: anything reachable through it would read the user's cloud mount
-// under this app's identity. So --run accepts only a command that resolves to a
-// file inside the pipeline's own bin directory, by basename or by a path that
-// lands there. Symlinks are resolved before the comparison, since the installed
-// commands ARE symlinks.
-func pipelineCommand(_ program: String) -> String? {
-    let fm = FileManager.default
-    let name = (program as NSString).lastPathComponent
-    guard !name.isEmpty, name != ".", name != ".." else { return nil }
-    let resolved = resolveScript(name)
-    guard !resolved.isEmpty else { return nil }
-    // A bare name is taken as that command. A path must point at the same file.
-    if program == name { return resolved }
-    let real = (program as NSString).resolvingSymlinksInPath
-    let realResolved = (resolved as NSString).resolvingSymlinksInPath
-    guard real == realResolved, fm.isExecutableFile(atPath: real) else { return nil }
-    return resolved
 }
 
 var cliChild: Process?
 func runUnderThisIdentity(_ argv: [String]) -> Never {
     guard let program = argv.first, !program.isEmpty else {
-        FileHandle.standardError.write(Data("usage: PhotoSync --sync [args…] | --run <program> [args…]\n".utf8))
+        FileHandle.standardError.write(Data("usage: PhotoSync --sync [args…]\n".utf8))
         exit(64)
     }
     let p = Process()
@@ -110,19 +91,16 @@ let cliArgs = Array(CommandLine.arguments.dropFirst())
 if cliArgs.first == "--sync" {
     let script = resolveScript("avd-photos-sync")
     if script.isEmpty {
-        FileHandle.standardError.write(Data("PhotoSync --sync: avd-photos-sync not found (set AVD_PHOTOS_BIN_DIR)\n".utf8))
+        FileHandle.standardError.write(Data(
+            "PhotoSync --sync: avd-photos-sync not found in this bundle or ~/.local/bin — re-run install.sh\n".utf8))
         exit(127)
     }
     runUnderThisIdentity(["/bin/bash", script] + cliArgs.dropFirst())
 }
 if cliArgs.first == "--run" {
-    let rest = Array(cliArgs.dropFirst())
-    guard let want = rest.first, let program = pipelineCommand(want) else {
-        FileHandle.standardError.write(Data(
-            "PhotoSync --run: only this pipeline's own commands may run under the app's identity\n".utf8))
-        exit(64)
-    }
-    runUnderThisIdentity([program] + rest.dropFirst())
+    FileHandle.standardError.write(Data(
+        "PhotoSync: --run was removed; only --sync runs under this app's identity\n".utf8))
+    exit(64)
 }
 
 // The launchd label prefix, and it must match lib/config.sh's AP_LABEL_PREFIX:

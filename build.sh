@@ -22,11 +22,19 @@ SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_NAME="${PHOTO_SYNC_APP_NAME:-Photo Sync}"
 DEST="${PHOTO_SYNC_APP_DIR:-/Applications}"
 FORCE=0
+# --bin-dir installs Contents/Resources/bin as a symlink to the directory holding
+# the pipeline's commands, BEFORE the bundle is signed. That link is how the app
+# finds avd-photos-sync and avd-photos-status: the app deliberately ignores the
+# environment for that decision (a caller-set variable would choose what runs
+# with the app's privacy grants), so a non-standard --prefix has to be recorded
+# somewhere only an installer can write.
+BIN_LINK=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --force) FORCE=1 ;;
     --dest) shift; DEST="${1:-}"; [ -n "$DEST" ] || { echo "--dest needs a directory" >&2; exit 2; } ;;
-    *) echo "usage: ${0##*/} [--force] [--dest <dir>]" >&2; exit 2 ;;
+    --bin-dir) shift; BIN_LINK="${1:-}"; [ -n "$BIN_LINK" ] || { echo "--bin-dir needs a directory" >&2; exit 2; } ;;
+    *) echo "usage: ${0##*/} [--force] [--dest <dir>] [--bin-dir <dir>]" >&2; exit 2 ;;
   esac
   shift
 done
@@ -50,6 +58,7 @@ SWIFTC="$(command -v swiftc 2>/dev/null || xcrun --find swiftc 2>/dev/null)"
 # artwork retries.
 if [ "$FORCE" -eq 0 ] && [ -x "$BIN" ] \
    && [ -f "$APP_DIR/Contents/Resources/AppIcon.icns" ] \
+   && { [ -z "$BIN_LINK" ] || [ "$(readlink "$APP_DIR/Contents/Resources/bin" 2>/dev/null)" = "$BIN_LINK" ]; } \
    && [ -z "$(find "$SRC_DIR/Sources" "$SRC_DIR/build.sh" -type f ! -name '.*' -newer "$BIN" -print -quit)" ]; then
   say "$APP_NAME is up to date"
   exit 0
@@ -155,6 +164,13 @@ build_icon() {
 ICON_WORK="$(mktemp -d "${TMPDIR:-/tmp}/photo-sync-icon.XXXXXX")"
 build_icon "$ICON_WORK" || say "the icon build failed — the bundle keeps the icon it had"
 rm -rf "$ICON_WORK"
+
+# The command directory, linked in BEFORE signing so the seal covers it.
+if [ -n "$BIN_LINK" ]; then
+  ln -sfn "$BIN_LINK" "$APP_DIR/Contents/Resources/bin" \
+    && say "commands: Resources/bin -> $BIN_LINK" \
+    || say "could not link Resources/bin — the app will fall back to ~/.local/bin"
+fi
 
 # Ad-hoc sign so macOS does not kill it for having no signature at all. This is a
 # locally built tool, so a real identity buys nothing here. It runs AFTER the

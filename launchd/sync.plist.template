@@ -35,10 +35,6 @@
     <string>-c</string>
     <string>app="__APP_BIN__"; n=0; while [ ! -x "$app" ]; do n=$((n+1)); [ "$n" -gt 60 ] &amp;&amp; { echo "$app never appeared - run build.sh" >&amp;2; exit 78; }; sleep 5; done; exec "$app" --sync</string>
   </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>AVD_PHOTOS_BIN_DIR</key><string>__BIN_DIR__</string>
-  </dict>
   <key>StartInterval</key><integer>900</integer>
   <key>RunAtLoad</key><true/>
   <key>ProcessType</key><string>Background</string>

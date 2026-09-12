@@ -9,9 +9,10 @@
   produced it yet on a fresh machine, and a missing binary under KeepAlive is a
   respawn-every-ten-seconds loop.
 
-  AVD_PHOTOS_BIN_DIR tells the app where the pipeline's scripts are, so the
-  status collector, "Offload from iCloud" and the --sync fallback all resolve
-  without guessing.
+  The app finds the pipeline's commands through the Resources/bin symlink
+  install.sh puts inside the bundle before signing it, and through the standard
+  user locations -- never through the environment, since whatever decides what
+  the app runs decides what inherits the app's privacy grants.
 -->
 <plist version="1.0">
 <dict>
@@ -22,10 +23,6 @@
     <string>-c</string>
     <string>app="__APP_BIN__"; while [ ! -x "$app" ]; do sleep 300; done; exec "$app"</string>
   </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>AVD_PHOTOS_BIN_DIR</key><string>__BIN_DIR__</string>
-  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Interactive</string>
