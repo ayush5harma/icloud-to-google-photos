@@ -22,12 +22,20 @@ SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_NAME="${PHOTO_SYNC_APP_NAME:-Photo Sync}"
 DEST="${PHOTO_SYNC_APP_DIR:-/Applications}"
 FORCE=0
-# --bin-dir installs Contents/Resources/bin as a symlink to the directory holding
-# the pipeline's commands, BEFORE the bundle is signed. That link is how the app
-# finds avd-photos-sync and avd-photos-status: the app deliberately ignores the
-# environment for that decision (a caller-set variable would choose what runs
-# with the app's privacy grants), so a non-standard --prefix has to be recorded
-# somewhere only an installer can write.
+# --bin-dir records the directory holding the pipeline's commands in the bundle's
+# Info.plist (AVDPhotosBinDir), BEFORE it is signed. That is how the app finds
+# avd-photos-sync and avd-photos-status: it deliberately ignores the environment
+# for that decision (a caller-set variable would choose what runs with the app's
+# privacy grants), so a non-standard --prefix has to be recorded somewhere only
+# an installer can write.
+#
+# A KEY, NOT A SYMLINK. The first version of this put Contents/Resources/bin in
+# the bundle as a symlink to the install prefix, and `codesign --verify --strict`
+# rejects that outright: "invalid destination for symbolic link in bundle". That
+# matters more than tidiness here -- the bundle identity IS the TCC identity, so
+# a seal that only passes the lax check is a grant that can evaporate at an OS
+# update. A plist key is sealed like any other byte of Info.plist and verifies
+# strictly.
 BIN_LINK=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -58,7 +66,7 @@ SWIFTC="$(command -v swiftc 2>/dev/null || xcrun --find swiftc 2>/dev/null)"
 # artwork retries.
 if [ "$FORCE" -eq 0 ] && [ -x "$BIN" ] \
    && [ -f "$APP_DIR/Contents/Resources/AppIcon.icns" ] \
-   && { [ -z "$BIN_LINK" ] || [ "$(readlink "$APP_DIR/Contents/Resources/bin" 2>/dev/null)" = "$BIN_LINK" ]; } \
+   && [ "$(/usr/bin/plutil -extract AVDPhotosBinDir raw "$APP_DIR/Contents/Info.plist" 2>/dev/null || true)" = "$BIN_LINK" ] \
    && [ -z "$(find "$SRC_DIR/Sources" "$SRC_DIR/build.sh" -type f ! -name '.*' -newer "$BIN" -print -quit)" ]; then
   say "$APP_NAME is up to date"
   exit 0
@@ -165,11 +173,18 @@ ICON_WORK="$(mktemp -d "${TMPDIR:-/tmp}/photo-sync-icon.XXXXXX")"
 build_icon "$ICON_WORK" || say "the icon build failed — the bundle keeps the icon it had"
 rm -rf "$ICON_WORK"
 
-# The command directory, linked in BEFORE signing so the seal covers it.
+# The command directory, recorded BEFORE signing so the seal covers it. An
+# earlier build of this project wrote a Resources/bin symlink here; remove it, or
+# a bundle upgraded in place keeps failing --strict for a link nothing reads.
+rm -f "$APP_DIR/Contents/Resources/bin"
 if [ -n "$BIN_LINK" ]; then
-  ln -sfn "$BIN_LINK" "$APP_DIR/Contents/Resources/bin" \
-    && say "commands: Resources/bin -> $BIN_LINK" \
-    || say "could not link Resources/bin — the app will fall back to ~/.local/bin"
+  /usr/bin/plutil -replace AVDPhotosBinDir -string "$BIN_LINK" "$APP_DIR/Contents/Info.plist" >/dev/null 2>&1 \
+    && say "commands: AVDPhotosBinDir = $BIN_LINK" \
+    || say "could not record AVDPhotosBinDir — the app will fall back to ~/.local/bin"
+else
+  # No --bin-dir: drop a value an earlier build recorded, so the bundle never
+  # points at a prefix that is no longer there.
+  /usr/bin/plutil -remove AVDPhotosBinDir "$APP_DIR/Contents/Info.plist" >/dev/null 2>&1 || true
 fi
 
 # Ad-hoc sign so macOS does not kill it for having no signature at all. This is a

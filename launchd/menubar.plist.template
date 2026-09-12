@@ -9,10 +9,10 @@
   produced it yet on a fresh machine, and a missing binary under KeepAlive is a
   respawn-every-ten-seconds loop.
 
-  The app finds the pipeline's commands through the Resources/bin symlink
-  install.sh puts inside the bundle before signing it, and through the standard
-  user locations -- never through the environment, since whatever decides what
-  the app runs decides what inherits the app's privacy grants.
+  The app finds the pipeline's commands through the AVDPhotosBinDir key that
+  install.sh writes into its Info.plist before the bundle is signed, and through
+  the standard user locations -- never through the environment, since whatever
+  decides what the app runs decides what inherits the app's privacy grants.
 -->
 <plist version="1.0">
 <dict>

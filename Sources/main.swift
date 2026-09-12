@@ -47,13 +47,16 @@ import AppKit
 // (`AVD_PHOTOS_BIN_DIR=/tmp/evil PhotoSync --run sh`), and a `--run` hatch that
 // accepted "one of the pipeline's own commands" was only as good as that
 // directory. Both are gone: the scripts are looked up in FIXED places only --
-// this bundle's own Resources/bin (a symlink install.sh creates before the
-// bundle is signed) and the standard user locations.
+// the directory this bundle's own Info.plist names (AVDPhotosBinDir, written by
+// build.sh before the bundle is signed, so the seal covers it and it cannot be
+// changed without breaking that seal) and the standard user locations.
 func resolveScript(_ name: String) -> String {
     let fm = FileManager.default
     let home = fm.homeDirectoryForCurrentUser.path
     var dirs: [String] = []
-    if let res = Bundle.main.resourceURL?.appendingPathComponent("bin").path { dirs.append(res) }
+    if let d = Bundle.main.object(forInfoDictionaryKey: "AVDPhotosBinDir") as? String, !d.isEmpty {
+        dirs.append(d)
+    }
     dirs += ["\(home)/.local/bin", "/usr/local/bin", "/opt/homebrew/bin"]
     for d in dirs {
         let p = "\(d)/\(name)"

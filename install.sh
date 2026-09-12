@@ -169,8 +169,8 @@ ap_secure_config
 if [ "$WANT_APP" -eq 1 ]; then
   head2 "Menu-bar app"
   # --bin-dir is how the app learns where the commands are: it ignores the
-  # environment for that decision on purpose, so the answer has to be recorded
-  # inside the bundle, by an installer, before it is signed.
+  # environment for that decision on purpose, so the answer is recorded in the
+  # bundle's own Info.plist, by an installer, before the bundle is signed.
   bash "$SRC_DIR/build.sh" --dest "$APP_PARENT" --bin-dir "$BIN_DIR" \
     || say "the app build failed — the pipeline still works without it, but the sync agent needs it"
 fi

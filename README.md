@@ -507,8 +507,8 @@ the emulator onto a newer API), `AVD_REROOT=1` (re-patch the ramdisk),
 `PLAYSTORE_DONOR_API`, `DEV_TIMEOUT`, `BOOT_WAIT`, `AVD_APP_NAME`, `AVD_APP_DIR`,
 `PHOTO_SYNC_APP_NAME`, `PHOTO_SYNC_APP_DIR`. **Nothing in the environment tells
 the app where the commands are**, deliberately: whatever decides what the app
-runs decides what inherits the app's privacy grants, so that answer lives in a
-symlink inside the signed bundle (below).
+runs decides what inherits the app's privacy grants, so that answer lives in the
+signed bundle's own Info.plist (below).
 
 ### Arming
 
@@ -585,10 +585,17 @@ those commands through an environment variable the caller sets, so
 `AVD_PHOTOS_BIN_DIR=/tmp/evil PhotoSync --run sh` ran an arbitrary script with
 the app's privacy grants. Whatever decides WHAT the app runs decides what
 inherits those grants, so that decision now ignores the environment entirely:
-the scripts are looked for in `Contents/Resources/bin` (a symlink `install.sh`
-creates inside the bundle before `build.sh` signs it, which is how a
-non-standard `--prefix` is recorded), then `~/.local/bin`, `/usr/local/bin`,
-`/opt/homebrew/bin`.
+the scripts are looked for in the directory named by the bundle's own
+`AVDPhotosBinDir` Info.plist key -- written by `build.sh --bin-dir`, which
+`install.sh` passes, BEFORE the bundle is signed, so the seal covers it and a
+non-standard `--prefix` is recorded where only an installer can put it -- then
+`~/.local/bin`, `/usr/local/bin`, `/opt/homebrew/bin`.
+
+That key replaced a `Contents/Resources/bin` symlink, which `codesign --verify
+--strict` rejects outright ("invalid destination for symbolic link in bundle").
+Worth knowing why that mattered: this bundle's identity is also its TCC identity,
+so a seal that passes only the lax check is a privacy grant that can evaporate at
+an OS update.
 
 Bundle identifier: `local.ayushsharma.icloud-to-google-photos`.
 
