@@ -56,6 +56,9 @@ jobs:
           Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force
 
       - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          # Every run installs icloudpd and Python the way a new user would.
+          enable-cache: false
 
       - name: Parse, PSScriptAnalyzer and Pester (WindowsOnly suites included)
         run: ./windows/tests/Invoke-Checks.ps1
@@ -84,6 +87,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          # Every run installs icloudpd and Python the way a new user would.
+          enable-cache: false
       - name: Python tests
         run: |
           $out = uv run --no-project --python 3.13 --with pytest pytest windows/tests/python -q

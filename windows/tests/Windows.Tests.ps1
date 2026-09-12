@@ -98,8 +98,12 @@ Describe 'the config file is owner-only' -Tag 'WindowsOnly' {
 
 Describe 'the process runner on Windows' -Tag 'WindowsOnly' {
     It 'hands a .bat its arguments intact through cmd.exe (the sdkmanager.bat pattern: %* to the real program)' {
+        # The stand-in reads its argv as the C runtime split it
+        # ([Environment]::GetCommandLineArgs), not PowerShell's $args, which
+        # re-reads a value that starts with a dash as a parameter name --
+        # sdkmanager.bat's real target is java, which does no such thing.
         $echo = Join-Path $TestDrive 'echo-args.ps1'
-        Set-Content -LiteralPath $echo -Value 'ConvertTo-Json -Compress -InputObject @($args)'
+        Set-Content -LiteralPath $echo -Value '$a = [Environment]::GetCommandLineArgs(); $i = [Array]::IndexOf($a, ''-File''); ConvertTo-Json -Compress -InputObject @($a[($i + 2)..($a.Count - 1)])'
         $bat = Join-Path $TestDrive 'fake tool.bat'
         Set-Content -LiteralPath $bat -Value "@`"$Pwsh`" -NoProfile -NonInteractive -File `"$echo`" %*" -Encoding ascii
         $want = @('system-images;android-37.0;google_apis;x86_64', '--sdk_root=C:\Users\John Smith\sdk', 'C:\trailing dir\', 'a&b|c', '(x)^y')
@@ -128,7 +132,9 @@ Describe 'the process runner on Windows' -Tag 'WindowsOnly' {
     }
     It 'passes ANDROID_HOME and ANDROID_SDK_ROOT to the emulator' {
         $log = Join-Path $TestDrive 'env.log'
-        $p = Start-AvdEmulatorProcess -EmulatorPath $Pwsh -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Write-Output "home=$env:ANDROID_HOME root=$env:ANDROID_SDK_ROOT"') -LogPath $log -SdkRoot 'C:\the sdk'
+        # No double quote in the command: nothing can carry one through cmd.exe,
+        # and ConvertTo-AvdCmdArgument refuses it.
+        $p = Start-AvdEmulatorProcess -EmulatorPath $Pwsh -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Write-Output (''home='' + $env:ANDROID_HOME + '' root='' + $env:ANDROID_SDK_ROOT)') -LogPath $log -SdkRoot 'C:\the sdk'
         $p.WaitForExit(60000) | Should -BeTrue
         [System.IO.File]::ReadAllText($log) | Should -Match 'home=C:\\the sdk root=C:\\the sdk'
     }

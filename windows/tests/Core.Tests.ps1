@@ -401,8 +401,10 @@ Describe 'ConvertTo-AvdCommandLine' {
     }
     It 'survives a real round trip into a child process' {
         $script = Join-Path $TestDrive 'echo-args.ps1'
-        Set-Content -LiteralPath $script -Value 'ConvertTo-Json -Compress -InputObject @($args)'
-        $want = @('a b', 'c"d', 'e\', 'f\\"g', 'while IFS= read -r f; do [ -n "$f" ]; done', "it's & <x> | y")
+        # The child reports its argv as the runtime split it, before PowerShell's
+        # own parameter handling would reinterpret a value that starts with a dash.
+        Set-Content -LiteralPath $script -Value '$a = [Environment]::GetCommandLineArgs(); $i = [Array]::IndexOf($a, ''-File''); ConvertTo-Json -Compress -InputObject @($a[($i + 2)..($a.Count - 1)])'
+        $want = @('a b', 'c"d', 'e\', 'f\\"g', 'while IFS= read -r f; do [ -n "$f" ]; done', "it's & <x> | y", '--sdk_root=C:\Users\John Smith\sdk', '-avd')
         $r = Invoke-AvdProcess -FilePath $Pwsh -ArgumentList (@('-NoProfile', '-NonInteractive', '-File', $script) + $want) -TimeoutSec 60
         $r.ExitCode | Should -Be 0
         ($r.StdOut | ConvertFrom-Json) | Should -Be $want
