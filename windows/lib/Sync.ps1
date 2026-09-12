@@ -803,7 +803,7 @@ function Invoke-AvdIcloudpdStep {
     switch ($o.Kind) {
         'ok' { Write-AvdSyncLog $c 'icloudpd ok' }
         'crash' {
-            Write-AvdSyncLog $c 'a broken icloudpd build aborts on every invocation; reinstall it (uv tool install icloudpd).'
+            Write-AvdSyncLog $c "a broken icloudpd build aborts on every invocation; reinstall it ($(Get-AvdInstallHint -Tool icloudpd -Architecture (Get-AvdConfigArchitecture $cfg)))."
             Stop-AvdSyncRun $c "icloudpd crashed ($($o.Code)) - the binary is broken, not the account"
         }
         'notexec' { Stop-AvdSyncRun $c 'icloudpd not executable (127)' }
@@ -1274,6 +1274,11 @@ function Invoke-AvdSyncRun {
         foreach ($w in @($cfg.WARNINGS)) { Write-AvdSyncLog $c "WARNING: config: $w" }
     }
     if (-not (Test-Path -LiteralPath (Join-Path $cfg.AVD_HOME "$($c.AvdName).avd") -PathType Container)) {
+        # On Windows on Arm "run avd-photos-setup" would send the reader to a
+        # command that can only say the same thing at greater length.
+        if ((Get-AvdConfigArchitecture $cfg) -eq 'Arm64') {
+            Stop-AvdSyncRun $c "no $($c.AvdName) emulator - Google publishes no Android Emulator for Windows on Arm (avd-photos-setup says more)"
+        }
         Stop-AvdSyncRun $c "no $($c.AvdName) emulator - run avd-photos-setup"
     }
     if (-not (Get-AvdAdbPath)) { Stop-AvdSyncRun $c 'adb missing from PATH' }

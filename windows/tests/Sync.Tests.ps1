@@ -19,7 +19,9 @@ BeforeAll {
     # directory, the macOS prefix incident), an AVD and an emulator binary, the
     # sentinel unless -Unarmed, and a fresh fake device in $script:Fake.
     function New-SyncWorld {
-        param([hashtable]$Environment = @{}, [switch]$Unarmed, [string]$ConfigText)
+        # x64 unless a test says otherwise, so the suite means the same on
+        # an Arm64 runner as on an x64 one.
+        param([hashtable]$Environment = @{}, [switch]$Unarmed, [string]$ConfigText, [string]$Architecture = 'X64')
         $root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N').Substring(0, 10))
         if ($ConfigText) {
             $null = [System.IO.Directory]::CreateDirectory((Join-Path $root 'config'))
@@ -38,7 +40,7 @@ BeforeAll {
             ICLOUD_USERNAME       = 'someone@example.invalid'
         }
         foreach ($k in $Environment.Keys) { $e[$k] = $Environment[$k] }
-        $cfg = Get-AvdConfig -Environment $e -Platform (Get-AvdPlatform)
+        $cfg = Get-AvdConfig -Environment $e -Platform (Get-AvdPlatform) -Architecture $Architecture
         if (-not $Unarmed) { [System.IO.File]::WriteAllText($cfg.SENTINEL, '') }
         $null = [System.IO.Directory]::CreateDirectory((Join-Path $cfg.AVD_HOME "$($cfg.AVD_NAME).avd"))
         $emu = Join-Path $cfg.AVD_SDK_ROOT 'emulator' $(if ($IsWindows) { 'emulator.exe' } else { 'emulator' })
@@ -649,6 +651,24 @@ Describe 'a whole sync against the fake device' {
         Invoke-AvdPhotosSync -Config $w.Config | Should -Be 1
         [System.IO.File]::ReadAllText((Get-StatePath $w 'phase')) | Should -BeExactly "failed: no gphotos-tablet emulator - run avd-photos-setup`n"
         (Get-SyncLog $w) | Should -Match (ConvertTo-LogPattern 'FAILED: no gphotos-tablet emulator - run avd-photos-setup')
+    }
+
+    It 'on Windows on Arm, says why there is no emulator rather than sending the reader to the setup' {
+        $w = New-SyncWorld -Architecture Arm64
+        Remove-Item -LiteralPath (Join-Path $w.Config.AVD_HOME 'gphotos-tablet.avd') -Recurse
+        Invoke-AvdPhotosSync -Config $w.Config | Should -Be 1
+        [System.IO.File]::ReadAllText((Get-StatePath $w 'phase')) |
+            Should -BeExactly "failed: no gphotos-tablet emulator - Google publishes no Android Emulator for Windows on Arm (avd-photos-setup says more)`n"
+        # Before the icloudpd step, as on x64: nothing is downloaded that
+        # nothing could upload (that step's first line is the reclaim notice).
+        (Get-SyncLog $w) | Should -Not -Match 'iCloud reclaim'
+    }
+
+    It 'names the per-architecture icloudpd install when a broken build crashes' {
+        $w = New-SyncWorld -Architecture Arm64
+        $Fake.IcloudpdExit = -1073741819
+        Invoke-AvdPhotosSync -Config $w.Config | Should -Be 1
+        (Get-SyncLog $w) | Should -Match (ConvertTo-LogPattern 'reinstall it (uv tool install --python 3.13 icloudpd).')
     }
 
     It 'fails on a crashed icloudpd, naming the NTSTATUS' {

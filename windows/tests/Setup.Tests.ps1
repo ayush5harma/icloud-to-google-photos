@@ -15,8 +15,10 @@ BeforeAll {
 
     # A config and an environment under a fresh $TestDrive directory, built
     # from a hashtable (never the process environment), on the host platform.
+    # The machine's architecture is x64 unless a test says otherwise, so these
+    # suites mean the same on an Arm64 runner (and on this Mac) as on an x64 one.
     function New-TestSetup {
-        param([string]$Mode = 'Full', [hashtable]$Extra = @{}, [switch]$Headless)
+        param([string]$Mode = 'Full', [hashtable]$Extra = @{}, [switch]$Headless, [string]$Architecture = 'X64')
         $base = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
         $envs = @{
             HOME                  = $base
@@ -30,7 +32,7 @@ BeforeAll {
             ICLOUD_DIR            = (Join-Path $base 'no-icloud')
         }
         foreach ($k in $Extra.Keys) { $envs[$k] = $Extra[$k] }
-        $cfg = Get-AvdConfig -Environment $envs -Platform (Get-AvdPlatform)
+        $cfg = Get-AvdConfig -Environment $envs -Platform (Get-AvdPlatform) -Architecture $Architecture
         $s = Initialize-AvdSetupState -Config $cfg -Environment $envs -Mode $Mode -Headless:$Headless
         $s.SerialWaitSec = 1; $s.DonorWaitSec = 1; $s.KillWaitSec = 1; $s.RebootDownSec = 1; $s.StopWaitTries = 1
         $null = New-Item -ItemType Directory -Force -Path $s.Stamps
@@ -105,6 +107,152 @@ Describe 'ConvertFrom-AvdSdkRepositoryXml' {
     It 'picks by host OS and returns nothing for an OS it does not list' {
         (ConvertFrom-AvdSdkRepositoryXml -Xml $Manifest -HostOs linux).Sha1 | Should -Be 'e025545c62a8e64c7559119566a569fb1dec5f60'
         ConvertFrom-AvdSdkRepositoryXml -Xml $Manifest -HostOs solaris | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Google''s SDK index by host architecture and channel' {
+    BeforeAll { $script:Index = Get-Fixture 'repository2-3-emulator.xml' }
+    It 'lists no emulator for Windows on Arm, on the stable channel or any other' {
+        ConvertFrom-AvdSdkRepositoryXml -Xml $Index -PackagePath emulator -HostOs windows -HostArch aarch64 -Channel channel-0 | Should -BeNullOrEmpty
+        ConvertFrom-AvdSdkRepositoryXml -Xml $Index -PackagePath emulator -HostOs windows -HostArch aarch64 | Should -BeNullOrEmpty
+    }
+    It 'lists the x64 emulator for Windows, stable by default of the channel asked for' {
+        $s = ConvertFrom-AvdSdkRepositoryXml -Xml $Index -PackagePath emulator -HostOs windows -HostArch x64 -Channel channel-0
+        $s.Url | Should -Be 'https://dl.google.com/android/repository/emulator-windows_x64-15917651.zip'
+        $s.Revision | Should -Be '37.1.11'
+        $s.HostArch | Should -Be 'x64'
+        (ConvertFrom-AvdSdkRepositoryXml -Xml $Index -PackagePath emulator -HostOs windows -HostArch x64 -Channel channel-2).Revision | Should -Be '37.2.8'
+        # No channel asked: the first package listed, which is the dev one.
+        (ConvertFrom-AvdSdkRepositoryXml -Xml $Index -PackagePath emulator -HostOs windows -HostArch x64).Revision | Should -Be '37.2.8'
+    }
+    It 'gives an Arm64 Mac the arm64 command-line tools, not the first macOS archive' {
+        (ConvertFrom-AvdSdkRepositoryXml -Xml $Index -HostOs macosx -HostArch aarch64).Url | Should -Match 'commandlinetools-mac_arm64-'
+        (ConvertFrom-AvdSdkRepositoryXml -Xml $Index -HostOs macosx -HostArch x64).Url | Should -Match 'commandlinetools-mac_x86_64-'
+    }
+    It 'serves Windows on Arm the architecture-neutral archives: the Java command-line tools and platform-tools' {
+        $t = ConvertFrom-AvdSdkRepositoryXml -Xml $Index -HostOs windows -HostArch aarch64 -Channel channel-0
+        $t.Url | Should -Be 'https://dl.google.com/android/repository/commandlinetools-win-16111833_latest.zip'
+        $t.HostArch | Should -Be ''
+        # One Windows archive for every architecture; its adb.exe is a 32-bit
+        # x86 program (read from the r37.0.1 zip, 2026-09-13), which Windows on
+        # Arm runs under emulation.
+        (ConvertFrom-AvdSdkRepositoryXml -Xml $Index -PackagePath platform-tools -HostOs windows -HostArch aarch64).Url |
+            Should -Be 'https://dl.google.com/android/repository/platform-tools_r37.0.1-win.zip'
+    }
+    It 'prefers an exact architecture to a neutral archive, and never takes another architecture''s' {
+        $xml = '<r><remotePackage path="p"><archives>' +
+            '<archive><complete><size>1</size><checksum type="sha1">aa</checksum><url>any.zip</url></complete><host-os>windows</host-os></archive>' +
+            '<archive><complete><size>2</size><checksum type="sha1">bb</checksum><url>x64.zip</url></complete><host-os>windows</host-os><host-arch>x64</host-arch></archive>' +
+            '<archive><complete><size>3</size><checksum type="sha1">cc</checksum><url>arm.zip</url></complete><host-os>windows</host-os><host-arch>aarch64</host-arch></archive>' +
+            '</archives></remotePackage></r>'
+        (ConvertFrom-AvdSdkRepositoryXml -Xml $xml -PackagePath p -HostArch aarch64).Url | Should -Match 'arm\.zip$'
+        (ConvertFrom-AvdSdkRepositoryXml -Xml $xml -PackagePath p -HostArch x64).Url | Should -Match 'x64\.zip$'
+        (ConvertFrom-AvdSdkRepositoryXml -Xml $xml -PackagePath p -HostArch riscv64).Url | Should -Match 'any\.zip$'
+        (ConvertFrom-AvdSdkRepositoryXml -Xml $xml -PackagePath p).Url | Should -Match 'any\.zip$'
+        $only = $xml -replace '<archive><complete><size>1</size>.*?</archive>', ''
+        ConvertFrom-AvdSdkRepositoryXml -Xml $only -PackagePath p -HostArch riscv64 | Should -BeNullOrEmpty
+    }
+    It 'counts a package with no channelRef as stable' {
+        $xml = '<r><remotePackage path="p"><archives><archive><complete><size>1</size><checksum type="sha1">aa</checksum><url>a.zip</url></complete><host-os>windows</host-os></archive></archives></remotePackage></r>'
+        ConvertFrom-AvdSdkRepositoryXml -Xml $xml -PackagePath p -Channel channel-0 | Should -Not -BeNullOrEmpty
+        ConvertFrom-AvdSdkRepositoryXml -Xml $xml -PackagePath p -Channel channel-3 | Should -BeNullOrEmpty
+    }
+    It 'spells a machine architecture as the index does' {
+        ConvertTo-AvdSdkHostArch X64 | Should -Be 'x64'
+        ConvertTo-AvdSdkHostArch Arm64 | Should -Be 'aarch64'
+        ConvertTo-AvdSdkHostArch AMD64 | Should -Be 'x64'
+        ConvertTo-AvdSdkHostArch X86 | Should -Be ''
+        ConvertTo-AvdSdkHostArch '' | Should -Be ''
+    }
+}
+
+Describe 'Windows on Arm: the emulator gate' {
+    BeforeAll {
+        $script:Index = Get-Fixture 'repository2-3-emulator.xml'
+        # The index with the STABLE emulator's Windows archive retagged for
+        # aarch64: the day Google publishes one.
+        $script:IndexWithArm = [regex]::Replace($Index, '(emulator-windows_x64-15917651\.zip</url>\s*</complete>\s*<host-os>windows</host-os>\s*<host-arch>)x64', '${1}aarch64')
+        # The same build listed with no host-arch, as the older repository2-1.xml does.
+        $script:IndexUntagged = [regex]::Replace($Index, '(emulator-windows_x64-15917651\.zip</url>\s*</complete>\s*<host-os>windows</host-os>)\s*<host-arch>x64</host-arch>', '$1')
+    }
+    BeforeEach {
+        Mock -ModuleName AvdPhotos Add-AvdToolPath {}
+        Mock -ModuleName AvdPhotos Invoke-AvdProcess { throw "unmocked process: $FilePath" }
+        Mock -ModuleName AvdPhotos Invoke-AvdAdb { throw 'unmocked adb' }
+        $script:Served = $Index
+        Mock -ModuleName AvdPhotos Invoke-WebRequest { [pscustomobject]@{ StatusCode = 200; Content = $script:Served } }
+    }
+    It 'is never asked on an x64 PC: no request to Google' {
+        $null = New-TestSetup -Architecture X64
+        Get-AvdSetupEmulatorBlocker | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName AvdPhotos Invoke-WebRequest -Times 0 -Exactly
+    }
+    It 'stops a setup on Windows on Arm with the one message, before any download, process or device call' {
+        $t = New-TestSetup -Architecture Arm64
+        Invoke-AvdSetup -Mode Full -Config $t.Config -Environment $t.Environment 6>$null | Should -Be 1
+        $log = Get-SetupLog $t.State
+        $log | Should -Match 'Windows on Arm: no Android Emulator'
+        $log | Should -Match 'Everything else runs natively'
+        $log | Should -Match 'ERROR no Android Emulator for Windows on Arm -- nothing was downloaded or changed'
+        Should -Invoke -ModuleName AvdPhotos Invoke-WebRequest -Times 1 -Exactly -ParameterFilter { "$Uri" -eq 'https://dl.google.com/android/repository/repository2-3.xml' }
+        Should -Invoke -ModuleName AvdPhotos Invoke-AvdProcess -Times 0 -Exactly
+        Should -Invoke -ModuleName AvdPhotos Invoke-AvdAdb -Times 0 -Exactly
+        Test-Path -LiteralPath $t.State.SdkRoot | Should -BeFalse
+        Test-Path -LiteralPath $t.State.Lock | Should -BeFalse
+    }
+    It 'says the same to -Check and -Start, which exit 1 too' {
+        foreach ($m in 'Check', 'Start') {
+            $t = New-TestSetup -Architecture Arm64 -Mode $m
+            Invoke-AvdSetup -Mode $m -Config $t.Config -Environment $t.Environment 6>$null | Should -Be 1 -Because $m
+            Get-SetupLog $t.State | Should -Match 'Windows on Arm: no Android Emulator'
+        }
+        Should -Invoke -ModuleName AvdPhotos Invoke-AvdProcess -Times 0 -Exactly
+    }
+    It 'ends a background run (the logon bootstrap, the weekly task) with exit 0 and the reason in setup.log' {
+        $t = New-TestSetup -Architecture Arm64 -Mode Bootstrap
+        Invoke-AvdSetup -Mode Bootstrap -Config $t.Config -Environment $t.Environment 6>$null | Should -Be 0
+        $log = Get-SetupLog $t.State
+        $log | Should -Match 'Windows on Arm: no Android Emulator'
+        $log | Should -Not -Match 'ERROR'
+        $w = New-TestSetup -Architecture Arm64 -Headless
+        Invoke-AvdSetup -Mode Full -Headless -Config $w.Config -Environment $w.Environment 6>$null | Should -Be 0
+        Should -Invoke -ModuleName AvdPhotos Invoke-AvdProcess -Times 0 -Exactly
+        Test-Path -LiteralPath $w.State.SetupDone | Should -BeFalse
+    }
+    It 'leaves -Stop alone: nothing to ask of Google to stop what runs' {
+        $t = New-TestSetup -Architecture Arm64 -Mode Stop
+        Mock -ModuleName AvdPhotos Test-AvdEmulatorRunning { $false }
+        Invoke-AvdSetup -Mode Stop -Config $t.Config -Environment $t.Environment 6>$null | Should -Be 0
+        Should -Invoke -ModuleName AvdPhotos Invoke-WebRequest -Times 0 -Exactly
+        Get-SetupLog $t.State | Should -Match '   not running'
+    }
+    It 'goes ahead, saying it is a first run, once the stable channel lists an aarch64 emulator for Windows' {
+        $script:Served = $IndexWithArm
+        $t = New-TestSetup -Architecture Arm64
+        Get-AvdSetupEmulatorBlocker 6>$null | Should -BeNullOrEmpty
+        Get-SetupLog $t.State | Should -Match 'now lists Android Emulator 37\.1\.11 for Windows on Arm'
+    }
+    It 'does not take an untagged Windows emulator archive for an Arm64 one' {
+        $script:Served = $IndexUntagged
+        $null = New-TestSetup -Architecture Arm64
+        $b = Get-AvdSetupEmulatorBlocker
+        $b | Should -Not -BeNullOrEmpty
+        $b[0] | Should -Match '^Windows on Arm: no Android Emulator'
+    }
+    It 'stops with the same message, and why the index was not read, when it cannot be read' {
+        Mock -ModuleName AvdPhotos Invoke-WebRequest { throw 'No such host is known.' }
+        $t = New-TestSetup -Architecture Arm64
+        Invoke-AvdSetup -Mode Full -Config $t.Config -Environment $t.Environment 6>$null | Should -Be 1
+        $log = Get-SetupLog $t.State
+        $log | Should -Match 'Windows on Arm: no Android Emulator'
+        $log | Should -Match 'could not be read either \(No such host is known\.\)'
+    }
+    It 'reads the index once a run, for the gate and the command-line tools alike' {
+        $null = New-TestSetup -Architecture Arm64
+        $a = Get-AvdSetupSdkManifest
+        $b = Get-AvdSetupSdkManifest
+        $a | Should -BeExactly $b
+        Should -Invoke -ModuleName AvdPhotos Invoke-WebRequest -Times 1 -Exactly
     }
 }
 
@@ -404,6 +552,35 @@ Describe 'Java, acceleration and path guards' {
         Assert-AvdSetupJava
         Assert-AvdSetupJava
         Should -Invoke -ModuleName AvdPhotos Invoke-AvdProcess -Times 1 -Exactly
+    }
+    It 'on Windows on Arm, refuses an x64 Java (sdkmanager would fetch x64 packages) and takes an arm64 one' {
+        function New-Exe([string]$Path, [int]$Machine) {
+            $b = [byte[]]::new(0x100)
+            $b[0] = 0x4D; $b[1] = 0x5A
+            [System.BitConverter]::GetBytes([int]0x80).CopyTo($b, 0x3C)
+            $b[0x80] = 0x50; $b[0x81] = 0x45
+            [System.BitConverter]::GetBytes([uint16]$Machine).CopyTo($b, 0x84)
+            New-File $Path ''
+            [System.IO.File]::WriteAllBytes($Path, $b)
+        }
+        $a = New-TestSetup -Architecture Arm64
+        $script:JavaExe = Join-Path $a.Base 'jdk-x64' 'java.exe'
+        New-Exe $JavaExe 0x8664
+        Mock -ModuleName AvdPhotos Get-AvdSetupJavaPath { $script:JavaExe }
+        Mock -ModuleName AvdPhotos Invoke-AvdProcess { New-Result -Err 'openjdk version "21.0.12" 2026-07-21 LTS' }
+        { Assert-AvdSetupJava 6>$null } | Should -Throw '*the X64 build of Java*winget install Microsoft.OpenJDK.21 --architecture arm64*'
+        Should -Invoke -ModuleName AvdPhotos Invoke-AvdProcess -Times 0 -Exactly
+        $script:JavaExe = Join-Path $a.Base 'jdk-arm64' 'java.exe'
+        New-Exe $JavaExe 0xAA64
+        Assert-AvdSetupJava
+        Should -Invoke -ModuleName AvdPhotos Invoke-AvdProcess -Times 1 -Exactly
+        # The same x64 Java on an x64 PC is simply Java.
+        $null = New-TestSetup -Architecture X64
+        $script:JavaExe = Join-Path $a.Base 'jdk-x64' 'java.exe'
+        Assert-AvdSetupJava
+        Mock -ModuleName AvdPhotos Get-AvdSetupJavaPath { $null }
+        $null = New-TestSetup -Architecture Arm64
+        { Assert-AvdSetupJava 6>$null } | Should -Throw '*Java not found*winget install Microsoft.OpenJDK.21 --architecture arm64*'
     }
     It 'dies on an unusable hypervisor in a full run and only reports it in -Check' {
         New-File $T.State.Emulator 'emu'

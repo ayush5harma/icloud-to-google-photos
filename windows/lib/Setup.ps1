@@ -96,16 +96,27 @@ function Get-AvdSdkToolPath {
     }
 }
 
-# The archive of one package for one host OS in Google's SDK repository
-# manifest: @{ Url; Sha1; Size; Revision }, or $null. Matched by local name, so
+# The archive of one package for one host in Google's SDK repository manifest:
+# @{ Url; Sha1; Size; Revision; HostArch }, or $null. Matched by local name, so
 # the manifest's namespaces do not matter, and by the EXACT package path: the
 # manifest also carries cmdline-tools;2.1, an obsolete cmdline-tools;2.0 and a
 # dozen more, and any prefix match takes the wrong one.
+# -HostArch is the manifest's spelling (x64, aarch64; ConvertTo-AvdSdkHostArch).
+# An archive without a host-arch serves every architecture; one naming another
+# architecture is never taken; an exact match beats a neutral one. The index
+# lists per-architecture archives where Google builds them -- the emulator
+# everywhere, cmdline-tools on macOS since 23.0 -- and a first-archive-for-the-OS
+# rule would hand an Arm64 Mac the x64 tools. Empty -HostArch: the first
+# archive for the OS, whatever its architecture.
+# -Channel 'channel-0' is stable, what sdkmanager installs unless told
+# otherwise (a package with no channelRef counts as stable); empty is any.
 function ConvertFrom-AvdSdkRepositoryXml {
     param(
         [Parameter(Mandatory)][string]$Xml,
         [string]$PackagePath = 'cmdline-tools;latest',
         [string]$HostOs = 'windows',
+        [string]$HostArch = '',
+        [string]$Channel = '',
         [string]$BaseUri = $script:SetupSdkRepositoryBase
     )
     $doc = [System.Xml.XmlDocument]::new()
@@ -113,28 +124,56 @@ function ConvertFrom-AvdSdkRepositoryXml {
     $doc.LoadXml($Xml)
     foreach ($pkg in $doc.SelectNodes("//*[local-name()='remotePackage']")) {
         if ($pkg.GetAttribute('path') -cne $PackagePath) { continue }
+        if ($Channel) {
+            $ch = $pkg.SelectSingleNode("*[local-name()='channelRef']")
+            $ref = if ($ch) { $ch.GetAttribute('ref') } else { 'channel-0' }
+            if ($ref -cne $Channel) { continue }
+        }
         $rev = ''
         $major = $pkg.SelectSingleNode("*[local-name()='revision']/*[local-name()='major']")
         $minor = $pkg.SelectSingleNode("*[local-name()='revision']/*[local-name()='minor']")
-        if ($major) { $rev = $major.InnerText.Trim(); if ($minor) { $rev += '.' + $minor.InnerText.Trim() } }
+        $micro = $pkg.SelectSingleNode("*[local-name()='revision']/*[local-name()='micro']")
+        if ($major) {
+            $rev = $major.InnerText.Trim()
+            if ($minor) { $rev += '.' + $minor.InnerText.Trim(); if ($micro) { $rev += '.' + $micro.InnerText.Trim() } }
+        }
+        $neutral = $null
         foreach ($a in $pkg.SelectNodes("*[local-name()='archives']/*[local-name()='archive']")) {
             $os = $a.SelectSingleNode("*[local-name()='host-os']")
             if (-not $os -or $os.InnerText.Trim() -cne $HostOs) { continue }
+            $archNode = $a.SelectSingleNode("*[local-name()='host-arch']")
+            $arch = if ($archNode) { $archNode.InnerText.Trim() } else { '' }
+            if ($HostArch -and $arch -and $arch -cne $HostArch) { continue }
             $url = $a.SelectSingleNode("*[local-name()='complete']/*[local-name()='url']")
             $sum = $a.SelectSingleNode("*[local-name()='complete']/*[local-name()='checksum'][@type='sha1']")
             $size = $a.SelectSingleNode("*[local-name()='complete']/*[local-name()='size']")
             if (-not $url -or -not $sum -or -not $size) { continue }
             $u = $url.InnerText.Trim()
             if ($u -notmatch '^https?://') { $u = $BaseUri + $u }
-            return [pscustomobject]@{
+            $found = [pscustomobject]@{
                 Url      = $u
                 Sha1     = $sum.InnerText.Trim().ToLowerInvariant()
                 Size     = [long]$size.InnerText.Trim()
                 Revision = $rev
+                HostArch = $arch
             }
+            if (-not $HostArch -or $arch -ceq $HostArch) { return $found }
+            if ($null -eq $neutral) { $neutral = $found }
         }
+        if ($null -ne $neutral) { return $neutral }
     }
     $null
+}
+
+# A machine architecture (ConvertTo-AvdArchitectureName's spelling) as Google's
+# SDK manifest spells a host-arch; '' for one it has no archives for.
+function ConvertTo-AvdSdkHostArch {
+    param([AllowEmptyString()][AllowNull()][string]$Architecture)
+    switch (ConvertTo-AvdArchitectureName $Architecture) {
+        'X64' { return 'x64' }
+        'Arm64' { return 'aarch64' }
+    }
+    ''
 }
 
 # API levels, newest first, de-duplicated. Google names API levels as POINT
@@ -355,6 +394,11 @@ function Initialize-AvdSetupState {
         Config         = $Config
         Environment    = $Environment
         Platform       = $platform
+        # The machine's (X64, Arm64): what Google's SDK index is asked for, and
+        # on Arm64 whether there is an emulator to set up at all.
+        Architecture   = Get-AvdConfigArchitecture $Config
+        # Google's SDK manifest, read at most once a run (Get-AvdSetupSdkManifest).
+        SdkManifest    = ''
         Mode           = $Mode
         Check          = $Mode -eq 'Check'
         StartOnly      = $Mode -eq 'Start'
@@ -738,7 +782,7 @@ function Get-AvdSetupJavaPath {
     if ($jh) {
         $j = Join-AvdPath $s.Platform $jh, 'bin', $(if ($s.Platform -eq 'Windows') { 'java.exe' } else { 'java' })
         if (Test-Path -LiteralPath $j -PathType Leaf) { return $j }
-        Stop-AvdSetup "JAVA_HOME is set to $jh, but $j does not exist; point JAVA_HOME at a JDK 17 or newer (winget install Microsoft.OpenJDK.21), or remove it"
+        Stop-AvdSetup "JAVA_HOME is set to $jh, but $j does not exist; point JAVA_HOME at a JDK 17 or newer ($(Get-AvdInstallHint -Tool java -Architecture $s.Architecture)), or remove it"
     }
     $c = Get-Command -Name 'java' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($c) { $c.Source } else { $null }
@@ -747,16 +791,27 @@ function Get-AvdSetupJavaPath {
 # sdkmanager and avdmanager are Java programs and current releases need JDK 17
 # or newer; with an older one they die on a class-version error that names
 # neither Java nor the fix. Checked once per run, before the first of them.
+# On Windows on Arm the JDK must also be the arm64 build: sdkmanager picks each
+# package's archive by the architecture its JVM reports, so under an x64 JDK
+# (emulated) it would fetch x64 packages, the emulator above all. Asked of
+# java.exe's own header, since the question is what the file is, not what this
+# pwsh is.
 function Assert-AvdSetupJava {
     $s = $script:AvdSetup
     if ($s.JavaChecked) { return }
+    $hint = Get-AvdInstallHint -Tool java -Architecture $s.Architecture
     $java = Get-AvdSetupJavaPath
-    if (-not $java) { Stop-AvdSetup 'Java not found; sdkmanager needs a JDK 17 or newer: winget install Microsoft.OpenJDK.21, then open a new terminal' }
+    if (-not $java) { Stop-AvdSetup "Java not found; sdkmanager needs a JDK 17 or newer: $hint, then open a new terminal" }
+    if ($s.Architecture -eq 'Arm64') {
+        # '' (not a PE file, as a java on macOS is) is no reason to stop.
+        $ja = Get-AvdExecutableArchitecture -Path $java
+        if ($ja -and $ja -ne 'Arm64') { Stop-AvdSetup "$java is the $ja build of Java, which runs under emulation on Windows on Arm and would make sdkmanager fetch $ja packages: $hint (and point JAVA_HOME at it if it is set)" }
+    }
     $r = Invoke-AvdProcess -FilePath $java -ArgumentList @('-version') -TimeoutSec 30
     $v = Get-AvdJavaMajorVersion ($r.StdErr + "`n" + $r.StdOut)
-    if ($r.ExitCode -ne 0) { Stop-AvdSetup "$java -version failed (exit $($r.ExitCode)); sdkmanager needs a JDK 17 or newer: winget install Microsoft.OpenJDK.21" }
+    if ($r.ExitCode -ne 0) { Stop-AvdSetup "$java -version failed (exit $($r.ExitCode)); sdkmanager needs a JDK 17 or newer: $hint" }
     if ($null -eq $v) { Write-AvdSetupWarning "could not read the Java version from $java -version; carrying on" }
-    elseif ($v -lt 17) { Stop-AvdSetup "$java is Java $v; sdkmanager needs 17 or newer: winget install Microsoft.OpenJDK.21 (and point JAVA_HOME at it if it is set)" }
+    elseif ($v -lt 17) { Stop-AvdSetup "$java is Java $v; sdkmanager needs 17 or newer: $hint (and point JAVA_HOME at it if it is set)" }
     $s.JavaChecked = $true
 }
 
@@ -795,6 +850,51 @@ function Invoke-AvdSetupSdkManager {
     Invoke-AvdProcess -FilePath $sdkm -ArgumentList (@("--sdk_root=$($s.SdkRoot)") + $ArgumentList) -TimeoutSec $TimeoutSec -StdinText $StdinText
 }
 
+# Google's SDK repository manifest as text, fetched at most once a run (the
+# command-line tools bootstrap and the Windows on Arm check both read it).
+# Throws when it cannot be read; each caller says what that stops.
+function Get-AvdSetupSdkManifest {
+    $s = $script:AvdSetup
+    if ($s.SdkManifest) { return $s.SdkManifest }
+    $req = @{ Uri = $script:SetupSdkManifestUri; TimeoutSec = 60; ErrorAction = 'Stop' }
+    if (Test-AvdOperationTimeoutSupport) { $req['OperationTimeoutSeconds'] = 60 }
+    $r = Invoke-WebRequest @req
+    $xml = if ($r.Content -is [byte[]]) { [System.Text.Encoding]::UTF8.GetString($r.Content) } else { [string]$r.Content }
+    $s.SdkManifest = $xml
+    $xml
+}
+
+# THE ONE LEG WINDOWS ON ARM LACKS. $null when this machine can run Google's
+# emulator; otherwise the lines that say why (Get-AvdWindowsOnArmNote, plus
+# what went wrong reading the index). Asked on Windows on Arm only, and asked
+# of Google's own SDK index -- the manifest sdkmanager installs from -- on
+# every run, so the day its stable channel lists an emulator archive for
+# windows/aarch64 the setup goes ahead with no change here. Read 2026-09-13:
+# the emulator (37.1.11 stable, 37.2.8 dev) has archives for linux/x64,
+# macosx/x64, macosx/aarch64 and windows/x64, and nothing else, on any
+# channel. The x64 build is no way round it: under Windows' x64 emulation no
+# hypervisor runs an x86_64 guest, and arm64-v8a images need an Arm64 build.
+function Get-AvdSetupEmulatorBlocker {
+    $s = $script:AvdSetup
+    if ($s.Architecture -ne 'Arm64') { return $null }
+    $why = ''
+    try {
+        $pkg = ConvertFrom-AvdSdkRepositoryXml -Xml (Get-AvdSetupSdkManifest) -PackagePath 'emulator' -HostOs 'windows' -HostArch 'aarch64' -Channel 'channel-0'
+        # Only an archive TAGGED aarch64 counts: the emulator is a native
+        # program, and the older index (repository2-1.xml) lists the very same
+        # x64 build with no host-arch at all.
+        if ($pkg -and $pkg.HostArch -ceq 'aarch64') {
+            Write-AvdSetupWarning "Google's SDK index now lists Android Emulator $($pkg.Revision) for Windows on Arm. This port has"
+            Write-AvdSetupWarning '  not run it yet: "First run on Windows" in the README says what to paste back if a step fails.'
+            return $null
+        }
+    } catch { $why = "Google's SDK index could not be read either ($($_.Exception.Message))." }
+    $lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($l in (Get-AvdWindowsOnArmNote)) { $lines.Add($l) }
+    if ($why) { $lines.Add($why) }
+    , $lines.ToArray()
+}
+
 # The command-line tools, from Google's repository manifest, verified by BOTH
 # the manifest's size and its sha1. The zip's top level is a cmdline-tools\
 # folder; its CONTENTS must land in <root>\cmdline-tools\latest. Unzipped as-is
@@ -809,17 +909,14 @@ function Install-AvdSetupCmdlineTool {
     param()
     $s = $script:AvdSetup
     $hostOs = if ($s.Platform -eq 'Windows') { 'windows' } elseif ($IsMacOS) { 'macosx' } else { 'linux' }
+    $hostArch = ConvertTo-AvdSdkHostArch $s.Architecture
     Write-AvdSetupStep 'no sdkmanager yet: fetching the Android command-line tools from Google (one time)'
     $xml = ''
-    try {
-        $req = @{ Uri = $script:SetupSdkManifestUri; TimeoutSec = 60; ErrorAction = 'Stop' }
-        if (Test-AvdOperationTimeoutSupport) { $req['OperationTimeoutSeconds'] = 60 }
-        $r = Invoke-WebRequest @req
-        $xml = if ($r.Content -is [byte[]]) { [System.Text.Encoding]::UTF8.GetString($r.Content) } else { [string]$r.Content }
-    } catch { Stop-AvdSetup "could not read Google's SDK repository manifest ($script:SetupSdkManifestUri): $($_.Exception.Message)" }
+    try { $xml = Get-AvdSetupSdkManifest }
+    catch { Stop-AvdSetup "could not read Google's SDK repository manifest ($script:SetupSdkManifestUri): $($_.Exception.Message)" }
     $pkg = $null
-    try { $pkg = ConvertFrom-AvdSdkRepositoryXml -Xml $xml -HostOs $hostOs } catch { Write-Verbose "manifest: $($_.Exception.Message)" }
-    if (-not $pkg) { Stop-AvdSetup "no cmdline-tools;latest archive for $hostOs in $script:SetupSdkManifestUri" }
+    try { $pkg = ConvertFrom-AvdSdkRepositoryXml -Xml $xml -HostOs $hostOs -HostArch $hostArch -Channel 'channel-0' } catch { Write-Verbose "manifest: $($_.Exception.Message)" }
+    if (-not $pkg) { Stop-AvdSetup "no cmdline-tools;latest archive for $hostOs$(if ($hostArch) { "/$hostArch" }) in $script:SetupSdkManifestUri" }
     $zip = Join-AvdPath $s.Platform $s.Config.STATE_DIR, 'cmdline-tools-download.zip'
     if (-not (Save-AvdSetupDownload -Path $zip -Uri $pkg.Url)) { Stop-AvdSetup "could not download $($pkg.Url)" }
     $len = (Get-Item -LiteralPath $zip).Length
@@ -1929,11 +2026,24 @@ function Invoke-AvdSetup {
     try {
         Initialize-AvdLog -Path $s.Log
         if ($Config.PSObject.Properties['WARNINGS']) { foreach ($w in @($Config.WARNINGS)) { if ($w) { Write-AvdSetupWarning $w } } }
-        Assert-AvdSetupPath
-        switch ($s.Mode) {
-            'Stop' { $null = Invoke-AvdSetupStop }
-            'Start' { $null = Invoke-AvdSetupStart }
-            default { $null = Invoke-AvdSetupFull }
+        # Windows on Arm, before anything else: with no emulator for this
+        # machine there is nothing to set up, and nothing is downloaded. -Stop
+        # has nothing to ask (it only stops what runs).
+        $blocker = if ($s.Mode -ne 'Stop') { Get-AvdSetupEmulatorBlocker } else { $null }
+        if ($blocker) {
+            foreach ($l in $blocker) { Write-AvdSetupWarning $l }
+            # A background run (the weekly task, the logon bootstrap) stops
+            # there with exit 0, as an unarmed sync tick does: no retry and no
+            # person can change the answer, and a task failing every week would
+            # read as something to fix. Someone who asked gets exit 1.
+            if (-not $s.Headless) { Stop-AvdSetup 'no Android Emulator for Windows on Arm -- nothing was downloaded or changed' }
+        } else {
+            Assert-AvdSetupPath
+            switch ($s.Mode) {
+                'Stop' { $null = Invoke-AvdSetupStop }
+                'Start' { $null = Invoke-AvdSetupStart }
+                default { $null = Invoke-AvdSetupFull }
+            }
         }
     } catch {
         $rc = 1
