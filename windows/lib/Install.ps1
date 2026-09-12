@@ -8,7 +8,7 @@
 #   .sync       every 900 s + at load  -> every 15 minutes + at logon
 #   .setup      Saturday 05:30         -> weekly, Saturday 05:30
 #   .bootstrap  at load                -> at logon
-#   .menubar    at load, KeepAlive     -> .tray at logon, restarted on failure
+#   .menubar    at load, KeepAlive     -> .tray at logon, restart-on-failure set
 #   .app        at load                -> no task: it rebuilt the Dock icon for
 #                                         the light/dark appearance at each login;
 #                                         a Start Menu shortcut has no such need
@@ -188,10 +188,12 @@ function Register-AvdTask {
         Priority                   = $Definition.Priority
     }
     if ($Definition.Tray) {
-        # launchd's KeepAlive, for a crash: restart a minute later (the
-        # shortest interval Task Scheduler accepts). A deliberate Quit exits 0
-        # and stays quit until the next logon, where KeepAlive on macOS would
-        # relaunch it at once.
+        # The nearest thing to launchd's KeepAlive: restart a minute later
+        # (the shortest interval Task Scheduler accepts) when the task fails.
+        # Whether Task Scheduler counts a tray that crashes after it started
+        # as a failure has not been observed, so the README promises only the
+        # next logon. A deliberate Quit exits 0 and stays quit until then,
+        # where KeepAlive on macOS would relaunch it at once.
         $settingsArgs.RestartCount = 999
         $settingsArgs.RestartInterval = New-TimeSpan -Minutes 1
     }

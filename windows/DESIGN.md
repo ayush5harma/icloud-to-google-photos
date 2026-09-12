@@ -162,6 +162,27 @@ Non-goals:
     `image.sysdir.1` with backslashes, so the API parser accepts both
     separators.
 
+15. **Where a run differs from the macOS script, on the safe side.** Added
+    after the review of 2026-09-13; each has a test.
+    - The sync ends the emulator's process when `emu kill` has not stopped
+      it within 60 s; the macOS sync only waits and logs. A wedged emulator
+      attached to nothing would otherwise hold its AVD, and every later tick
+      would find it "running", until the next reboot.
+    - A batch list whose push failed is not run. The macOS loop runs over
+      whatever `/data/local/tmp/avd-batch` holds, and a list left by a loop
+      killed at its timeout, run in prune mode, would remove device files
+      that run never confirmed -- files the ledger then never pushes again.
+    - The patched ramdisk is installed with the VM down when Windows refuses
+      the rename while the emulator holds the file (macOS renames it under a
+      running VM).
+    - A config line the parser cannot use is reported by line number and the
+      known key it names, never repeated: the logs are meant to be pasted
+      into issues, and a mistyped `GITHUB_TOKEN` line would go with them.
+    - The tray task sets Task Scheduler's restart-on-failure, the nearest
+      thing to launchd's KeepAlive. Whether Task Scheduler counts a tray that
+      crashes after starting as a failed task has not been observed, so the
+      README promises only the next logon and the Start Menu shortcut.
+
 ## Layout
 
 ```

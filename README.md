@@ -641,6 +641,12 @@ put `AVD_SDK_ROOT=C:\android-avd-sdk` in the config, and open a new window.
 **`java` is not found, or `sdkmanager` fails at once.** Install the JDK
 (Requirements) and open a new window.
 
+**The tray says `Last run failed -- uv missing from PATH (...)`.** On Windows uv runs
+the Photos database check as well as the reclaim, so the sync refuses to run
+without it rather than run and never confirm anything. Install it
+(Requirements) and check `uv python find 3.13` answers; the first run fetches
+that Python.
+
 **The log says `icloudpd has NO SAVED SESSION`**, or icloudpd's own output
 says `None of providers gave password`. Run the interactive login from step 2.
 On Windows the unattended run asks icloudpd for the keyring password only,
@@ -712,7 +718,26 @@ Windows Security is optional and needs administrator rights.
   starts it at once on macOS): step 3 runs the same setup in front of you, and
   a background copy would only hold the lock against it.
 - **Quit means quit** for the tray until the next logon; launchd's KeepAlive
-  would relaunch it at once. A crash is still restarted a minute later.
+  would relaunch it at once. The tray task also carries Task Scheduler's
+  restart-on-failure setting, but whether Task Scheduler counts a tray that
+  crashes after it started as a failed task has not been observed, so after a
+  crash count on the Photo Sync shortcut in the Start Menu or the next logon.
+  The sync never depends on the tray.
+- **The patched ramdisk may be installed with the VM down.** macOS renames it
+  over `ramdisk.img` while the emulator runs; if Windows refuses that because
+  the emulator still holds the file, the setup installs it in the gap between
+  stopping the VM and starting it again, which is when it is read anyway.
+- **`avd-stop` finds the emulator by name** before it stops it, and ends its
+  process if no adb serial answers to that name; the sync does the same when
+  a graceful stop takes more than a minute (the macOS sync only waits).
+- **A batch list that fails to reach the device is not run.** The macOS sync
+  runs its on-device loop over whatever `/data/local/tmp/avd-batch` holds even
+  when pushing the new list failed, and a list left behind by a loop killed
+  at its timeout could then prune files that run never confirmed. The Windows
+  sync skips that chunk and counts it as failed.
+- **A config line the parser cannot use is logged by its line number** and
+  the key it names, never repeated: the logs are what Troubleshooting asks you
+  to paste, and a mistyped `GITHUB_TOKEN` line would go with them.
 
 ### First run on Windows
 
@@ -732,11 +757,13 @@ your Apple ID and filenames):
 | Step | If it fails, paste back |
 | --- | --- |
 | Emulator boot (`avd-photos-setup`) | its console output; `& "$env:LOCALAPPDATA\android-avd-sdk\emulator\emulator.exe" -accel-check`; `Get-Content "$env:LOCALAPPDATA\avd-photos\logs\emulator.log" -Tail 60` |
-| The Magisk patch on the x86_64 ramdisk | `Get-Content "$env:LOCALAPPDATA\avd-photos\logs\setup.log" -Tail 80`; `avd-photos-check` |
+| The emulator is found by name | `adb devices`; `adb -s emulator-5554 emu avd name`; and if `avd-photos-status` says `"emulator":false` while it runs, `Get-CimInstance Win32_Process -Filter "Name LIKE 'qemu-system%' OR Name LIKE 'emulator%'" \| Select-Object ProcessId, Name, CommandLine` |
+| The Magisk patch on the x86_64 ramdisk | `Get-Content "$env:LOCALAPPDATA\avd-photos\logs\setup.log" -Tail 80`; `adb -s <serial> shell cat /data/local/tmp/magiskpatch/decompress.log`; `adb -s <serial> shell ls -l /dev/block/`; `avd-photos-check` |
 | NeoZygisk, the spoof, the Play Store | `avd-photos-check` |
 | Google sign-in | whether the page renders under `avd-signin`; the device id from `avd-photos-check` |
-| icloudpd's unattended re-authentication | `icloudpd --username <id> --directory "<staging>" --recent 1 --password-provider keyring --only-print-filenames` |
+| icloudpd's unattended re-authentication | `icloudpd --username <id> --directory "<staging>" --recent 1 --password-provider keyring --only-print-filenames`; `Get-Content "$env:LOCALAPPDATA\avd-photos\icloudpd.err" -Tail 40` (the last run's own output) |
 | The scheduled tasks actually running | `Get-ScheduledTask -TaskName 'com.ayushsharma.icloud-to-google-photos.*' \| Get-ScheduledTaskInfo \| Format-List` |
+| The Photos database check (Magisk `su` and the copy on x86_64, uv's Python) | `adb -s <serial> shell su -c "ls -l /data/data/com.google.android.apps.photos/databases/"`; `uv python find 3.13` |
 | A real upload confirmed and reclaimed | `avd-photos-status`; `Get-Content "$env:LOCALAPPDATA\avd-photos\logs\sync.log" -Tail 80`; `avd-photos-offload -DryRun`, then `reclaim.log` |
 
 ---
@@ -888,7 +915,7 @@ library, named with the same labels:
 | `.sync` | every 15 minutes + at logon | `avd-photos-sync.ps1` under `conhost --headless`. Below-normal priority. |
 | `.setup` | Saturday 05:30 | `avd-photos-setup.ps1 -Headless` - the update. |
 | `.bootstrap` | at logon | `avd-photos-setup.ps1 -Bootstrap` - builds or resumes; a no-op once complete. |
-| `.tray` | at logon, restarted on failure | `avd-photos-tray.ps1`, Photo Sync. Normal priority. |
+| `.tray` | at logon (restart-on-failure set; see "What differs on Windows") | `avd-photos-tray.ps1`, Photo Sync. Normal priority. |
 
 All of them run as you, with the Interactive logon type (a task that runs
 "whether logged on or not" runs in session 0, where your Drive and iCloud
