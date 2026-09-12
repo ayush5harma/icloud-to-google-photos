@@ -133,7 +133,14 @@ ap_defaults() {
   # Photos' own database holds its dedup_key. iCloud keeps it in Recently
   # Deleted for 30 days. Set to 0 to keep everything in iCloud.
   DELETE_FROM_ICLOUD="${DELETE_FROM_ICLOUD:-1}"
-  KEEP_ICLOUD_DAYS="${KEEP_ICLOUD_DAYS-}"     # never delete an asset newer than N days
+  # A FIRST-TIMER'S NET, and the reason it is not 0: the first armed runs are
+  # exactly when a mis-set staging path, a half-finished sign-in or a
+  # misunderstanding of what "confirmed" means will show up, and seven days is
+  # long enough to notice before the newest photos can leave iCloud. Set it to 0
+  # to reclaim as soon as a photo is confirmed. `KEEP_ICLOUD_DAYS=` (empty) also
+  # means no floor -- the `-` form below substitutes only when it is UNSET, so a
+  # config that clears it keeps it cleared.
+  KEEP_ICLOUD_DAYS="${KEEP_ICLOUD_DAYS-7}"
   PRUNE_DEVICE_AFTER_UPLOAD="${PRUNE_DEVICE_AFTER_UPLOAD:-1}"
   STOP_EMULATOR_WHEN_IDLE="${STOP_EMULATOR_WHEN_IDLE:-1}"
 
@@ -187,9 +194,14 @@ ap_seed_path() {
 # ap_write_default_config [path]: the commented default config. Never overwrites
 # (the caller decides), and it is the ONE definition of that file -- both
 # avd-photos-config and the setup script's first run print it from here.
+#
+# 0600, because this file holds an Apple ID and may hold a GITHUB_TOKEN. The
+# umask is set for the write itself rather than chmod'ed afterwards, so the
+# secret is never on disk world-readable, not even for the width of one syscall.
 ap_write_default_config() {
-  local out="${1:-$CONFIG_FILE}"
+  local out="${1:-$CONFIG_FILE}" old
   mkdir -p "$(dirname "$out")" 2>/dev/null || return 1
+  old="$(umask)"; umask 077
   cat >"$out" <<'CFGEOF'
 # icloud-to-google-photos configuration. Shell syntax, sourced by every script;
 # values are plain assignments. Anything left commented out keeps its default.
@@ -239,14 +251,35 @@ ICLOUD_USERNAME=
 
 # ── iCloud space reclaim ────────────────────────────────────────────────────
 # 1 (the default) deletes an asset from iCloud only after Google Photos' own
-# database holds its dedup_key. 0 keeps everything in iCloud.
+# database holds its dedup_key AND the last verify pass confirmed cleanly.
+# 0 keeps everything in iCloud.
 #DELETE_FROM_ICLOUD=1
 # Never delete anything created within the last N days, whatever its state.
-#KEEP_ICLOUD_DAYS=
+# The default is 7: a net for the first armed runs, which is when a mis-set
+# staging path or a half-finished sign-in shows up. 0 reclaims a photo as soon
+# as it is confirmed.
+#KEEP_ICLOUD_DAYS=7
 
 # ── Optional ────────────────────────────────────────────────────────────────
 # Raises the GitHub API's 60-per-hour unauthenticated limit for the release
 # lookups. The pipeline works without it.
 #GITHUB_TOKEN=
 CFGEOF
+  local rc=$?
+  # `>` truncates but KEEPS an existing file's mode, so the umask above does
+  # nothing when the file was already there: chmod as well.
+  chmod 600 "$out" 2>/dev/null
+  umask "$old"
+  return "$rc"
+}
+
+# ap_secure_config [path]: make an existing config 0600. For an installer or a
+# configuration manager that wrote one itself.
+ap_secure_config() {
+  local out="${1:-$CONFIG_FILE}"
+  [ -f "$out" ] || return 0
+  case "$(/usr/bin/stat -f %Lp "$out" 2>/dev/null)" in
+    600) return 0 ;;
+    *) chmod 600 "$out" 2>/dev/null && return 10 ;;   # 10 = "it was looser, now fixed"
+  esac
 }

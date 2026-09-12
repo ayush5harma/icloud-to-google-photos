@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
 # Arm (or disarm) the sync. ARM ONLY AFTER a signed-in emulator with the spoof
 # active has been verified: from this moment the job downloads originals, pushes
-# them into the emulator and -- once Google Photos' own database confirms them --
-# deletes them from iCloud.
-#   avd-photos-arm          arm, and kick the agent once so the first run is now
+# them into the emulator and -- once Google Photos' own database confirms them,
+# and only then -- DELETES THEM FROM iCLOUD.
+#
+#   avd-photos-arm          print what arming would switch on; arm if reclaim is
+#                           off, otherwise ask for --yes
+#   avd-photos-arm --yes    arm, deletions included
 #   avd-photos-arm --off    disarm; the agent keeps ticking and every tick exits
 #   avd-photos-arm --status say which it is
+#
+# WHY THE EXTRA WORD. Every other command here is reversible. This one turns on a
+# process whose last step deletes photographs from the only library most people
+# have, on a schedule, with no further prompt -- so the settings that decide what
+# leaves iCloud are printed first, and turning it on with reclaim enabled takes a
+# deliberate second word.
 
 set -uo pipefail
 
@@ -14,6 +23,7 @@ LIB_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BAS
 . "$LIB_DIR/config.sh"
 ap_load_config
 
+YES=0
 case "${1:-}" in
   --status)
     [ -f "$SENTINEL" ] && echo "armed ($SENTINEL)" || echo "dormant (no $SENTINEL)"
@@ -22,12 +32,37 @@ case "${1:-}" in
     rm -f "$SENTINEL"
     echo "disarmed — every sync tick now exits immediately"
     exit 0 ;;
+  --yes) YES=1 ;;
   "") ;;
-  *) echo "usage: ${0##*/} [--off|--status]" >&2; exit 2 ;;
+  *) echo "usage: ${0##*/} [--yes|--off|--status]" >&2; exit 2 ;;
 esac
 
 [ -n "$ICLOUD_USERNAME" ] || {
   echo "ICLOUD_USERNAME is unset in $CONFIG_FILE — set it before arming" >&2; exit 1; }
+
+printf 'Arming will run the sync every 15 minutes with these settings:\n\n'
+printf '  Apple ID              %s\n' "$ICLOUD_USERNAME"
+printf '  staging               %s\n' "$STAGING"
+printf '  emulator              %s\n' "$AVD_NAME"
+if [ "$DELETE_FROM_ICLOUD" = "1" ]; then
+  printf '  delete from iCloud    YES, once Google Photos has confirmed each file\n'
+  if [ -n "$KEEP_ICLOUD_DAYS" ] && [ "$KEEP_ICLOUD_DAYS" != "0" ]; then
+    printf '  keep the newest       %s day(s), never deleted whatever their state\n' "$KEEP_ICLOUD_DAYS"
+  else
+    printf '  keep the newest       NOTHING — a photo can leave iCloud as soon as it is confirmed\n'
+  fi
+  printf '\n  Deleted photos go to iCloud'"'"'s Recently Deleted for 30 days.\n'
+  printf '  Set DELETE_FROM_ICLOUD=0 in %s to copy without deleting.\n' "$CONFIG_FILE"
+  printf '  Dry run first: avd-photos-sync --reclaim-dry-run\n'
+else
+  printf '  delete from iCloud    no (DELETE_FROM_ICLOUD=0) — this copies only\n'
+fi
+printf '\n'
+
+if [ "$DELETE_FROM_ICLOUD" = "1" ] && [ "$YES" -eq 0 ]; then
+  echo "Not armed. Re-run as: ${0##*/} --yes"
+  exit 1
+fi
 
 mkdir -p "$CONFIG_DIR"
 touch "$SENTINEL"
