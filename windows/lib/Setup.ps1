@@ -400,6 +400,9 @@ function Initialize-AvdSetupState {
         Serial         = ''
         EmuStartedByUs = $false
         AdbRootOk      = $false
+        # A patched ramdisk waiting for the VM to let go of ramdisk.img
+        # (Install-AvdSetupRamdisk, Restart-AvdSetupEmulator).
+        PendingRamdisk = $null
         GhWarned       = $false
         JavaChecked    = $false
         AccelChecked   = $false
@@ -989,6 +992,14 @@ function Start-AvdSetupEmulator {
     Enable-AvdSetupAdbRoot
 }
 
+# Put the patched ramdisk in place: a rename over the old one, so a reader
+# sees one file or the other, never half of each. One function so the tests
+# can play Windows refusing it.
+function Install-AvdSetupRamdisk {
+    param([Parameter(Mandatory)][string]$From, [Parameter(Mandatory)][string]$To)
+    [System.IO.File]::Move($From, $To, $true)
+}
+
 # TWO DIFFERENT REBOOTS, and using the wrong one silently loses the work.
 # Restart-AvdSetupEmulator after a ramdisk patch, because QEMU reads
 # ramdisk.img once at VM start and `adb reboot` re-runs the same in-memory
@@ -1004,6 +1015,15 @@ function Restart-AvdSetupEmulator {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     while ($sw.Elapsed.TotalSeconds -lt $s.KillWaitSec -and (Test-AvdEmulatorRunning -AvdName $name)) { Start-Sleep -Seconds 2 }
     if (Test-AvdEmulatorRunning -AvdName $name) { Stop-AvdEmulatorProcess -AvdName $name; Start-Sleep -Seconds 3 }
+    # The one moment the patched ramdisk can always be installed on Windows:
+    # the VM is down and QEMU holds nothing (see the root phase).
+    if ($null -ne $s.PendingRamdisk) {
+        $p = $s.PendingRamdisk
+        $s.PendingRamdisk = $null
+        try { Install-AvdSetupRamdisk -From $p.From -To $p.To }
+        catch { Stop-AvdSetup "could not install the patched ramdisk even with the emulator stopped: $($_.Exception.Message)" }
+        Write-AvdSetupStep 'installed the patched ramdisk with the emulator stopped'
+    }
     $s.EmuStartedByUs = $false          # Start-AvdSetupEmulator sets it again for the new process
     Start-AvdSetupEmulator
 }
@@ -1300,8 +1320,18 @@ function Invoke-AvdSetupRootPhase {
         Remove-Item -LiteralPath $new -Force -ErrorAction SilentlyContinue
         Stop-AvdSetup 'the ramdisk patch produced nothing'
     }
-    try { [System.IO.File]::Move($new, $rd, $true) }
-    catch { Stop-AvdSetup "could not install the patched ramdisk: $($_.Exception.Message)" }
+    # macOS renames with the VM still up: QEMU read ramdisk.img at start and
+    # holds nothing on it. Windows refuses to replace a file another process
+    # still has open, and whether this emulator's QEMU does was never seen on
+    # Windows -- so when the rename is refused while the VM runs, the patched
+    # copy waits as ramdisk.img.new and Restart-AvdSetupEmulator installs it
+    # between stopping the VM and starting it again, the moment it is read.
+    try { Install-AvdSetupRamdisk -From $new -To $rd }
+    catch {
+        if (-not (Test-AvdEmulatorRunning -AvdName $cfg.AVD_NAME)) { Stop-AvdSetup "could not install the patched ramdisk: $($_.Exception.Message)" }
+        Write-AvdSetupStep "ramdisk.img is held by the running emulator ($($_.Exception.Message)); it is replaced once the VM is down"
+        $s.PendingRamdisk = [pscustomobject]@{ From = $new; To = $rd }
+    }
     $null = Invoke-AvdAdb -ArgumentList @('-s', $ser, 'install', '-r', $apk) -TimeoutSec 300
     # FULL VM restart, not Restart-AvdSetupDevice: no Magisk module exists yet,
     # so emu kill has nothing to lose and its `sync` still flushes the APK

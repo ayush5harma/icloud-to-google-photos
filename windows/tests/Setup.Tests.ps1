@@ -525,6 +525,32 @@ Describe 'the root phase on a recorded device' {
         Get-SetupLog $T.State | Should -Match 'Magisk active: 28.1:MAGISK:R'
     }
 
+    It 'installs the patch while the VM is down when Windows refuses to replace a ramdisk the VM holds' {
+        $script:Dev.Tries = 0
+        $script:Dev.InstalledWhileDown = $false
+        Mock -ModuleName AvdPhotos Install-AvdSetupRamdisk {
+            $script:Dev.Tries++
+            if (-not $script:Dev.Killed) { throw [System.IO.IOException]::new('The process cannot access the file because it is being used by another process.') }
+            [System.IO.File]::Move($From, $To, $true)
+            $script:Dev.InstalledWhileDown = $true
+        }
+        Invoke-AvdSetupRootPhase 6>$null
+        $script:Dev.Tries | Should -Be 2
+        $script:Dev.InstalledWhileDown | Should -BeTrue
+        [System.IO.File]::ReadAllText($Rd) | Should -Be 'PATCHED'
+        Test-Path "$Rd.new" | Should -BeFalse
+        $script:Dev.Launched | Should -Be 1
+        Get-SetupLog $T.State | Should -Match 'replaced once the VM is down'
+        Get-SetupLog $T.State | Should -Match 'installed the patched ramdisk with the emulator stopped'
+    }
+
+    It 'stops, leaving the original ramdisk, when the patch cannot be installed even with the VM down' {
+        Mock -ModuleName AvdPhotos Install-AvdSetupRamdisk { throw [System.IO.IOException]::new('denied') }
+        { Invoke-AvdSetupRootPhase 6>$null } | Should -Throw '*even with the emulator stopped*'
+        [System.IO.File]::ReadAllText($Rd) | Should -Be 'ORIGINAL'
+        $script:Dev.Launched | Should -Be 0
+    }
+
     It 'refuses to patch when the Magisk APK does not verify' {
         [System.IO.File]::WriteAllText((Join-Path $T.State.Stamps 'sha-magisk-28.1'), ('0' * 64))
         { Invoke-AvdSetupRootPhase 6>$null } | Should -Throw '*did not verify*'
