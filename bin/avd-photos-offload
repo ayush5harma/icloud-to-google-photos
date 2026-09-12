@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Reclaim iCloud space on demand -- the command-line twin of the menu bar's
+# "Offload from iCloud". Forces DELETE_FROM_ICLOUD for this one run; the sync
+# still refuses to delete anything without a last-upload-confirmed stamp, so this
+# is safe to run before the pipeline has proven itself (it just does nothing).
+exec "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/avd-photos-sync" --offload "$@"

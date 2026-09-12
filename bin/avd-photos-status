@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# Emit ONE JSON blob describing the iCloud -> Google Photos pipeline. The menu
+# bar app polls this every 30 seconds and paints its ring from it; a human can
+# run it too (`avd-photos-status | jq`).
+#
+# IT COMPUTES ALMOST NOTHING. Every number that needs the Photos database, the
+# ledger or a device query is WRITTEN BY THE SYNC JOB and only read here, with
+# its age reported -- one writer, many readers. The two exceptions are cheap and
+# need no root: counting the staging tree, and listing the camera folder when an
+# emulator is ALREADY running. This never starts an emulator.
+#
+# FAST AND SILENT: a few stats and, at most, one bounded adb call.
+
+set -uo pipefail
+
+LIB_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/../lib"
+# shellcheck disable=SC1091
+. "$LIB_DIR/config.sh"
+ap_load_config
+ap_seed_path "$AVD_SDK_ROOT/platform-tools"
+
+SER="emulator-5554"
+
+armed=false
+[ -f "$SENTINEL" ] && armed=true
+emu=false
+pgrep -f "qemu-system.*$AVD_NAME" >/dev/null 2>&1 && emu=true
+
+# Dotfiles excluded: a .DS_Store in the staging tree must not inflate the library
+# count the sync ledger is compared against.
+staged=0
+[ -d "$STAGING" ] && staged="$(find "$STAGING" -type f ! -name '.*' 2>/dev/null | wc -l | tr -d ' ')"
+
+ondev=0; uploaded=0; queued=0; failed=0; upl_age=-1
+if [ "$emu" = true ]; then
+  bounded() {
+    local out; out="$(mktemp)"
+    ( adb -s "$SER" shell "$@" >"$out" 2>/dev/null ) & local p=$! n=0
+    while kill -0 "$p" 2>/dev/null; do
+      [ "$n" -ge 6 ] && { kill -9 "$p" 2>/dev/null; break; }
+      sleep 1; n=$((n+1))
+    done
+    wait "$p" 2>/dev/null; tr -d '\r' <"$out"; rm -f "$out"
+  }
+  # On-device count is cheap and needs no root: just list the camera folder.
+  ondev="$(bounded "ls $DEST_DCIM 2>/dev/null | wc -l" | tr -dc '0-9')"
+fi
+
+# THE BACKLOG is staged files the ledger has not seen. `grep -c .` prints its own
+# 0 on an empty file AND exits 1, so a `|| echo 0` would print a second 0 and
+# break the JSON -- hence the `|| true` plus the ${x:-0} default, here and below.
+remaining=0
+if [ "${staged:-0}" -gt 0 ] && [ -r "$STATE_DIR/pushed.list" ]; then
+  pushed_n="$(grep -c . "$STATE_DIR/pushed.list" 2>/dev/null || true)"; pushed_n="${pushed_n:-0}"
+  remaining=$(( staged - pushed_n ))
+  [ "$remaining" -lt 0 ] && remaining=0
+fi
+
+# THE VERIFY COUNT DESCRIBES THE DEVICE AS OF ITS WRITE, and a push after it
+# starts a batch it knows nothing about: read verbatim, a 05:47 status (1000 of
+# 1000, then pruned) sat beside 377 freshly pushed files nine hours later and the
+# bar read "1000/377" with an exclamation mark. So it counts only while its stamp
+# is not older than the ledger's last change; otherwise the batch is unverified
+# so far, and a verify pass in flight reports its own progress through the phase
+# line parsed below.
+if [ -r "$STATE_DIR/upload-status" ]; then
+  read -r u t f ts _ < "$STATE_DIR/upload-status" 2>/dev/null || true
+  led_m="$(stat -f %m "$STATE_DIR/pushed.list" 2>/dev/null || echo 0)"
+  if [ "${ts:-0}" -ge "${led_m:-0}" ]; then
+    uploaded="${u:-0}"; failed="${f:-0}"; queued="$(( ${t:-0} - ${u:-0} ))"
+    [ "$queued" -lt 0 ] && queued=0
+    [ -n "${ts:-}" ] && upl_age=$(( $(date +%s) - ts ))
+  fi
+fi
+
+# THE CONFIRMATION STAMP IS THE ONLY HONEST "BACKED UP": the sync writes
+# last-upload-confirmed only when every camera-folder file matched in
+# remote_media with zero permanent failures, and DELETES it when a run cannot
+# confirm. Every derived count above can look complete while that stamp is
+# absent, so the app gates its green state on this and never on arithmetic.
+confirmed=false; confirmed_age=-1
+if [ -r "$STATE_DIR/last-upload-confirmed" ]; then
+  cts="$(tr -dc '0-9' < "$STATE_DIR/last-upload-confirmed")"
+  if [ -n "$cts" ]; then
+    confirmed=true
+    confirmed_age=$(( $(date +%s) - cts ))
+    [ "$confirmed_age" -lt 0 ] && confirmed_age=0
+  fi
+fi
+
+# PIPELINE LIVENESS is the age of the last COMPLETED run (the newest "done ("
+# line), NOT the log's mtime: a run that bails writes the log too, so the mtime
+# said "21.7h ago" and the meter said "All backed up" through five days of
+# "icloudpd missing" skips. A healthy no-op still ends in "done (0 pushed this
+# run)", so only a job that stopped completing goes stale.
+last_run_age=-1
+SYNC_LOG="$LOG_DIR/sync.log"
+if [ -f "$SYNC_LOG" ]; then
+  done_ts="$(grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} done \(' "$SYNC_LOG" 2>/dev/null | tail -1 | cut -c1-19)"
+  lm=""
+  [ -n "$done_ts" ] && lm="$(date -j -f '%Y-%m-%d %H:%M:%S' "$done_ts" +%s 2>/dev/null || echo)"
+  [ -n "$lm" ] || lm="$(stat -f %m "$SYNC_LOG" 2>/dev/null || echo)"
+  [ -n "$lm" ] && last_run_age=$(( $(date +%s) - lm ))
+  [ "$last_run_age" -lt 0 ] && last_run_age=0
+fi
+
+# The reclaim ledgers: what has been deleted from iCloud after confirmation, and
+# what is confirmed but not yet deleted.
+reclaimed=0; reclaim_pending=0
+[ -r "$STATE_DIR/reclaimed.list" ] && reclaimed="$(grep -c . "$STATE_DIR/reclaimed.list" 2>/dev/null || true)"
+if [ -r "$STATE_DIR/reclaim-pending.list" ]; then
+  reclaim_pending="$(sort -u "$STATE_DIR/reclaim-pending.list" | comm -23 - <(sort -u "$STATE_DIR/reclaimed.list" 2>/dev/null) | grep -c . || true)"
+fi
+reclaimed="${reclaimed:-0}"; reclaim_pending="${reclaim_pending:-0}"
+
+# LIVE PHASE AND THE RUNNING FLAG come from the sync job itself: sync.lock/pid
+# names the run in flight and $STATE_DIR/phase is its current step ("pushing 120
+# of 500 to the emulator", "verifying uploads: 40 of 500 confirmed") or the
+# "failed: <why>" it leaves behind. Read, never computed: a run is alive only
+# while its pid is, so a crashed job cannot look busy.
+running=false; phase=""
+lp="$STATE_DIR/sync.lock/pid"
+if [ -r "$lp" ]; then
+  lpid="$(tr -dc '0-9' < "$lp")"
+  [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null && running=true
+fi
+[ -r "$STATE_DIR/phase" ] && phase="$(head -1 "$STATE_DIR/phase" | tr -d '"\\' | cut -c1-160)"
+# A verify pass in flight publishes "verifying uploads: N of M confirmed" as its
+# phase; while the run is alive that is the live count for the batch on the
+# device (upload-status is written only after the pass ends).
+if [ "$running" = true ]; then
+  case "$phase" in
+    "verifying uploads: "*" of "*" confirmed")
+      v="${phase#verifying uploads: }"; vu="${v%% of *}"; vt="${v#* of }"; vt="${vt%% confirmed*}"
+      case "$vu$vt" in
+        ''|*[!0-9]*) ;;
+        *) uploaded="$vu"; queued=$(( vt - vu )); [ "$queued" -lt 0 ] && queued=0; upl_age=0 ;;
+      esac ;;
+  esac
+fi
+
+printf '{"backup":{"armed":%s,"emulator":%s,"staged":%s,"remaining":%s,"on_device":%s,"uploaded":%s,"queued":%s,"failed":%s,"upload_age":%s,"confirmed":%s,"confirmed_age":%s,"last_run_age":%s,"running":%s,"phase":"%s","reclaimed":%s,"reclaim_pending":%s},"ts":%s}\n' \
+  "$armed" "$emu" "${staged:-0}" "${remaining:-0}" "${ondev:-0}" "${uploaded:-0}" "${queued:-0}" "${failed:-0}" "${upl_age:--1}" "$confirmed" "$confirmed_age" "$last_run_age" "$running" "$phase" "$reclaimed" "$reclaim_pending" "$(date +%s)"

@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Write the commented default configuration, and say where every file lives.
+#   avd-photos-config            write it if it does not exist, then print it
+#   avd-photos-config --force    overwrite an existing one (the old one is kept
+#                                beside it as config.bak)
+#   avd-photos-config --paths    print the resolved locations and change nothing
+
+set -uo pipefail
+
+LIB_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/../lib"
+# shellcheck disable=SC1091
+. "$LIB_DIR/config.sh"
+ap_load_config
+
+case "${1:-}" in
+  --paths)
+    printf 'config     %s\n' "$CONFIG_FILE"
+    printf 'armed      %s%s\n' "$SENTINEL" "$( [ -f "$SENTINEL" ] && printf ' (present)' || printf ' (absent: the pipeline is dormant)' )"
+    printf 'state      %s\n' "$STATE_DIR"
+    printf 'logs       %s\n' "$LOG_DIR"
+    printf 'staging    %s\n' "$STAGING"
+    printf 'sdk root   %s\n' "$AVD_SDK_ROOT"
+    printf 'emulator   %s\n' "$AVD_NAME"
+    exit 0 ;;
+  --force)
+    [ -f "$CONFIG_FILE" ] && cp -f "$CONFIG_FILE" "$CONFIG_FILE.bak" \
+      && printf 'kept the previous config as %s\n' "$CONFIG_FILE.bak"
+    ap_write_default_config || { echo "could not write $CONFIG_FILE" >&2; exit 1; }
+    printf 'wrote %s\n' "$CONFIG_FILE" ;;
+  "")
+    if [ -f "$CONFIG_FILE" ]; then
+      printf '%s already exists (--force overwrites it, keeping a .bak)\n\n' "$CONFIG_FILE"
+    else
+      ap_write_default_config || { echo "could not write $CONFIG_FILE" >&2; exit 1; }
+      printf 'wrote %s\n\n' "$CONFIG_FILE"
+    fi
+    cat "$CONFIG_FILE" ;;
+  *)
+    echo "usage: ${0##*/} [--force|--paths]" >&2; exit 2 ;;
+esac

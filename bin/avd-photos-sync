@@ -1,0 +1,706 @@
+#!/usr/bin/env bash
+# The sync job: pull new iCloud photos and hand them to Google Photos in the
+# (Pixel-spoofed) rooted tablet emulator, which backs them up. Run every 15
+# minutes and at login by the sync launchd agent, and from the menu bar's
+# "Check iCloud now". Dormant until the arming sentinel exists (avd-photos-arm).
+#
+# Flow: icloudpd -> staging -> push into DCIM/Camera -> media rescan -> Photos
+# backup -> each dedup_key appears in Photos' own remote_media -> the emulator
+# copy is pruned -> the CONFIRMED items leave iCloud.
+#
+# WHY A LEDGER AND NOT `find -mtime`: icloudpd stamps each file with the PHOTO's
+# creation date, not the download time, so "what changed in the last two days"
+# skips almost the whole library while the job looks healthy. Keyed on the path
+# relative to staging, so a re-download or a staging move does not confuse it.
+
+set -uo pipefail
+
+LIB_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/../lib"
+# shellcheck disable=SC1091
+. "$LIB_DIR/config.sh"
+# shellcheck disable=SC1091
+. "$LIB_DIR/log.sh"
+# shellcheck disable=SC1091
+. "$LIB_DIR/proc.sh"
+
+ap_load_config
+
+LEDGER="$STATE_DIR/pushed.list"
+# Staged paths Google Photos has confirmed (fed ONLY by the prune step), and the
+# ones already deleted from iCloud or found not to be there.
+RECLAIM_PENDING="$STATE_DIR/reclaim-pending.list"
+RECLAIMED="$STATE_DIR/reclaimed.list"
+# Settings.Secure android_id, regenerated whenever userdata is: the right key for
+# "is this still the device the ledger was written for". A recreated emulator
+# wipes /sdcard while the ledger survives, and the job would report "new since
+# last run: 0" against an empty DCIM.
+DEVICE_ID_FILE="$STATE_DIR/device.id"
+# From the first push of a batch until the prune leaves DCIM empty, so the
+# quiet-tick gate (step 2) does not skip the emulator mid-batch. A run killed
+# between push and verify leaves the ledger full and the old confirmation stamp
+# intact; without this marker that batch would never verify.
+DEVICE_BUSY="$STATE_DIR/device-busy"
+GPHOTOS_PKG="com.google.android.apps.photos"
+AVD_EMU="$AVD_SDK_ROOT/emulator/emulator"
+SER="emulator-5554"
+
+ap_seed_path "$AVD_SDK_ROOT/platform-tools"
+
+LOG="$LOG_DIR/sync.log"
+log_init "$LOG"
+
+# ONE RUN AT A TIME: the agent fires every 15 minutes AND at every login, while a
+# run against a real library is hours long (measured: 2 h 41 min in icloudpd
+# alone), so a login tick lands mid-run. Taken BEFORE the exit trap, so a
+# contending run touches neither the lock nor the phase file of its owner.
+LOCK="$STATE_DIR/sync.lock"
+single_flight_lock "$LOCK" log
+case $? in
+  1) log "another sync run is in progress (pid $SFL_PID) — skipping"; exit 0 ;;
+  2) log "cannot take $LOCK — skipping"; exit 0 ;;
+esac
+
+# LIVE PHASE FOR THE MENU BAR: avd-photos-status reads $STATE_DIR/phase every
+# tick and the app paints the ring from it, so THE PHASE STRINGS BELOW ARE AN
+# INTERFACE. A clean exit removes the file, a run that cannot do its job leaves
+# "failed: <why>", and every prerequisite that used to skip quietly is a failure
+# now -- five days of "icloudpd missing" skips were invisible because they were
+# not.
+PHASE="$STATE_DIR/phase"
+phase() { printf '%s\n' "$*" > "$PHASE"; }
+OUTCOME=""
+cleanup() {
+  if [ -n "$OUTCOME" ]; then phase "$OUTCOME"; else rm -f "$PHASE"; fi
+  rm -rf "$LOCK"
+}
+trap cleanup EXIT
+fail() { OUTCOME="failed: $1"; log "FAILED: $1"; exit 1; }
+
+# Lines in a file, "0" for an empty or missing one. NOT `grep -c . f || echo 0`:
+# grep prints its own 0 AND exits 1 on an empty file, so that idiom yields
+# "0\n0", which broke the first drained reclaim list.
+count_lines() { local n; n="$(grep -c . "$1" 2>/dev/null)"; printf '%s\n' "${n:-0}"; }
+
+# A device command's stdout, bounded (dev_capture, lib/proc.sh). NEVER
+# run_bounded here: its stdout goes to /dev/null, so a capture written that way
+# silently reads empty -- that is how device.id went unwritten for seven runs.
+dev_out() { dev_capture "$SER" "$ADB_TIMEOUT" '' '' "$@" | tr -d '\r'; }
+
+# An on-device per-path loop ($1 = host file of device paths, $2 = scan | prune |
+# touch, $3 = phase label; 1 if any chunk failed). PASS THE LIST AS A FILE: a
+# real export is named "Google Photos_ Backup & Edit.PNG", which `for f in
+# $(cat)` splits on spaces while the bare `&` backgrounds a device command.
+# 100 per adb call: 500 scan_file calls took ~122 s, past the 120 s ADB_TIMEOUT,
+# and 1,000 in one call froze the phase line for 12+ minutes.
+device_each() {
+  local list="$1" mode="$2" label="$3" total done=0 rc=0 body dir chunk
+  total="$(count_lines "$list")"
+  case "$mode" in
+    scan)  body='content call --uri content://media --method scan_file --arg "$f" >/dev/null 2>&1' ;;
+    prune) body='rm -f "$f" && content call --uri content://media --method scan_file --arg "$f" >/dev/null 2>&1' ;;
+    touch) body='touch "$f" && content call --uri content://media --method scan_file --arg "$f" >/dev/null 2>&1' ;;
+    *) return 1 ;;
+  esac
+  dir="$(mktemp -d)"
+  split -l 100 -a 3 "$list" "$dir/c."
+  for chunk in "$dir"/c.*; do
+    [ -f "$chunk" ] || continue
+    adb -s "$SER" push "$chunk" /data/local/tmp/avd-batch >/dev/null 2>&1
+    run_bounded $((ADB_TIMEOUT + 200)) adb -s "$SER" shell \
+      "while IFS= read -r f; do [ -n \"\$f\" ] && { $body; }; done < /data/local/tmp/avd-batch; rm -f /data/local/tmp/avd-batch" \
+      || rc=1
+    done=$((done + $(count_lines "$chunk")))
+    phase "$label $done of $total"
+  done
+  rm -rf "$dir"
+  return "$rc"
+}
+
+# Staged path for a device file name: the YYYY_MM_name device naming reverses
+# directly; any other name reverses through the ledger, matched on the whole
+# basename.
+rel_of_devname() {
+  local b="$1"
+  case "$b" in
+    [0-9][0-9][0-9][0-9]_[0-9][0-9]_?*) printf '%s/%s/%s\n' "${b:0:4}" "${b:5:2}" "${b:8}" ;;
+    *) awk -v b="$b" 'substr($0, length($0) - length(b)) == "/" b { print; exit }' "$LEDGER" 2>/dev/null ;;
+  esac
+}
+
+# Media only, as paths RELATIVE to staging so the ledger survives a staging move.
+# STRIP THE PREFIX WITH PARAMETER EXPANSION, NEVER sed: a staging path may
+# contain brackets ("[05] Backups" did), which in a sed s||| pattern are a
+# CHARACTER CLASS, so the prefix never matched, the push target became
+# "$STAGING/$STAGING/..." and every push failed. Treat this path as hostile.
+ENUM_ERR=""
+enumerate_staging() {  # sorted relative media paths on stdout; rc 1 if find complained
+  local err; err="$(mktemp)"; ENUM_ERR=""
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    printf '%s\n' "${f#"$STAGING"/}"
+  done < <(find "$STAGING" -type f 2>"$err") \
+    | grep -iE '\.(jpg|jpeg|png|heic|heif|gif|webp|mp4|mov|m4v|3gp)$' \
+    | sort
+  if [ -s "$err" ]; then ENUM_ERR="$(head -1 "$err")"; log "  find: $ENUM_ERR"; rm -f "$err"; return 1; fi
+  rm -f "$err"
+}
+
+# iCloud reclaim (step 6, and the quiet-tick path in step 2): avd-photos-reclaim.py
+# on icloudpd's own library, pinned to the installed tool's version and sharing
+# its ~/.pyicloud session. Exit 2 = no valid session, nothing deleted; the
+# pending list survives a failure and drains next run. A small "walked" count is
+# a small library, not a broken walk.
+reclaim_icloud() {
+  local pend out stats rlog ver spec py rc n i pid c
+  [ -f "$RECLAIMED" ] || : > "$RECLAIMED"
+  rlog="$LOG_DIR/reclaim.log"
+  log_init "$rlog"
+  pend="$(mktemp)"; out="$(mktemp)"; stats="$(mktemp)"
+  sort -u "$RECLAIM_PENDING" | comm -23 - <(sort -u "$RECLAIMED") > "$pend"
+  n="$(count_lines "$pend")"
+  if [ "$n" -eq 0 ]; then rm -f "$pend" "$out" "$stats"; return 0; fi
+  py=""
+  for c in "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/avd-photos-reclaim.py" \
+           "$HOME/.local/bin/avd-photos-reclaim.py"; do
+    [ -f "$c" ] && { py="$c"; break; }
+  done
+  [ -n "$py" ] || { log "WARNING: avd-photos-reclaim.py not found — $n confirmed file(s) stay in iCloud"; rm -f "$pend" "$out" "$stats"; return 0; }
+  # THE LIBRARY, NOT THE TOOL: a `uv tool` icloudpd is a self-contained binary
+  # with nothing importable in it, so the reclaim runs against the pure wheel of
+  # the SAME version, which shares the tool's ~/.pyicloud session unchanged.
+  ver="$("$ICLOUDPD" --version 2>/dev/null | sed -n 's/^version:\([0-9][0-9.]*\).*/\1/p' | head -1)"
+  [ -n "$ver" ] || { log "WARNING: cannot read icloudpd's version — reclaim skipped, $n file(s) stay in iCloud"; rm -f "$pend" "$out" "$stats"; return 0; }
+  spec="icloudpd @ git+https://github.com/icloud-photos-downloader/icloud_photos_downloader@v$ver"
+  phase "reclaiming iCloud space: $n confirmed file(s)"
+  log "iCloud reclaim: $n confirmed file(s) pending (icloudpd library $ver)"
+  ( uv run -q --python 3.13 --with "$spec" "$py" --username "$ICLOUD_USERNAME" --staging "$STAGING" \
+      --pending "$pend" --out "$out" ${KEEP_ICLOUD_DAYS:+--keep-days "$KEEP_ICLOUD_DAYS"} \
+      </dev/null >"$stats" 2>>"$rlog" ) & pid=$!
+  i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$i" -ge "$RECLAIM_TIMEOUT" ]; then kill -9 "$pid" 2>/dev/null; break; fi
+    sleep 1; i=$((i+1))
+  done
+  wait "$pid" 2>/dev/null; rc=$?
+  case "$rc" in
+    0|1)
+      cat "$out" >> "$RECLAIMED"; sort -u "$RECLAIMED" -o "$RECLAIMED"
+      # Resolved paths leave the pending list; held and kept ones stay for next time.
+      sort -u "$RECLAIM_PENDING" | comm -23 - <(sort -u "$RECLAIMED") > "$pend"; mv -f "$pend" "$RECLAIM_PENDING"
+      log "iCloud reclaim: $(tr -d '\n' < "$stats"); $(count_lines "$RECLAIM_PENDING") still pending"
+      if [ "$(jq -r '.deleted // 0' "$stats" 2>/dev/null)" = "0" ] && [ "$(jq -r '.not_found // 0' "$stats" 2>/dev/null)" != "0" ]; then
+        log "WARNING: none of the pending file(s) was found in iCloud — already gone, or the staged-path rebuild no longer matches (see $rlog)"
+      fi
+      [ "$rc" -eq 1 ] && log "WARNING: some iCloud deletions failed — see $rlog" ;;
+    2) log "WARNING: iCloud reclaim could not authenticate — icloudpd needs its one-time interactive login; $n file(s) stay in iCloud" ;;
+    124|137) log "WARNING: iCloud reclaim timed out after ${RECLAIM_TIMEOUT}s — $n file(s) stay in iCloud" ;;
+    *) log "WARNING: iCloud reclaim exited $rc — see $rlog; $n file(s) stay in iCloud" ;;
+  esac
+  rm -f "$pend" "$out" "$stats"
+}
+
+# Single-quote a device path for the emulator's shell: an apostrophe in a name
+# must not end the quote.
+shq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+
+# ── Dormancy + prerequisites ─────────────────────────────────────────────────
+[ -f "$SENTINEL" ] || { log "not armed (no $SENTINEL) — skipping"; exit 0; }
+[ -d "$HOME/.android/avd/${AVD_NAME}.avd" ] || fail "no $AVD_NAME emulator — run avd-photos-setup"
+command -v adb >/dev/null 2>&1 || fail "adb missing from PATH"
+command -v "$ICLOUDPD" >/dev/null 2>&1 || fail "icloudpd ($ICLOUDPD) missing from PATH"
+
+# --offload (the menu item, the avd-photos-offload command): reclaim ON for this
+# run whatever the config says. Only confirmed files are ever deleted, so the
+# button is safe to press at any time.
+case " $* " in
+  *" --offload "*) DELETE_FROM_ICLOUD=1; log "manual offload requested (--offload)" ;;
+esac
+[ -n "$ICLOUD_USERNAME" ] || fail "ICLOUD_USERNAME unset in $CONFIG_FILE"
+
+log "start (user $ICLOUD_USERNAME)"
+phase "starting"
+
+# ── 1. icloudpd: download NEW originals into staging ─────────────────────────
+# FIRST, BEFORE THE EMULATOR: the incremental pass IS the check for new photos,
+# about a minute against a saved session. --log-level info, not the default
+# debug: at 96 passes a day the fifty "already exists" DEBUG lines per pass would
+# be most of the log, while "Downloaded" and errors are INFO.
+mkdir -p "$STAGING" 2>/dev/null || fail "cannot mkdir staging $STAGING"
+icp_args=( --username "$ICLOUD_USERNAME" --directory "$STAGING"
+           --until-found "$UNTIL_FOUND" --recent "$RECENT"
+           --folder-structure '{:%Y/%m}' --no-progress-bar --log-level info )
+# NEVER --delete-after-download: it removed each item from iCloud the moment its
+# bytes landed in staging, hours before Google Photos had it, gated only on SOME
+# earlier run having confirmed uploads. Step 6 offloads per file, after
+# confirmation, and nothing else ever leaves iCloud.
+if [ "$DELETE_FROM_ICLOUD" = "1" ]; then
+  log "iCloud reclaim ON: confirmed uploads are deleted from iCloud after verification${KEEP_ICLOUD_DAYS:+ (keeping the newest $KEEP_ICLOUD_DAYS day(s))}"
+else
+  log "iCloud reclaim OFF (DELETE_FROM_ICLOUD=0 in $CONFIG_FILE): confirmed uploads stay in iCloud"
+fi
+# STDIN MUST BE CLOSED: with no stored session icloudpd falls back to `getpass()`
+# and BLOCKS FOREVER (observed: a 10-minute hang in an unattended job), while at
+# /dev/null it fails fast with EOFError, which becomes "needs auth" below.
+# Authenticate once: icloudpd --username <id> --directory <staging> --recent 1
+# PROGRESS: one "Downloaded <path>" line per new original, counted every 5 s from
+# $LOG, which only rotates at the top of a run.
+phase "downloading from iCloud"
+log_from="$(wc -l < "$LOG" | tr -d ' ')"
+"$ICLOUDPD" "${icp_args[@]}" </dev/null >>"$LOG" 2>&1 & icp_pid=$!
+while kill -0 "$icp_pid" 2>/dev/null; do
+  sleep 5
+  n_dl="$(tail -n +"$((log_from + 1))" "$LOG" 2>/dev/null | grep -cE ' INFO +Downloaded ')"
+  [ "${n_dl:-0}" -gt 0 ] && phase "downloading from iCloud: $n_dl new so far"
+done
+wait "$icp_pid"; rc=$?
+# DISTINGUISH "no new items" FROM "the binary is broken": a plain non-zero exit
+# is routine, death by SIGNAL is not, and treating them alike is how this whole
+# pipeline once stayed a silent no-op for days (a packaged icloudpd that aborted
+# on every invocation while `command -v` still found it).
+if [ "$rc" -eq 0 ]; then
+  log "icloudpd ok"
+elif [ "$rc" -ge 128 ]; then
+  log "a broken icloudpd build aborts on every invocation; reinstall it (uv tool install icloudpd)."
+  fail "icloudpd died with signal $((rc - 128)) — the binary is broken, not the account"
+elif [ "$rc" -eq 127 ]; then
+  fail "icloudpd not executable (127)"
+elif grep -qiE "EOFError|ask_password_in_console|Failed to execute script" "$LOG" 2>/dev/null \
+     && [ "$(tail -40 "$LOG" | grep -ciE "EOFError|ask_password_in_console")" -gt 0 ]; then
+  log "icloudpd has NO SAVED SESSION — it needs a one-time interactive login:"
+  log "    icloudpd --username $ICLOUD_USERNAME --directory \"$STAGING\" --recent 1"
+  log "  continuing with whatever is already staged"
+else
+  log "icloudpd rc=$rc (often just 'no new items' or needs re-auth) — continuing"
+fi
+
+# ── 2. Anything for the emulator? ────────────────────────────────────────────
+# A 15-minute tick must not boot a headless Android VM to learn there is nothing
+# to push. This ONE listing is trusted only when it reported no error and is at
+# least as large as the ledger; anything else falls through to step 4, which
+# lists twice and names a refused directory. The ledger's device check needs adb,
+# so a recreated emulator is noticed by the first run that boots.
+if ! pgrep -f "qemu-system.*$AVD_NAME" >/dev/null 2>&1 && [ -f "$STATE_DIR/last-upload-confirmed" ] \
+   && [ ! -f "$DEVICE_BUSY" ]; then
+  [ -f "$LEDGER" ] || : > "$LEDGER"
+  quick="$(mktemp)"; n_quick=-1
+  if enumerate_staging > "$quick"; then n_quick="$(wc -l < "$quick" | tr -d ' ')"; fi
+  case "$ENUM_ERR" in
+    *"Operation not permitted"*)
+      fail "no access to the staging directory (macOS refused this process; a sync over a cloud-provider mount must run as a child of the app bundle — see 'Staging' in the README)" ;;
+  esac
+  if [ "$n_quick" -gt 0 ] && [ "$n_quick" -ge "$(count_lines "$LEDGER")" ] \
+     && [ "$(sort -u "$LEDGER" | comm -23 "$quick" - | grep -c .)" -eq 0 ]; then
+    rm -f "$quick"
+    log "nothing new: $n_quick staged, all pushed and confirmed — the emulator stays off"
+    if [ "$DELETE_FROM_ICLOUD" = "1" ] && [ -s "$RECLAIM_PENDING" ]; then reclaim_icloud; fi
+    log "done (0 pushed this run)"
+    exit 0
+  fi
+  rm -f "$quick"
+fi
+
+# ── 3. Bring the emulator up, headless ───────────────────────────────────────
+if ! pgrep -f "qemu-system.*$AVD_NAME" >/dev/null 2>&1; then
+  [ -x "$AVD_EMU" ] || fail "emulator binary missing at $AVD_EMU"
+  log "starting $AVD_NAME (headless)"
+  phase "booting the emulator"
+  ANDROID_HOME="$AVD_SDK_ROOT" ANDROID_SDK_ROOT="$AVD_SDK_ROOT" \
+    nohup "$AVD_EMU" -avd "$AVD_NAME" -no-snapshot -no-boot-anim -no-window \
+      -gpu "$AVD_GPU" \
+      >>"$LOG_DIR/emulator.log" 2>&1 &
+  sleep 8
+fi
+run_bounded 60 adb start-server
+phase "waiting for the emulator to boot"
+booted=0
+for _ in $(seq 1 90); do
+  [ "$(dev_out getprop sys.boot_completed)" = "1" ] && { booted=1; break; }
+  sleep 3
+done
+[ "$booted" -eq 1 ] || fail "the emulator did not boot within 4.5 min"
+log "emulator up ($SER)"
+
+# ── 4. Push everything the ledger has not seen, then rescan ──────────────────
+run_bounded "$ADB_TIMEOUT" adb -s "$SER" shell "mkdir -p $DEST_DCIM"
+
+cand="$(mktemp)"; newf="$(mktemp)"; sorted_ledger="$(mktemp)"; pushedpaths="$(mktemp)"
+# NEVER TRUST ONE LISTING OF THE STAGING TREE, AND NEVER SWALLOW ITS ERROR.
+# Measured 2026-09-06 against a cloud-provider mount: "new since last run: 0"
+# over 2,689 files, because macOS refused the launchd-spawned shell every
+# directory of the mount and the error went to a stderr aimed at /dev/null. Two
+# listings that agree, report no error, are not empty while the directory has
+# entries, and are not smaller than the ledger; ~25 ms when healthy.
+[ -f "$LEDGER" ] || : > "$LEDGER"
+n_ledger="$(count_lines "$LEDGER")"
+phase "listing the staging tree"
+attempt=0; prev=-2; n_cand=-1
+while :; do
+  attempt=$((attempt+1))
+  if enumerate_staging > "$cand"; then n_cand="$(wc -l < "$cand" | tr -d ' ')"; else n_cand=-1; fi
+  case "$ENUM_ERR" in
+    *"Operation not permitted"*)
+      fail "no access to the staging directory (macOS refused this process; a sync over a cloud-provider mount must run as a child of the app bundle — see 'Staging' in the README)" ;;
+  esac
+  suspect=0
+  [ "$n_cand" -lt 0 ] && suspect=1
+  [ "$n_cand" -eq 0 ] && [ -n "$(ls "$STAGING" 2>/dev/null)" ] && suspect=1
+  [ "$n_cand" -ge 0 ] && [ "$n_cand" -lt "$n_ledger" ] && suspect=1
+  if [ "$suspect" -eq 0 ] && [ "$n_cand" -eq "$prev" ]; then break; fi
+  if [ "$attempt" -ge 6 ]; then
+    [ "$n_cand" -gt 0 ] || fail "staging tree unreadable: $attempt listings of $STAGING found nothing"
+    log "WARNING: staging lists $n_cand media file(s), fewer than the $n_ledger in the ledger — proceeding"
+    break
+  fi
+  if [ "$suspect" -eq 1 ]; then
+    log "  staging listing suspect (attempt $attempt: $n_cand file(s), ledger $n_ledger) — retrying in 20 s"
+    sleep 20
+  fi
+  prev="$n_cand"
+done
+# Invalidate the ledger if this is not the device it was written for. dev_out,
+# never run_bounded (stdout to /dev/null): that capture was always empty and
+# device.id went unwritten through seven armed runs.
+cur_dev="$(dev_out settings get secure android_id | tr -d '\r\n')"
+case "$cur_dev" in ''|null|Exception*) cur_dev="" ;; esac
+if [ -n "$cur_dev" ]; then
+  prev_dev="$(cat "$DEVICE_ID_FILE" 2>/dev/null || true)"
+  if [ -n "$prev_dev" ] && [ "$prev_dev" != "$cur_dev" ]; then
+    log "new device detected (android_id $prev_dev -> $cur_dev) — resetting ledger; everything will be re-pushed"
+    : > "$LEDGER"
+  fi
+  printf '%s\n' "$cur_dev" > "$DEVICE_ID_FILE"
+fi
+sort -u "$LEDGER" > "$sorted_ledger"
+comm -23 "$cand" "$sorted_ledger" > "$newf"
+total_new="$(wc -l < "$newf" | tr -d ' ')"
+
+pushed=0; failed=0; evicted=0; empty=0
+to_push="$total_new"; [ "$to_push" -gt "$PUSH_CAP" ] && to_push="$PUSH_CAP"
+[ "$to_push" -gt 0 ] && { touch "$DEVICE_BUSY"; phase "pushing 0 of $to_push to the emulator"; }
+while IFS= read -r rel; do
+  [ -n "$rel" ] || continue
+  [ "$pushed" -ge "$PUSH_CAP" ] && break
+  # An online-only stub can BLOCK FOREVER when read, so test METADATA only and
+  # skip; it mirrors on a later run. Same rule as lib/fs.sh, kept inline here
+  # because it is one stat in the hot loop.
+  if /usr/bin/stat -f %Sf "$STAGING/$rel" 2>/dev/null | grep -q dataless; then
+    evicted=$((evicted+1)); continue
+  fi
+  # A 0-byte staged file (a download left truncated) is never pushed: a 0-byte
+  # push would pass the size check below and loop through the empty-device sweep
+  # every run. Delete it from staging to fetch it again.
+  if [ "$(/usr/bin/stat -f %z "$STAGING/$rel" 2>/dev/null || echo 0)" -eq 0 ]; then
+    empty=$((empty+1)); log "  empty staged file skipped (delete it to let icloudpd fetch it again): $rel"; continue
+  fi
+  # ONE DEVICE NAME PER STAGED PATH: DCIM/Camera is flat and iCloud names repeat
+  # across months, so a bare-basename push overwrote the earlier file before
+  # Photos had it. "/" -> "_" (2026/05/IMG_2885.HEIC -> 2026_05_IMG_2885.HEIC).
+  devname="${rel//\//_}"
+  if run_bounded "$ADB_TIMEOUT" adb -s "$SER" push "$STAGING/$rel" "$DEST_DCIM/$devname"; then
+    # CHECK THE SIZE THAT LANDED. `adb push` reported success for three files on
+    # 2026-09-07 while writing them EMPTY (a cloud fault-in racing the read is
+    # the likely cause), the ledger recorded them as pushed, and Photos can
+    # register but never upload an empty HEIC -- so every later run burned the
+    # full UPLOAD_WAIT on "0 of 3 confirmed" and the device-busy marker never
+    # cleared. A mismatch is a failed push: drop the device copy and leave the
+    # path OUT of the ledger so the next run sends it again.
+    src_sz="$(/usr/bin/stat -f %z "$STAGING/$rel" 2>/dev/null || echo 0)"
+    dev_sz="$(dev_out "stat -c %s $(shq "$DEST_DCIM/$devname") 2>/dev/null" | tr -dc '0-9')"
+    if [ "${src_sz:-0}" -gt 0 ] && [ -n "$dev_sz" ] && [ "$dev_sz" = "$src_sz" ]; then
+      printf '%s\n' "$rel" >> "$LEDGER"; pushed=$((pushed+1))
+      printf '%s/%s\n' "$DEST_DCIM" "$devname" >> "$pushedpaths"
+      [ $((pushed % 25)) -eq 0 ] && phase "pushing $pushed of $to_push to the emulator"
+    else
+      log "WARNING: short push, not recorded: $rel (staged $src_sz bytes, on device ${dev_sz:-?})"
+      run_bounded "$ADB_TIMEOUT" adb -s "$SER" shell rm -f "$(shq "$DEST_DCIM/$devname")" >/dev/null 2>&1 </dev/null
+      failed=$((failed+1))
+    fi
+  else
+    failed=$((failed+1))
+  fi
+done < "$newf"
+rm -f "$cand" "$newf" "$sorted_ledger"
+
+log "staged $n_cand media file(s), ledger $n_ledger; new since last run: $total_new; pushed $pushed (cap $PUSH_CAP), failed $failed, evicted-skipped $evicted, empty-skipped $empty"
+[ "$total_new" -gt "$pushed" ] && log "$((total_new - pushed)) left for the next run"
+
+if [ "$pushed" -gt 0 ]; then
+  # INDEX VIA content call scan_file. On Android 17 the two obvious commands are
+  # useless: `cmd media rescan --dir` and `cmd media scan` fail with "cmd: Can't
+  # find service: media", and the legacy MEDIA_MOUNTED broadcast RETURNS SUCCESS
+  # while indexing nothing.
+  if device_each "$pushedpaths" scan "indexing in MediaStore:"; then
+    log "media scan requested for $pushed file(s)"
+  else
+    log "WARNING: media scan failed — Photos may not see the new files"
+  fi
+  phase "waiting for MediaStore to index $pushed file(s)"
+
+  # POLL: scan_file is asynchronous, so querying immediately after requesting it
+  # reports 0 rows and reads as a failure while the scan is still in flight.
+  indexed=0
+  for _ in $(seq 1 15); do
+    # MATCH ON THE DIRECTORY NAME, not $DEST_DCIM: MediaStore stores the
+    # CANONICAL /storage/emulated/0/... path, so a LIKE '/sdcard/%' predicate
+    # never matched and reported "nothing indexed" for indexed files. And COUNT
+    # BOTH COLLECTIONS -- a real iCloud batch is a third Live-Photo videos.
+    ii="$(dev_out "content query --uri content://media/external/images/media --projection _id --where \"_data LIKE '%/${DEST_DCIM##*/}/%'\"" | grep -c '^Row:')"
+    vv="$(dev_out "content query --uri content://media/external/video/media --projection _id --where \"_data LIKE '%/${DEST_DCIM##*/}/%'\"" | grep -c '^Row:')"
+    indexed=$(( ${ii:-0} + ${vv:-0} ))
+    [ "${indexed:-0}" -gt 0 ] && break
+    sleep 2
+  done
+  if [ "${indexed:-0}" -gt 0 ]; then
+    log "MediaStore indexed $indexed file(s) (${ii:-0} image, ${vv:-0} video) under $DEST_DCIM"
+  else
+    log "WARNING: nothing indexed under $DEST_DCIM after 30s; Google Photos will not see these files"
+  fi
+  # Foreground Google Photos, and LOG WHAT ACTUALLY HAPPENED: the log used to
+  # claim "Google Photos foregrounded" while the call did nothing.
+  if run_bounded "$ADB_TIMEOUT" adb -s "$SER" shell "monkey -p $GPHOTOS_PKG -c android.intent.category.LAUNCHER 1"; then
+    log "Google Photos foregrounded"
+  else
+    log "WARNING: could not foreground Google Photos — backup may be delayed"
+  fi
+fi
+
+# ── 5. Confirm Google Photos actually UPLOADED them ──────────────────────────
+# The only authoritative signal, and it is local: Photos' own database.
+# Everything else -- file on disk, MediaStore row, thumbnail, "backup job
+# running" in logcat -- is satisfied long before a byte is uploaded. gphotos0.db
+# is the SIGNED-IN account's (0 = backup_prefs_account_id); gphotos-1.db beside
+# it is the signed-out placeholder, same tables all EMPTY, so "the first
+# gphotos*.db" reads zero.
+PHOTOS_DB=/data/data/com.google.android.apps.photos/databases/gphotos0.db
+
+# NOT EVERY IMAGE SHIPS sqlite3 (and `su -c sqlite3` then fails to a silent empty
+# string): the verifier polled "0 done" for the whole UPLOAD_WAIT and failed a
+# working backup. It fails SAFE, but success became unreachable, which is as
+# broken. So: the device's sqlite3 when it exists, else the ~200 MB database
+# pulled to the host.
+PHOTOS_SQL_MODE=""
+HOST_DB=""
+photos_sql_probe() {
+  if dev_out "command -v sqlite3" | grep -q sqlite3; then PHOTOS_SQL_MODE=device
+  else
+    PHOTOS_SQL_MODE=host
+    HOST_DB="$(mktemp -d)/photos.db"
+    log "device has no sqlite3 — verifying uploads by copying the Photos DB to the host"
+  fi
+}
+# COPY ALL THREE FILES IN ONE SHOT: the db is in WAL mode and Photos writes to it
+# continuously, so pulling the .db and the -wal in separate adb calls captures
+# them seconds apart and sqlite rejects the pair as "database disk image is
+# malformed" -- a silent false negative on the check that gates iCloud deletion.
+# Still possible under load, hence the retry rather than a count.
+photos_sql_refresh() {
+  [ "$PHOTOS_SQL_MODE" = host ] || return 0
+  local i=0
+  while [ "$i" -lt 3 ]; do
+    run_bounded "$ADB_TIMEOUT" adb -s "$SER" shell \
+      su -c "cp ${PHOTOS_DB} ${PHOTOS_DB}-wal ${PHOTOS_DB}-shm /sdcard/ 2>/dev/null; chmod 644 /sdcard/gphotos0.db*" >/dev/null 2>&1
+    rm -f "$HOST_DB" "$HOST_DB-wal" "$HOST_DB-shm"
+    run_bounded "$ADB_TIMEOUT" adb -s "$SER" pull /sdcard/gphotos0.db     "$HOST_DB"      >/dev/null 2>&1
+    run_bounded "$ADB_TIMEOUT" adb -s "$SER" pull /sdcard/gphotos0.db-wal "$HOST_DB-wal"  >/dev/null 2>&1
+    run_bounded "$ADB_TIMEOUT" adb -s "$SER" pull /sdcard/gphotos0.db-shm "$HOST_DB-shm"  >/dev/null 2>&1
+    # DELETE THE STAGING COPY, whether or not the pull worked: /sdcard is the
+    # only place the shell user can read the DB from, this runs every poll, and
+    # the file is ~230 MB (a 233 MB orphan sat on the emulator disk for a day).
+    run_bounded "$ADB_TIMEOUT" adb -s "$SER" shell rm -f /sdcard/gphotos0.db /sdcard/gphotos0.db-wal /sdcard/gphotos0.db-shm >/dev/null 2>&1
+    # A trivial query proves the snapshot is coherent before we trust its counts.
+    if [ -s "$HOST_DB" ] && sqlite3 "$HOST_DB" 'select count(*) from local_media;' >/dev/null 2>&1; then
+      return 0
+    fi
+    i=$((i+1)); sleep 3
+  done
+  log "  could not get a coherent copy of the Photos DB (retried 3x)"
+  return 1
+}
+photos_sql() {
+  if [ "$PHOTOS_SQL_MODE" = device ]; then
+    # Through a file, not the command line: the IN list of every device path is
+    # tens of KB, which no nested su/sh quoting survives.
+    local q; q="$(mktemp)"; printf '%s\n' "$1" > "$q"
+    adb -s "$SER" push "$q" /data/local/tmp/avd-query.sql >/dev/null 2>&1; rm -f "$q"
+    dev_out "su -c 'sqlite3 $PHOTOS_DB < /data/local/tmp/avd-query.sql' 2>/dev/null"
+  else
+    [ -s "$HOST_DB" ] || return 0
+    sqlite3 "$HOST_DB" "$1" 2>/dev/null
+  fi
+}
+
+uploaded=0; pending=0; failed=0; total=0
+# Verify after a push, AND when the last run did not finish cleanly (otherwise
+# the confirmation stamp that gates DELETE_FROM_ICLOUD stays off with nothing
+# re-testing it), AND whenever anything is still on the device -- one run left
+# 513 files uploading after a 1,000 push, and without this they would sit there
+# until the next new photo. One `ls` decides.
+if [ "$pushed" -gt 0 ] || [ ! -f "$STATE_DIR/last-upload-confirmed" ] \
+   || [ "$(dev_out "ls -1 $DEST_DCIM 2>/dev/null | grep -vc '^\\.'" | tr -dc '0-9')" -gt 0 ]; then
+  # UPLOADED = the local row's dedup_key in remote_media, scoped to
+  # in_camera_folder=1 AND to the files on the device by path. Each of those
+  # three was a false UPLOAD CONFIRMED once (first_backup_timestamp is stamped at
+  # QUEUE time; an unscoped count never converges; rows outlive a prune).
+  dev_dir="$(dev_out "readlink -f $DEST_DCIM" | tr -d '\r\n')"
+  [ -n "$dev_dir" ] || dev_dir="/storage/emulated/0/${DEST_DCIM#/sdcard/}"
+  devlist="$(mktemp)"
+  dev_out "ls -1 $DEST_DCIM 2>/dev/null" | grep -v '^\.' | grep -v '^$' > "$devlist"
+  # A 0-BYTE FILE ON THE DEVICE CAN NEVER CONFIRM, so it must not be counted or
+  # waited for: Photos registers an empty HEIC and never uploads it, and three
+  # such files left by one bad push made every run since burn the whole
+  # UPLOAD_WAIT on "0 of 3 confirmed" with the device-busy marker stuck on.
+  # Remove them, take their staged paths back out of the ledger so the next run
+  # pushes them again, and leave them out of the counts below.
+  emptyf="$(mktemp)"
+  dev_out "stat -c '%s %n' $DEST_DCIM/* 2>/dev/null" \
+    | awk '$1 == "0" { sub(/^0[ \t]+/, ""); if (length($0)) print }' > "$emptyf"
+  if [ "$(count_lines "$emptyf")" -gt 0 ]; then
+    log "$(count_lines "$emptyf") empty device file(s) removed and queued again: $(sed 's|.*/||' "$emptyf" | tr '\n' ' ')"
+    device_each "$emptyf" prune "removing empty device files:" \
+      || log "WARNING: some empty-file removals failed"
+    while IFS= read -r ep; do
+      [ -n "$ep" ] || continue
+      er="$(rel_of_devname "${ep##*/}")"
+      # grep exits 1 when nothing is left, so the mv is separate: a ledger or a
+      # listing whose only entry was the empty file must still be truncated.
+      if [ -n "$er" ] && [ -f "$LEDGER" ]; then
+        grep -vxF "$er" "$LEDGER" > "$LEDGER.tmp"
+        mv -f "$LEDGER.tmp" "$LEDGER"
+      fi
+      grep -vxF "${ep##*/}" "$devlist" > "$devlist.tmp"
+      mv -f "$devlist.tmp" "$devlist"
+    done < "$emptyf"
+    [ -s "$devlist" ] || rm -f "$DEVICE_BUSY"
+  fi
+  rm -f "$emptyf"
+  n_dev="$(count_lines "$devlist")"
+  inlist="$(awk -v d="$dev_dir" -v q="'" '{ gsub(q, q q); printf "%s%s%s/%s%s", (NR > 1 ? "," : ""), q, d, $0, q }' "$devlist")"
+  devlist_keep="$devlist"
+  [ -n "$inlist" ] || inlist="''"
+  # COUNT DISTINCT FILES, NOT JOIN ROWS: one dedup_key matches several
+  # remote_media rows (7,393 keys are shared on this account, because much of the
+  # library was already in Google Photos from the phone), and count(*) reported
+  # 1,894 uploaded for 1,393 files on the device -- a false UPLOAD CONFIRMED 11 s
+  # after a 1,000 push.
+  SQL_UP="select count(distinct l.filepath) from local_media l join remote_media r on l.dedup_key=r.dedup_key where l.in_camera_folder=1 and l.filepath in ($inlist);"
+  SQL_TOT="select count(distinct filepath) from local_media where in_camera_folder=1 and filepath in ($inlist);"
+  SQL_FAIL="select count(distinct filepath) from local_media where has_upload_permanently_failed=1 and in_camera_folder=1 and filepath in ($inlist);"
+  end=$((SECONDS + UPLOAD_WAIT + n_dev * 2))
+  phase "verifying uploads with Google Photos"
+  photos_sql_probe
+  photos_sql_refresh
+  # RE-ANNOUNCE WHAT PHOTOS HAS NOT REGISTERED: it syncs MediaStore incrementally
+  # and never revisits what it skipped (measured: 369 files with no local_media
+  # row an hour after indexing). A `touch` plus scan_file bumps the row's
+  # generation and Photos picks them up (146 -> 468 in one pass).
+  SQL_REG="select filepath from local_media where in_camera_folder=1 and filepath in ($inlist);"
+  reannounced=0
+  reannounce_unregistered() {
+    local regf unregf n
+    regf="$(mktemp)"; unregf="$(mktemp)"
+    photos_sql "$SQL_REG" | grep '^/' | sort > "$regf"
+    awk -v d="$dev_dir" '{ print d "/" $0 }' "$devlist_keep" | sort | comm -23 - "$regf" > "$unregf"
+    n="$(count_lines "$unregf")"
+    if [ "$n" -gt 0 ]; then
+      log "Google Photos has not registered $n of $n_dev device file(s) — touching and rescanning them"
+      device_each "$unregf" touch "re-announcing to Photos:" || log "WARNING: some re-announce chunks failed"
+      phase "verifying uploads with Google Photos"
+    fi
+    rm -f "$regf" "$unregf"
+    reannounced=$((reannounced+1))
+  }
+  polls=0
+  while :; do
+    uploaded="$(photos_sql "$SQL_UP"   | tr -dc '0-9')"
+    total="$(photos_sql "$SQL_TOT"     | tr -dc '0-9')"
+    failed="$(photos_sql "$SQL_FAIL"   | tr -dc '0-9')"
+    polls=$((polls+1))
+    # Third poll (Photos has had a minute) and again after thirty more if short.
+    if [ "${total:-0}" -lt "$n_dev" ] && { [ "$polls" -eq 3 ] && [ "$reannounced" -eq 0 ] || { [ "$polls" -eq 33 ] && [ "$reannounced" -eq 1 ]; }; }; then
+      reannounce_unregistered
+    fi
+    [ "${uploaded:-0}" -gt "$n_dev" ] && log "WARNING: uploaded (${uploaded}) exceeds files on device ($n_dev) — the query is over-counting"
+    pending=$(( n_dev - ${uploaded:-0} ))
+    [ "$n_dev" -gt 0 ] && [ "$pending" -le 0 ] && { pending=0; break; }
+    [ "$n_dev" -eq 0 ] && { pending=0; rm -f "$DEVICE_BUSY"; break; }
+    [ "$SECONDS" -ge "$end" ] && break
+    log "upload in progress: ${uploaded:-0}/$n_dev confirmed (${total:-0} registered by Photos), ${failed:-0} failed"
+    phase "verifying uploads: ${uploaded:-0} of $n_dev confirmed"
+    sleep 20
+    photos_sql_refresh
+  done
+  # Publish the counts for the menu bar; it must NOT recompute them, since the
+  # only honest query needs the ~200 MB Photos DB pulled to the host.
+  printf '%s %s %s %s\n' "${uploaded:-0}" "$n_dev" "${failed:-0}" "$(date +%s)" \
+    > "$STATE_DIR/upload-status"
+  if [ "${pending:-1}" = "0" ] && [ "${failed:-0}" = "0" ]; then
+    log "UPLOAD CONFIRMED: ${uploaded:-0} file(s) backed up to Google Photos"
+    date +%s > "$STATE_DIR/last-upload-confirmed"
+  else
+    log "WARNING: upload NOT complete — ${uploaded:-0} of $n_dev done (${total:-0} registered by Photos), ${pending:-?} pending, ${failed:-0} permanently failed"
+    log "         iCloud deletion stays disabled until a run confirms cleanly"
+    rm -f "$STATE_DIR/last-upload-confirmed"
+  fi
+
+  # ── Reclaim DEVICE space: drop confirmed copies from the emulator ──────────
+  # What makes the loop self-sustaining: the emulator is a disposable STAGING
+  # device, and left alone DCIM grows with the ENTIRE library until the disk
+  # fills. Safe because remote_media means Google holds the content and the
+  # ledger is keyed on the STAGING path, so a pruned DCIM never re-pushes. NOT
+  # DELETE_FROM_ICLOUD -- this frees the throwaway emulator.
+  if [ "$PRUNE_DEVICE_AFTER_UPLOAD" = "1" ] && [ "${uploaded:-0}" -gt 0 ]; then
+    phase "reclaiming emulator space"
+    prunelist="$(mktemp)"
+    photos_sql "select distinct l.filepath from local_media l join remote_media r on l.dedup_key=r.dedup_key where l.in_camera_folder=1 and l.filepath in ($inlist);" \
+      | grep '^/' > "$prunelist"
+    npr="$(count_lines "$prunelist")"
+    if [ "${npr:-0}" -gt 0 ]; then
+      # A scan of a vanished file removes its MediaStore row; Photos reconciles
+      # local_media on its own, and the backup is untouched.
+      device_each "$prunelist" prune "reclaiming emulator space:" || log "WARNING: some prune chunks failed"
+      # HAND THE CONFIRMED FILES TO THE iCLOUD RECLAIM (step 6). This list is the
+      # ONLY thing that feeds it: nothing else counts as confirmation, and a
+      # filename match least of all -- of 1,525 confirmed files, 444 matched
+      # Google Photos by name and size, 109 by name only, 972 not at all.
+      while IFS= read -r dp; do
+        [ -n "$dp" ] || continue
+        r="$(rel_of_devname "${dp##*/}")"
+        [ -n "$r" ] && printf '%s\n' "$r" >> "$RECLAIM_PENDING"
+      done < "$prunelist"
+      # dev_out, not run_bounded (whose stdout is /dev/null): this read "0 remain
+      # on device" on every run, 393 files included.
+      remain="$(dev_out "ls $DEST_DCIM 2>/dev/null | wc -l" | tr -dc '0-9')"
+      log "reclaimed emulator space: removed ${npr} confirmed file(s) from DCIM (${remain:-0} remain on device)"
+      [ "${remain:-1}" -eq 0 ] && rm -f "$DEVICE_BUSY"
+    fi
+    rm -f "$prunelist"
+  fi
+else
+  # Nothing pushed, nothing on the device, last batch confirmed: a marker left by
+  # a batch whose pushes all failed has nothing to wait for.
+  rm -f "$DEVICE_BUSY"
+fi
+
+# ── 6. Reclaim iCloud space: delete what Google Photos has CONFIRMED ─────────
+# reclaim_icloud is defined above (step 2's quiet tick calls it too); only the
+# prune list of step 5 ever feeds its pending list.
+if [ "$DELETE_FROM_ICLOUD" = "1" ] && [ -s "$RECLAIM_PENDING" ]; then
+  reclaim_icloud
+fi
+
+# Stop the emulator once the device is drained and the batch confirmed, so a
+# quiet tick is one icloudpd pass and no VM; the next batch pays the ~90 s boot.
+# Same recipe as avd-photos-setup --stop: sync, then emu kill.
+# STOP_EMULATOR_WHEN_IDLE=0 in the config keeps it resident.
+if [ "$STOP_EMULATOR_WHEN_IDLE" = "1" ] && [ ! -f "$DEVICE_BUSY" ] && [ -f "$STATE_DIR/last-upload-confirmed" ] \
+   && pgrep -f "qemu-system.*$AVD_NAME" >/dev/null 2>&1; then
+  phase "stopping the emulator"
+  dev_out sync >/dev/null 2>&1
+  run_bounded 30 adb -s "$SER" emu kill </dev/null
+  n=0; while [ "$n" -lt 30 ] && pgrep -f "qemu-system.*$AVD_NAME" >/dev/null 2>&1; do sleep 2; n=$((n+1)); done
+  if pgrep -f "qemu-system.*$AVD_NAME" >/dev/null 2>&1; then log "WARNING: the emulator did not stop within 60 s"; else log "emulator stopped: device drained, batch confirmed"; fi
+fi
+
+rm -f "$pushedpaths"
+log "done ($pushed pushed this run)"
+exit 0

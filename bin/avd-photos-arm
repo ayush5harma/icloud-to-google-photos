@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Arm (or disarm) the sync. ARM ONLY AFTER a signed-in emulator with the spoof
+# active has been verified: from this moment the job downloads originals, pushes
+# them into the emulator and -- once Google Photos' own database confirms them --
+# deletes them from iCloud.
+#   avd-photos-arm          arm, and kick the agent once so the first run is now
+#   avd-photos-arm --off    disarm; the agent keeps ticking and every tick exits
+#   avd-photos-arm --status say which it is
+
+set -uo pipefail
+
+LIB_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/../lib"
+# shellcheck disable=SC1091
+. "$LIB_DIR/config.sh"
+ap_load_config
+
+case "${1:-}" in
+  --status)
+    [ -f "$SENTINEL" ] && echo "armed ($SENTINEL)" || echo "dormant (no $SENTINEL)"
+    exit 0 ;;
+  --off)
+    rm -f "$SENTINEL"
+    echo "disarmed — every sync tick now exits immediately"
+    exit 0 ;;
+  "") ;;
+  *) echo "usage: ${0##*/} [--off|--status]" >&2; exit 2 ;;
+esac
+
+[ -n "$ICLOUD_USERNAME" ] || {
+  echo "ICLOUD_USERNAME is unset in $CONFIG_FILE — set it before arming" >&2; exit 1; }
+
+mkdir -p "$CONFIG_DIR"
+touch "$SENTINEL"
+# Kick the agent so the first run is now rather than up to 15 minutes away. The
+# run is then launchd's child, which is what gives it the app bundle's identity;
+# a failure here is not an error (the agent may not be installed).
+launchctl kickstart -k "gui/$(id -u)/$AP_LABEL_PREFIX.sync" >/dev/null 2>&1 \
+  && echo "armed, and the sync agent was kicked — watch $LOG_DIR/sync.log" \
+  || echo "armed — the sync agent is not loaded, so nothing is scheduled (run install.sh)"
