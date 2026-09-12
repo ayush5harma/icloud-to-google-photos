@@ -342,8 +342,10 @@ Four, and no automation can do any of them:
 - **The uncertified-device registration**, once per Google account, with the
   device id from GMS' `Checkin.xml` - not from the GSF provider, which answers
   "No result found" here. If sign-in still fails afterwards, force a check-in
-  with `adb -s emulator-5554 shell am broadcast -a android.server.checkin.CHECKIN`
-  and try again.
+  with `adb -s <serial> shell am broadcast -a android.server.checkin.CHECKIN`,
+  where `<serial>` is the one `avd-photos-check` prints as `device:` while the
+  emulator is running (do not assume `emulator-5554` — see "Which emulator is
+  ours"), and try again.
 - **The file-provider grant for `Photo Sync.app`**, only if your staging
   directory lives on a cloud mount. macOS asks the first time the app's child
   reads it; answer yes. (For Google Drive it is the per-app File Provider
@@ -466,10 +468,13 @@ the scripts.
 
 `~/.config/avd-photos/config`, shell syntax, sourced by every script, **0600**
 (it holds an Apple ID and may hold a `GITHUB_TOKEN`; the installer tightens an
-existing one). Precedence is **environment > config file > default**.
-`AVD_PHOTOS_CONFIG_DIR`, `AVD_PHOTOS_STATE_DIR` and `AVD_PHOTOS_LOG_DIR` are
-environment-only, since they decide where the config is read from in the first
-place.
+existing one). Precedence is **environment > config file > default**, decided by
+whether the caller SET a variable rather than whether it is non-empty, so
+`KEEP_ICLOUD_DAYS= avd-photos-sync` means "no floor for this run" and beats a
+value in the config file exactly as an empty value in the config file beats the
+default. `AVD_PHOTOS_CONFIG_DIR`, `AVD_PHOTOS_STATE_DIR` and `AVD_PHOTOS_LOG_DIR`
+are environment-only, since they decide where the config is read from in the
+first place.
 
 | Key | Default | What it is |
 | --- | --- | --- |
@@ -500,8 +505,10 @@ place.
 Also read from the environment, never from the config: `AVD_RECREATE=1` (recreate
 the emulator onto a newer API), `AVD_REROOT=1` (re-patch the ramdisk),
 `PLAYSTORE_DONOR_API`, `DEV_TIMEOUT`, `BOOT_WAIT`, `AVD_APP_NAME`, `AVD_APP_DIR`,
-`PHOTO_SYNC_APP_NAME`, `PHOTO_SYNC_APP_DIR`, `AVD_PHOTOS_BIN_DIR` (where the app
-looks for the scripts; the agents set it).
+`PHOTO_SYNC_APP_NAME`, `PHOTO_SYNC_APP_DIR`. **Nothing in the environment tells
+the app where the commands are**, deliberately: whatever decides what the app
+runs decides what inherits the app's privacy grants, so that answer lives in a
+symlink inside the signed bundle (below).
 
 ### Arming
 
@@ -563,26 +570,27 @@ Templates are in `launchd/`, with `__LABEL__`, `__BIN_DIR__`, `__APP_BIN__` and
 
 ### The app's CLI
 
-`Photo Sync.app/Contents/MacOS/PhotoSync` handles two arguments before any UI
-exists:
+`Photo Sync.app/Contents/MacOS/PhotoSync` handles exactly one argument before any
+UI exists: **`--sync [args...]`**, which runs `avd-photos-sync` as its child and
+waits, passing the arguments through and forwarding SIGTERM so the script's exit
+trap runs. It spawns and waits, never `exec`s (`exec` would swap the image and
+the identity with it), and it is handled before the first line that touches
+AppKit, because `NSStatusBar.system` registers the process with LaunchServices as
+a running copy of the app and the UI's single-instance sweep would then kill a
+`--sync` parent mid-run.
 
-- `--sync [args...]` runs `avd-photos-sync` as its child and waits, passing the
-  arguments through and forwarding SIGTERM so the script's exit trap runs.
-- `--run <command> [args...]` does the same for one of this pipeline's own
-  commands, named bare or by its installed path. **Anything else is refused**,
-  because a child of this app inherits the app's privacy grants -- that is the
-  whole point of `--sync` -- and a general "run anything as me" hatch would lend
-  those grants to any program on the Mac.
-
-Both spawn and wait, never `exec`: `exec` would swap the image and the identity
-with it. They are handled before the first line that touches AppKit, because
-`NSStatusBar.system` registers the process with LaunchServices as a running copy
-of the app and the UI's single-instance sweep would then kill a `--run` parent
-mid-sync.
-
-Bundle identifier: `local.ayushsharma.icloud-to-google-photos`. It resolves the
-scripts through `AVD_PHOTOS_BIN_DIR`, then `~/.local/bin`, `/usr/local/bin`,
+**There is no general `--run`.** An earlier version had one, restricted to the
+pipeline's own commands, and that restriction was worth nothing: it resolved
+those commands through an environment variable the caller sets, so
+`AVD_PHOTOS_BIN_DIR=/tmp/evil PhotoSync --run sh` ran an arbitrary script with
+the app's privacy grants. Whatever decides WHAT the app runs decides what
+inherits those grants, so that decision now ignores the environment entirely:
+the scripts are looked for in `Contents/Resources/bin` (a symlink `install.sh`
+creates inside the bundle before `build.sh` signs it, which is how a
+non-standard `--prefix` is recorded), then `~/.local/bin`, `/usr/local/bin`,
 `/opt/homebrew/bin`.
+
+Bundle identifier: `local.ayushsharma.icloud-to-google-photos`.
 
 ---
 
