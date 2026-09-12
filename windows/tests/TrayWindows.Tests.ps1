@@ -135,9 +135,20 @@ Describe 'the tray on Windows' -Tag 'WindowsOnly' {
         $cache.Count | Should -Be 2
         # Loaded at the small-icon size, from one of the four frames.
         $a.Width | Should -BeIn 16, 20, 24, 32
-        Clear-AvdTrayIconCache -Cache $cache
-        $cache.Count | Should -Be 0
-        { $null = $a.Handle } | Should -Throw
+        # Clearing disposes every cached Icon (what reading Handle afterwards
+        # does is the framework's business: it did not throw on .NET 10,
+        # measured on windows-latest 2026-09-13), so count the Dispose calls.
+        $disposed = [System.Collections.Generic.List[string]]::new()
+        $probe = @{}
+        foreach ($k in $cache.Keys) {
+            $o = [pscustomobject]@{ Key = $k }
+            $o | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $disposed.Add($this.Key) }.GetNewClosure()
+            $probe[$k] = $o
+        }
+        foreach ($icon in @($cache.Values)) { $icon.Dispose() }
+        Clear-AvdTrayIconCache -Cache $probe
+        $probe.Count | Should -Be 0
+        $disposed.Count | Should -Be 2
     }
 
     It 'builds the context menu from the model: labels for text rows, items for actions' {
@@ -154,29 +165,29 @@ Describe 'the tray on Windows' -Tag 'WindowsOnly' {
             for ($i = 0; $i -lt $model.Count; $i++) {
                 $m = $model[$i]; $item = $menu.Items[$i]
                 switch ($m.Kind) {
-                    'separator' { $item | Should -BeOfType ([System.Windows.Forms.ToolStripSeparator]) }
+                    'separator' { $item | Should -BeOfType ([System.Windows.Forms.ToolStripSeparator]) -Because "row $i" }
                     'action' {
-                        $item | Should -BeOfType ([System.Windows.Forms.ToolStripMenuItem])
-                        $item.Enabled | Should -BeTrue
-                        $item.Tag | Should -Be $m.Action
-                        $item.Text | Should -Be (ConvertTo-AvdMenuText -Text $m.Text -Key $m.Key)
+                        $item | Should -BeOfType ([System.Windows.Forms.ToolStripMenuItem]) -Because "row $i"
+                        $item.Enabled | Should -BeTrue -Because "action row $i ($($m.Text)) is enabled"
+                        $item.Tag | Should -Be $m.Action -Because "row $i"
+                        $item.Text | Should -Be (ConvertTo-AvdMenuText -Text $m.Text -Key $m.Key) -Because "row $i"
                     }
                     default {
-                        $item | Should -BeOfType ([System.Windows.Forms.ToolStripLabel])
-                        $item.GetType() | Should -Be ([System.Windows.Forms.ToolStripLabel])
-                        $item.CanSelect | Should -BeFalse
-                        $item.Text | Should -Be $m.Text
+                        $item | Should -BeOfType ([System.Windows.Forms.ToolStripLabel]) -Because "row $i"
+                        $item.GetType() | Should -Be ([System.Windows.Forms.ToolStripLabel]) -Because "row $i"
+                        $item.CanSelect | Should -BeFalse -Because "label row $i cannot be selected"
+                        $item.Text | Should -Be $m.Text -Because "row $i"
                     }
                 }
             }
-            $menu.Items[0].Font.Bold | Should -BeTrue
+            $menu.Items[0].Font.Bold | Should -BeTrue -Because 'the header is bold'
             @($menu.Items | Where-Object { $_.Text -like 'Staged*' })[0].Font.Name | Should -Be 'Consolas'
             if (-not [System.Windows.Forms.SystemInformation]::HighContrast) {
                 $menu.Items[1].ForeColor.ToArgb() | Should -Be ([int](Get-AvdTrayTextColor)['green'])
             }
             $first = $menu.Items[0]
             Update-AvdTrayMenu -Menu $menu -Model $model -Font $font -OnClick { }
-            $first.IsDisposed | Should -BeTrue
+            $first.IsDisposed | Should -BeTrue -Because 'a rebuild disposes the old rows'
             $menu.Items.Count | Should -Be $model.Count
         } finally {
             $menu.Dispose()
