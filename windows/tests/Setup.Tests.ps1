@@ -553,34 +553,13 @@ Describe 'Java, acceleration and path guards' {
         Assert-AvdSetupJava
         Should -Invoke -ModuleName AvdPhotos Invoke-AvdProcess -Times 1 -Exactly
     }
-    It 'on Windows on Arm, refuses an x64 Java (sdkmanager would fetch x64 packages) and takes an arm64 one' {
-        function New-Exe([string]$Path, [int]$Machine) {
-            $b = [byte[]]::new(0x100)
-            $b[0] = 0x4D; $b[1] = 0x5A
-            [System.BitConverter]::GetBytes([int]0x80).CopyTo($b, 0x3C)
-            $b[0x80] = 0x50; $b[0x81] = 0x45
-            [System.BitConverter]::GetBytes([uint16]$Machine).CopyTo($b, 0x84)
-            New-File $Path ''
-            [System.IO.File]::WriteAllBytes($Path, $b)
-        }
-        $a = New-TestSetup -Architecture Arm64
-        $script:JavaExe = Join-Path $a.Base 'jdk-x64' 'java.exe'
-        New-Exe $JavaExe 0x8664
-        Mock -ModuleName AvdPhotos Get-AvdSetupJavaPath { $script:JavaExe }
-        Mock -ModuleName AvdPhotos Invoke-AvdProcess { New-Result -Err 'openjdk version "21.0.12" 2026-07-21 LTS' }
-        { Assert-AvdSetupJava 6>$null } | Should -Throw '*the X64 build of Java*winget install Microsoft.OpenJDK.21 --architecture arm64*'
-        Should -Invoke -ModuleName AvdPhotos Invoke-AvdProcess -Times 0 -Exactly
-        $script:JavaExe = Join-Path $a.Base 'jdk-arm64' 'java.exe'
-        New-Exe $JavaExe 0xAA64
-        Assert-AvdSetupJava
-        Should -Invoke -ModuleName AvdPhotos Invoke-AvdProcess -Times 1 -Exactly
-        # The same x64 Java on an x64 PC is simply Java.
-        $null = New-TestSetup -Architecture X64
-        $script:JavaExe = Join-Path $a.Base 'jdk-x64' 'java.exe'
-        Assert-AvdSetupJava
-        Mock -ModuleName AvdPhotos Get-AvdSetupJavaPath { $null }
+    It 'on Windows on Arm, names the arm64 JDK when Java is missing or too old' {
         $null = New-TestSetup -Architecture Arm64
+        Mock -ModuleName AvdPhotos Get-AvdSetupJavaPath { $null }
         { Assert-AvdSetupJava 6>$null } | Should -Throw '*Java not found*winget install Microsoft.OpenJDK.21 --architecture arm64*'
+        Mock -ModuleName AvdPhotos Get-AvdSetupJavaPath { '/fake/java' }
+        Mock -ModuleName AvdPhotos Invoke-AvdProcess { New-Result -Err 'java version "1.8.0_401"' }
+        { Assert-AvdSetupJava 6>$null } | Should -Throw '*Java 8*winget install Microsoft.OpenJDK.21 --architecture arm64*'
     }
     It 'dies on an unusable hypervisor in a full run and only reports it in -Check' {
         New-File $T.State.Emulator 'emu'

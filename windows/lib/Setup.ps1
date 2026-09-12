@@ -791,22 +791,17 @@ function Get-AvdSetupJavaPath {
 # sdkmanager and avdmanager are Java programs and current releases need JDK 17
 # or newer; with an older one they die on a class-version error that names
 # neither Java nor the fix. Checked once per run, before the first of them.
-# On Windows on Arm the JDK must also be the arm64 build: sdkmanager picks each
-# package's archive by the architecture its JVM reports, so under an x64 JDK
-# (emulated) it would fetch x64 packages, the emulator above all. Asked of
-# java.exe's own header, since the question is what the file is, not what this
-# pwsh is.
+# (Since command-line tools 23.0, Aug 2026, sdkmanager.bat hands its work to
+# the Android CLI, a native program, and avdmanager is the one still on Java;
+# the check stays, as the older tools a PATH can hold still need it. Any JDK
+# of the right version will do on either architecture: on Windows on Arm an
+# x64 one runs under emulation, and the hint names the arm64 build.)
 function Assert-AvdSetupJava {
     $s = $script:AvdSetup
     if ($s.JavaChecked) { return }
     $hint = Get-AvdInstallHint -Tool java -Architecture $s.Architecture
     $java = Get-AvdSetupJavaPath
     if (-not $java) { Stop-AvdSetup "Java not found; sdkmanager needs a JDK 17 or newer: $hint, then open a new terminal" }
-    if ($s.Architecture -eq 'Arm64') {
-        # '' (not a PE file, as a java on macOS is) is no reason to stop.
-        $ja = Get-AvdExecutableArchitecture -Path $java
-        if ($ja -and $ja -ne 'Arm64') { Stop-AvdSetup "$java is the $ja build of Java, which runs under emulation on Windows on Arm and would make sdkmanager fetch $ja packages: $hint (and point JAVA_HOME at it if it is set)" }
-    }
     $r = Invoke-AvdProcess -FilePath $java -ArgumentList @('-version') -TimeoutSec 30
     $v = Get-AvdJavaMajorVersion ($r.StdErr + "`n" + $r.StdOut)
     if ($r.ExitCode -ne 0) { Stop-AvdSetup "$java -version failed (exit $($r.ExitCode)); sdkmanager needs a JDK 17 or newer: $hint" }
