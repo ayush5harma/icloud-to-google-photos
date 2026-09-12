@@ -74,6 +74,9 @@ function New-FakeDevice {
         # The `su -c cp` of the Photos DB copies nothing (su refused, the DB
         # missing), so every pull of it fails: no host copy is ever coherent.
         CopyFails    = $false
+        # Every push of the on-device batch list fails (a full /data, adb
+        # dropping), leaving whatever an earlier batch left in its place.
+        BatchPushFails = $false
         ShortPush    = [System.Collections.Generic.HashSet[string]]::new()
         Indexed      = [System.Collections.Generic.HashSet[string]]::new()
         Unregistered = [System.Collections.Generic.HashSet[string]]::new()
@@ -321,6 +324,9 @@ function Invoke-FakeAdb {
                 Copy-Item -LiteralPath $local -Destination $file -Force
                 $Fake.Pushes.Add($remote)
                 return (New-FakeResult -StdOut "$local`: 1 file pushed.`r`n")
+            }
+            if ($remote -ceq '/data/local/tmp/avd-batch' -and $Fake.BatchPushFails) {
+                return (New-FakeResult -ExitCode 1 -StdErr "adb: error: failed to copy '$local' to '$remote'")
             }
             if ($remote -ceq '/data/local/tmp/avd-batch' -or $remote -ceq '/data/local/tmp/avd-query.sql') {
                 Copy-Item -LiteralPath $local -Destination (Join-Path $Fake.Tmp ($remote.Substring($remote.LastIndexOf('/') + 1))) -Force

@@ -442,9 +442,19 @@ function Invoke-AvdDeviceEach {
             $chunk = [string[]]@($items[$i..$last])
             $file = Join-Path $dir ('c.{0:D3}' -f [int][math]::Floor($i / 100))
             Set-AvdLine -Path $file -Line $chunk
-            $null = Invoke-AvdAdb -ArgumentList @('-s', $Context.Serial, 'push', $file, '/data/local/tmp/avd-batch') -TimeoutSec $Context.AdbTimeout
-            $r = Invoke-AvdAdbShell -Serial $Context.Serial -Command @($loop) -TimeoutSec ($Context.AdbTimeout + 200)
-            if ($r.ExitCode -ne 0) { $ok = $false }
+            $push = Invoke-AvdAdb -ArgumentList @('-s', $Context.Serial, 'push', $file, '/data/local/tmp/avd-batch') -TimeoutSec $Context.AdbTimeout
+            if ($push.ExitCode -eq 0) {
+                $r = Invoke-AvdAdbShell -Serial $Context.Serial -Command @($loop) -TimeoutSec ($Context.AdbTimeout + 200)
+                if ($r.ExitCode -ne 0) { $ok = $false }
+            } else {
+                # A DIFFERENCE FROM MACOS, on the safe side: bin/avd-photos-sync
+                # runs the loop whatever the push did, over whatever
+                # /data/local/tmp/avd-batch holds, and a loop killed at its
+                # timeout never reaches its `rm -f`. A stale list run in prune
+                # mode would remove device files this run never confirmed --
+                # files the ledger then never pushes again. No list, no loop.
+                $ok = $false
+            }
             $done += $chunk.Count
             Set-AvdSyncPhase $Context "$Label $done of $total"
         }

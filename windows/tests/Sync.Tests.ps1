@@ -275,6 +275,23 @@ Describe 'the on-device loop' {
         $Fake.Indexed.Count | Should -Be 250
         Assert-CleanFake
     }
+    It 'never runs a stale list when pushing the new one fails' {
+        $w = New-SyncWorld
+        $Fake.Running = $true
+        $ctx = New-AvdSyncContext -Config $w.Config
+        $ctx.Serial = $Fake.OurSerial
+        foreach ($n in 'A.HEIC', 'B.HEIC') { [System.IO.File]::WriteAllText((Join-Path $Fake.Dcim "2026_05_$n"), 'x') }
+        # The list a killed loop left on the device, naming both files.
+        [System.IO.File]::WriteAllText((Join-Path $Fake.Tmp 'avd-batch'), "/sdcard/DCIM/Camera/2026_05_A.HEIC`n/sdcard/DCIM/Camera/2026_05_B.HEIC`n")
+        $Fake.BatchPushFails = $true
+        Invoke-AvdDeviceEach $ctx @('/sdcard/DCIM/Camera/2026_05_A.HEIC') prune 'reclaiming emulator space:' | Should -BeFalse
+        # B, which nobody asked to prune, is still there; so is A, whose list never arrived.
+        Test-Path -LiteralPath (Join-Path $Fake.Dcim '2026_05_B.HEIC') | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $Fake.Dcim '2026_05_A.HEIC') | Should -BeTrue
+        @($Fake.Calls | Where-Object { $_ -like '* shell while IFS=*' }).Count | Should -Be 0
+        @($Fake.Phases) | Should -Be @('reclaiming emulator space: 1 of 1')
+        Assert-CleanFake
+    }
 }
 
 Describe 'a whole sync against the fake device' {
