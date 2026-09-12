@@ -60,6 +60,27 @@ func resolveScript(_ name: String) -> String {
     return ""
 }
 
+// A child of this app INHERITS the app's privacy grants -- that is the entire
+// point of --sync, and it is also why --run cannot be a general "run anything as
+// me" hatch: anything reachable through it would read the user's cloud mount
+// under this app's identity. So --run accepts only a command that resolves to a
+// file inside the pipeline's own bin directory, by basename or by a path that
+// lands there. Symlinks are resolved before the comparison, since the installed
+// commands ARE symlinks.
+func pipelineCommand(_ program: String) -> String? {
+    let fm = FileManager.default
+    let name = (program as NSString).lastPathComponent
+    guard !name.isEmpty, name != ".", name != ".." else { return nil }
+    let resolved = resolveScript(name)
+    guard !resolved.isEmpty else { return nil }
+    // A bare name is taken as that command. A path must point at the same file.
+    if program == name { return resolved }
+    let real = (program as NSString).resolvingSymlinksInPath
+    let realResolved = (resolved as NSString).resolvingSymlinksInPath
+    guard real == realResolved, fm.isExecutableFile(atPath: real) else { return nil }
+    return resolved
+}
+
 var cliChild: Process?
 func runUnderThisIdentity(_ argv: [String]) -> Never {
     guard let program = argv.first, !program.isEmpty else {
@@ -94,7 +115,15 @@ if cliArgs.first == "--sync" {
     }
     runUnderThisIdentity(["/bin/bash", script] + cliArgs.dropFirst())
 }
-if cliArgs.first == "--run" { runUnderThisIdentity(Array(cliArgs.dropFirst())) }
+if cliArgs.first == "--run" {
+    let rest = Array(cliArgs.dropFirst())
+    guard let want = rest.first, let program = pipelineCommand(want) else {
+        FileHandle.standardError.write(Data(
+            "PhotoSync --run: only this pipeline's own commands may run under the app's identity\n".utf8))
+        exit(64)
+    }
+    runUnderThisIdentity([program] + rest.dropFirst())
+}
 
 // The launchd label prefix, and it must match lib/config.sh's AP_LABEL_PREFIX:
 // "Check iCloud now" kickstarts <prefix>.sync so the run is launchd's child and
