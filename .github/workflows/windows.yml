@@ -1,5 +1,7 @@
-# The Windows port, checked on real Windows. What this proves and what it
-# cannot (no hosted runner can boot an Android emulator) is listed in
+# The Windows port, checked on real Windows of both architectures: x64
+# (windows-latest) and Arm64 (windows-11-arm, a Windows 11 Arm64 machine). What
+# this proves and what it cannot (no hosted runner can boot an Android
+# emulator, and Google publishes none for Windows on Arm) is listed in
 # windows/DESIGN.md and the README's Windows section.
 name: windows
 
@@ -35,9 +37,20 @@ defaults:
 
 jobs:
   windows:
-    name: Windows (Pester, PSScriptAnalyzer, Python, reclaim path)
-    runs-on: windows-latest
-    timeout-minutes: 45
+    name: Windows ${{ matrix.arch }} (Pester, PSScriptAnalyzer, Python, reclaim path, architecture, SDK host)
+    strategy:
+      # One architecture's failure must not hide the other's result.
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            arch: X64
+            jdk: x64
+          - runner: windows-11-arm
+            arch: Arm64
+            jdk: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
 
@@ -67,14 +80,31 @@ jobs:
         env:
           PYTHONUTF8: '1'
         run: |
+          $py = uv run --no-project --python 3.13 python -c "import platform; print(platform.machine(), platform.python_version())"
           $out = uv run --no-project --python 3.13 --with pytest pytest windows/tests/python -q
           $code = $LASTEXITCODE
           $out
-          "::notice title=pytest::$([System.Runtime.InteropServices.RuntimeInformation]::OSDescription): $($out | Select-Object -Last 1)"
+          "::notice title=pytest (${{ matrix.arch }})::$([System.Runtime.InteropServices.RuntimeInformation]::OSDescription), Python $py`: $($out | Select-Object -Last 1)"
           exit $code
 
       - name: Reclaim invocation path (uv tool icloudpd, pinned library, empty list)
         run: ./windows/tests/Test-ReclaimImport.ps1
+
+      # After the reclaim path, so uv, its Python 3.13 and icloudpd are there
+      # to be read.
+      - name: The machine's architecture, native and under emulation
+        run: ./windows/tests/Test-HostArchitecture.ps1 -Expect ${{ matrix.arch }}
+
+      # The JDK the README names (Microsoft's build of OpenJDK 21), in this
+      # machine's architecture: on Windows on Arm the setup refuses any other.
+      - uses: actions/setup-java@v6
+        with:
+          distribution: microsoft
+          java-version: '21'
+          architecture: ${{ matrix.jdk }}
+
+      - name: What the setup fetches from Google, up to the emulator
+        run: ./windows/tests/Test-SdkHost.ps1 -Expect ${{ matrix.arch }}
 
   python:
     name: Python and reclaim path (${{ matrix.os }})
@@ -99,3 +129,14 @@ jobs:
           exit $code
       - name: Reclaim invocation path (uv tool icloudpd, pinned library, empty list)
         run: ./windows/tests/Test-ReclaimImport.ps1
+      # The suites on an Apple Silicon Mac, WindowsOnly excluded: how the port
+      # is checked before any Windows machine sees it (Invoke-Checks.ps1).
+      - name: Install Pester 5 and PSScriptAnalyzer (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Name Pester -RequiredVersion 5.9.1 -Scope CurrentUser -Force -SkipPublisherCheck
+          Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force
+      - name: Parse, PSScriptAnalyzer and Pester (macOS)
+        if: runner.os == 'macOS'
+        run: ./windows/tests/Invoke-Checks.ps1

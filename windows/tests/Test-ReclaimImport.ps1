@@ -4,17 +4,20 @@
 The reclaim step's whole invocation path on this OS, with no Apple account.
 
 .DESCRIPTION
-Installs icloudpd the way the README says (`uv tool install icloudpd`), reads
-its version the way the sync does, pins the library to that version, and runs
-bin/avd-photos-reclaim.py -- unchanged, the file macOS runs -- under
+Installs icloudpd the way the README says (`uv tool install icloudpd`; on
+Windows on Arm `uv tool install --python 3.13 icloudpd`, which takes its
+pure-Python wheel, as icloudpd builds Windows executables for amd64 only),
+reads its version the way the sync does, pins the library to that version, and
+runs bin/avd-photos-reclaim.py -- unchanged, the file macOS runs -- under
 `uv run --python 3.13` with PYTHONUTF8=1 and an EMPTY pending list. The script
 imports every icloudpd name it uses before it reads that list, and returns
 before authenticating when the list is empty, so this proves the tool
 install, the version parse, the git+https pin, the managed Python and every
-import, and touches nothing but a scratch directory.
+import, and touches nothing but a scratch directory. On Windows it also says
+what the tool's Python is built for, from its PE header.
 
-CI runs it on windows-latest, ubuntu-latest and macos-latest. It needs uv and
-git on PATH and network access.
+CI runs it on windows-latest, windows-11-arm, ubuntu-latest and macos-latest.
+It needs uv and git on PATH and network access.
 #>
 [CmdletBinding()]
 param([string]$WorkDir)
@@ -26,14 +29,23 @@ $null = New-Item -ItemType Directory -Force -Path $WorkDir
 Add-AvdToolPath
 $uv = (Get-Command -Name 'uv' -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 
-$r = Invoke-AvdProcess -FilePath $uv -ArgumentList @('tool', 'install', 'icloudpd') -TimeoutSec 900
-if ($r.ExitCode -ne 0) { throw "uv tool install icloudpd failed ($($r.ExitCode)): $($r.StdErr)" }
+# The Windows port's per-architecture install; elsewhere the macOS README's.
+$arch = if ($IsWindows) { (Get-AvdHostArchitecture).Os } else { '' }
+$installArgs = Get-AvdIcloudpdInstallArgument -Architecture $arch
+$r = Invoke-AvdProcess -FilePath $uv -ArgumentList $installArgs -TimeoutSec 900
+if ($r.ExitCode -ne 0) { throw "uv $($installArgs -join ' ') failed ($($r.ExitCode)): $($r.StdErr)" }
 $binDir = (Invoke-AvdProcess -FilePath $uv -ArgumentList @('tool', 'dir', '--bin') -TimeoutSec 60).StdOut.Trim()
 $icloudpd = Join-Path $binDir $(if ($IsWindows) { 'icloudpd.exe' } else { 'icloudpd' })
 $r = Invoke-AvdProcess -FilePath $icloudpd -ArgumentList @('--version') -TimeoutSec 300
 $version = Get-AvdIcloudpdVersion -Text $r.StdOut
 if (-not $version) { throw "could not read a version from icloudpd --version: $($r.StdOut) $($r.StdErr)" }
-Write-Host "icloudpd $version at $icloudpd"
+Write-Host "icloudpd $version at $icloudpd (uv $($installArgs -join ' '))"
+$toolPython = ''
+if ($IsWindows) {
+    $toolDir = (Invoke-AvdProcess -FilePath $uv -ArgumentList @('tool', 'dir') -TimeoutSec 60).StdOut.Trim()
+    $toolPython = Get-AvdExecutableArchitecture -Path (Join-Path $toolDir 'icloudpd' 'Scripts' 'python.exe')
+    Write-Host "icloudpd's Python is the $(if ($toolPython) { $toolPython } else { 'unknown' }) build on a $arch machine"
+}
 
 $pending = Join-Path $WorkDir 'pending'
 [System.IO.File]::WriteAllText($pending, '')
@@ -54,5 +66,6 @@ if ($stats.pending -ne 0 -or $stats.deleted -ne 0 -or $stats.dry_run -ne $false)
 if (Test-Path -LiteralPath $out) { throw 'an empty pending list must not write --out' }
 Write-Host 'reclaim import path: ok'
 if ($env:GITHUB_ACTIONS -eq 'true') {
-    Write-Host "::notice title=Reclaim path::$([System.Runtime.InteropServices.RuntimeInformation]::OSDescription): icloudpd $version via uv tool; bin/avd-photos-reclaim.py exit 0 on an empty list; stats $($r.StdOut.Trim())"
+    $py = if ($toolPython) { " on a $toolPython Python ($arch machine)" } else { '' }
+    Write-Host "::notice title=Reclaim path::$([System.Runtime.InteropServices.RuntimeInformation]::OSDescription): icloudpd $version via uv $($installArgs -join ' ')$py; bin/avd-photos-reclaim.py exit 0 on an empty list; stats $($r.StdOut.Trim())"
 }

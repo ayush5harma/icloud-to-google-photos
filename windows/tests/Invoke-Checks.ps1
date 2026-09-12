@@ -7,8 +7,9 @@ One exit code for every check of the Windows port.
 Every PowerShell file under windows\ parses; PSScriptAnalyzer reports nothing
 at Warning or above (with the settings beside this file); the Pester suites in
 this directory pass. Suites tagged WindowsOnly run only on Windows. CI runs
-this on windows-latest; it runs anywhere pwsh 7 does, which is how the port
-was checked on a Mac before any Windows machine saw it.
+this on windows-latest (x64), windows-11-arm (Arm64) and macos-latest; it runs
+anywhere pwsh 7 does, which is how the port was checked on a Mac before any
+Windows machine saw it.
 
 Needs the Pester (5.x) and PSScriptAnalyzer modules on PSModulePath.
 
@@ -71,7 +72,9 @@ if (-not $NoPester) {
     }
     $r = Invoke-Pester -Configuration $cfg
     $failed += $r.FailedCount + $r.FailedBlocksCount + $r.FailedContainersCount
-    $pesterLine = "Pester on $([System.Runtime.InteropServices.RuntimeInformation]::OSDescription): passed $($r.PassedCount), failed $($r.FailedCount), skipped $($r.SkippedCount), not run $($r.NotRunCount)"
+    # The architecture as well: both Windows runners describe themselves as
+    # "Microsoft Windows 10.0.26100".
+    $pesterLine = "Pester on $([System.Runtime.InteropServices.RuntimeInformation]::OSDescription) ($([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)): passed $($r.PassedCount), failed $($r.FailedCount), skipped $($r.SkippedCount), not run $($r.NotRunCount)"
 }
 
 # In GitHub Actions, the counts as an annotation as well: annotations are
