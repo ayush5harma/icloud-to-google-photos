@@ -206,6 +206,18 @@ function Show-AvdTrayMenu {
     if ($null -ne $m) { [void]$m.Invoke($NotifyIcon, $null) }
 }
 
+# -- Children ------------------------------------------------------------------------
+
+# The pwsh arguments that run one of the pipeline's scripts: the prefix the
+# installer's tasks and shortcuts use, so a script behaves the same whichever
+# of them started it. -ExecutionPolicy is passed, not inherited: this tray's
+# own -ExecutionPolicy reaches its children only through an environment
+# variable, and a tray started some other way would not have set it.
+function Get-AvdTrayPwshArgument {
+    param([Parameter(Mandatory)][string]$Script, [string[]]$Argument = @())
+    , (@('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $Script) + $Argument)
+}
+
 # -- Collect (refresh()) -----------------------------------------------------------
 
 function Test-AvdTraySick {
@@ -233,7 +245,7 @@ function Start-AvdTrayCollection {
     if ($null -ne $t.Collector) { return }
     $out = Join-Path ([System.IO.Path]::GetTempPath()) ('avd-photos-tray-' + [guid]::NewGuid().ToString('N') + '.json')
     try {
-        $p = Start-AvdDetachedProcess -FilePath $t.Pwsh -ArgumentList @('-NoProfile', '-NonInteractive', '-File', $t.StatusScript, '-OutFile', $out)
+        $p = Start-AvdDetachedProcess -FilePath $t.Pwsh -ArgumentList (Get-AvdTrayPwshArgument -Script $t.StatusScript -Argument '-OutFile', $out)
     } catch {
         Write-AvdTrayError $_
         $t.LastError = 'collector failed to start'
@@ -371,7 +383,7 @@ function Invoke-AvdTrayCheck {
         } finally { $p.Dispose() }
     } catch { Write-AvdTrayError $_ }
     if (-not $kicked -and $t.SyncScript) {
-        try { (Start-AvdDetachedProcess -FilePath $t.Pwsh -ArgumentList @('-NoProfile', '-NonInteractive', '-File', $t.SyncScript)).Dispose() }
+        try { (Start-AvdDetachedProcess -FilePath $t.Pwsh -ArgumentList (Get-AvdTrayPwshArgument -Script $t.SyncScript)).Dispose() }
         catch { Write-AvdTrayError $_ }
     }
     $timer = [System.Windows.Forms.Timer]::new()
@@ -395,7 +407,7 @@ function Invoke-AvdTrayOffload {
     if ($t.Offloading -or -not $t.SyncScript) { return }
     $t.Offloading = $true
     try {
-        $t.OffloadProcess = Start-AvdDetachedProcess -FilePath $t.Pwsh -ArgumentList @('-NoProfile', '-NonInteractive', '-File', $t.SyncScript, '-Offload')
+        $t.OffloadProcess = Start-AvdDetachedProcess -FilePath $t.Pwsh -ArgumentList (Get-AvdTrayPwshArgument -Script $t.SyncScript -Argument '-Offload')
     } catch {
         Write-AvdTrayError $_
         $t.Offloading = $false
@@ -406,7 +418,7 @@ function Invoke-AvdTrayOffload {
 function Invoke-AvdTrayOpenAvd {
     $t = $script:AvdTray
     if (-not $t.AppScript) { return }
-    (Start-AvdDetachedProcess -FilePath $t.Pwsh -ArgumentList @('-NoProfile', '-NonInteractive', '-File', $t.AppScript, '-Open')).Dispose()
+    (Start-AvdDetachedProcess -FilePath $t.Pwsh -ArgumentList (Get-AvdTrayPwshArgument -Script $t.AppScript -Argument '-Open')).Dispose()
 }
 
 # Ends Application.Run; Start-AvdTrayHost then disposes everything and exits.
@@ -445,7 +457,7 @@ function Start-AvdTrayHost {
     # default; a caller that passed -MTA gets a copy of this script in STA,
     # waited on so a task that started this one still tracks the tray.
     if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne [System.Threading.ApartmentState]::STA) {
-        $p = Start-AvdDetachedProcess -FilePath ([System.Environment]::ProcessPath) -ArgumentList @('-STA', '-NoProfile', '-NonInteractive', '-File', $PSCommandPath)
+        $p = Start-AvdDetachedProcess -FilePath ([System.Environment]::ProcessPath) -ArgumentList (@('-STA') + (Get-AvdTrayPwshArgument -Script $PSCommandPath))
         $p.WaitForExit()
         exit $p.ExitCode
     }
