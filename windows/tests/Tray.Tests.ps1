@@ -691,8 +691,8 @@ Describe 'the host logic (dot-sourced, fake processes and timers)' {
             Start-AvdTrayCollection
             Start-AvdTrayCollection
             Should -Invoke Start-AvdDetachedProcess -Times 1 -Exactly -ParameterFilter {
-                $FilePath -eq 'pwsh' -and $ArgumentList[0] -eq '-NoProfile' -and $ArgumentList -contains '-NonInteractive' -and
-                $ArgumentList[3] -eq 'C:\t\avd-photos-status.ps1' -and $ArgumentList[4] -eq '-OutFile' -and $ArgumentList[5] -like '*.json'
+                $FilePath -eq 'pwsh' -and ($ArgumentList[0..5] -join ' ') -eq '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\t\avd-photos-status.ps1' -and
+                $ArgumentList[6] -eq '-OutFile' -and $ArgumentList[7] -like '*.json' -and $ArgumentList.Count -eq 8
             }
             $t.Collector | Should -Not -BeNullOrEmpty
             $t.Timers.Poll.Enabled | Should -BeTrue
@@ -796,7 +796,7 @@ Describe 'the host logic (dot-sourced, fake processes and timers)' {
             Invoke-AvdTrayAction -Action offload
             Invoke-AvdTrayAction -Action offload
             Should -Invoke Start-AvdDetachedProcess -Times 1 -Exactly -ParameterFilter {
-                $FilePath -eq 'pwsh' -and $ArgumentList[3] -eq 'C:\t\avd-photos-sync.ps1' -and $ArgumentList[4] -eq '-Offload'
+                $FilePath -eq 'pwsh' -and ($ArgumentList -join ' ') -eq '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\t\avd-photos-sync.ps1 -Offload'
             }
             $t.Offloading | Should -BeTrue
             Invoke-AvdTrayHeartbeat
@@ -806,6 +806,17 @@ Describe 'the host logic (dot-sourced, fake processes and timers)' {
             $t.Offloading | Should -BeFalse
             $t.OffloadProcess | Should -BeNullOrEmpty
             Should -Invoke Start-AvdTrayCollection -Times 1 -Exactly
+        }
+        It 'opens Google Photos through avd-photos-app -Open, and does nothing without it' {
+            Mock Start-AvdDetachedProcess { New-FakeProcess }
+            $null = Set-TrayState @{ AppScript = 'C:\t\avd-photos-app.ps1' }
+            Invoke-AvdTrayOpenAvd
+            Should -Invoke Start-AvdDetachedProcess -Times 1 -Exactly -ParameterFilter {
+                ($ArgumentList -join ' ') -eq '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\t\avd-photos-app.ps1 -Open'
+            }
+            $null = Set-TrayState
+            Invoke-AvdTrayOpenAvd
+            Should -Invoke Start-AvdDetachedProcess -Times 1 -Exactly
         }
         It 'clears the offload flag and refreshes when the run cannot start' {
             Mock Start-AvdDetachedProcess { throw 'no pwsh' }
