@@ -71,6 +71,17 @@ if (-not $NoPester) {
     }
     $r = Invoke-Pester -Configuration $cfg
     $failed += $r.FailedCount + $r.FailedBlocksCount + $r.FailedContainersCount
+    $pesterLine = "Pester on $([System.Runtime.InteropServices.RuntimeInformation]::OSDescription): passed $($r.PassedCount), failed $($r.FailedCount), skipped $($r.SkippedCount), not run $($r.NotRunCount)"
+}
+
+# In GitHub Actions, the counts as an annotation as well: annotations are
+# readable through the public API, job logs are not, and the pull request
+# cites these numbers as the evidence of what ran on Windows.
+if ($env:GITHUB_ACTIONS -eq 'true') {
+    $parts = @("parsed $($files.Count) files")
+    if (-not $NoAnalyzer) { $parts += "PSScriptAnalyzer findings $($results.Count)" }
+    if (-not $NoPester) { $parts += $pesterLine }
+    Write-Host "::notice title=Invoke-Checks::$($parts -join '; ')"
 }
 
 if ($failed -gt 0) {

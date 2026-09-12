@@ -53,3 +53,6 @@ $stats = $r.StdOut.Trim() | ConvertFrom-Json
 if ($stats.pending -ne 0 -or $stats.deleted -ne 0 -or $stats.dry_run -ne $false) { throw "unexpected stats: $($r.StdOut)" }
 if (Test-Path -LiteralPath $out) { throw 'an empty pending list must not write --out' }
 Write-Host 'reclaim import path: ok'
+if ($env:GITHUB_ACTIONS -eq 'true') {
+    Write-Host "::notice title=Reclaim path::$([System.Runtime.InteropServices.RuntimeInformation]::OSDescription): icloudpd $version via uv tool; bin/avd-photos-reclaim.py exit 0 on an empty list; stats $($r.StdOut.Trim())"
+}
