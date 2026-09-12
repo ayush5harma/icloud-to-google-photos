@@ -505,13 +505,15 @@ Describe 'a whole sync against the fake device' {
         Test-Path $lock | Should -BeFalse
     }
 
-    It 'logs a config line it could not use instead of dropping it' {
-        $w = New-SyncWorld -ConfigText "this is not config`nUPLOAD_WAIT=0`n"
+    It 'logs a config line it could not use instead of dropping it, without repeating the line' {
+        $w = New-SyncWorld -ConfigText "set GITHUB_TOKEN=ghp_notarealtoken`nUPLOAD_WAIT=0`n"
         Add-Staged $w '2026/05/A.HEIC'
         Set-AvdLine -Path (Get-StatePath $w 'pushed.list') -Line @('2026/05/A.HEIC')
         Set-Stamp $w
         Invoke-AvdPhotosSync -Config $w.Config | Should -Be 0
-        (Get-SyncLog $w) | Should -Match 'WARNING: config: .*config: line 1: not a KEY=value assignment, ignored: this is not config'
+        $log = Get-SyncLog $w
+        $log | Should -Match 'WARNING: config: .*config: line 1: not a KEY=value assignment, ignored \(it names GITHUB_TOKEN'
+        $log | Should -Not -Match 'notarealtoken'
     }
 
     It 're-announces the files Photos has not registered, on the third poll' {

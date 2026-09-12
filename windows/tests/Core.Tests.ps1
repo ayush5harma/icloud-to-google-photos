@@ -172,6 +172,18 @@ Describe 'ConvertFrom-AvdConfigText' {
         $r.Warnings[0] | Should -Match 'line 1'
         $r.Values.AVD_NAME | Should -Be 'x'
     }
+    It 'never repeats a line in a warning, so a mistyped token cannot reach a log' {
+        $r = Parse "set GITHUB_TOKEN=ghp_notarealtoken1`n`$env:GITHUB_TOKEN = 'ghp_notarealtoken2'`nghp_notarealtoken3`nGITHUB_TOKEN='ghp_notarealtoken4'tail5"
+        $r.Warnings.Count | Should -Be 4
+        ($r.Warnings -join "`n") | Should -Not -Match 'notarealtoken|tail5'
+        $r.Warnings[0] | Should -BeExactly 'line 1: not a KEY=value assignment, ignored (it names GITHUB_TOKEN; the line is not repeated here)'
+        $r.Warnings[1] | Should -Match '^line 2: .*it names GITHUB_TOKEN'
+        $r.Warnings[2] | Should -BeExactly 'line 3: not a KEY=value assignment, ignored (the line is not repeated here, in case it holds a secret)'
+        $r.Warnings[3] | Should -BeExactly 'line 4: text after the closing quote of GITHUB_TOKEN ignored'
+    }
+    It 'names a known key only as a whole word' {
+        (Parse 'set MY_GITHUB_TOKENS=1').Warnings[0] | Should -Match 'in case it holds a secret'
+    }
     It 'reports an unterminated quote and text after a closing quote' {
         $r = Parse "STAGING=`"C:\x`nAVD_NAME='a' b"
         $r.Values.Contains('STAGING') | Should -BeFalse

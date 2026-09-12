@@ -304,6 +304,19 @@ function Expand-AvdConfigValue {
 #   as a sourced file's would be; only known keys are returned.
 # A line that is not an assignment is reported, never silently dropped: a
 # config value quietly lost is what the macOS config comment warns about.
+# The report never repeats the line: these warnings go to sync.log and
+# setup.log, which the README asks people to paste into issues, and a
+# GITHUB_TOKEN written in another shell's syntax (`set GITHUB_TOKEN=...`,
+# `$env:GITHUB_TOKEN = '...'`) would be published with them. The line number
+# and the known key it names are enough to find it.
+function Get-AvdConfigLineHint {
+    param([AllowEmptyString()][string]$Line)
+    foreach ($k in $script:AvdKeys) {
+        if ($Line -cmatch "(?<![A-Za-z0-9_])$k(?![A-Za-z0-9_])") { return " (it names $k; the line is not repeated here)" }
+    }
+    ' (the line is not repeated here, in case it holds a secret)'
+}
+
 function ConvertFrom-AvdConfigText {
     param(
         [AllowEmptyString()][string]$Text,
@@ -324,7 +337,7 @@ function ConvertFrom-AvdConfigText {
         if ($trimmed -eq '' -or $trimmed.StartsWith('#')) { continue }
         $m = [regex]::Match($line, '^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$')
         if (-not $m.Success) {
-            $warnings.Add("line $($ln + 1): not a KEY=value assignment, ignored: $trimmed")
+            $warnings.Add("line $($ln + 1): not a KEY=value assignment, ignored$(Get-AvdConfigLineHint $trimmed)")
             continue
         }
         $name = $m.Groups[1].Value
@@ -348,7 +361,7 @@ function ConvertFrom-AvdConfigText {
             $val = Expand-AvdConfigValue -Value $bare -Lookup $vars -Environment $Environment -HomeDir $HomeDir
         }
         if ($rest -ne '' -and -not $rest.StartsWith('#')) {
-            $warnings.Add("line $($ln + 1): text after the closing quote of $name ignored: $rest")
+            $warnings.Add("line $($ln + 1): text after the closing quote of $name ignored")
         }
         $vars[$name] = $val
         if ($script:AvdKeys -contains $name) { $values[$name] = $val }
