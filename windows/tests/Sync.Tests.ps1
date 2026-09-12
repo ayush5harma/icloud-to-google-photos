@@ -19,8 +19,12 @@ BeforeAll {
     # directory, the macOS prefix incident), an AVD and an emulator binary, the
     # sentinel unless -Unarmed, and a fresh fake device in $script:Fake.
     function New-SyncWorld {
-        param([hashtable]$Environment = @{}, [switch]$Unarmed)
+        param([hashtable]$Environment = @{}, [switch]$Unarmed, [string]$ConfigText)
         $root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N').Substring(0, 10))
+        if ($ConfigText) {
+            $null = [System.IO.Directory]::CreateDirectory((Join-Path $root 'config'))
+            [System.IO.File]::WriteAllText((Join-Path $root 'config' 'config'), $ConfigText)
+        }
         $h = Join-Path $root 'home'
         $e = @{
             HOME                  = $h
@@ -499,6 +503,15 @@ Describe 'a whole sync against the fake device' {
         $log | Should -Match (ConvertTo-LogPattern 'reclaiming a stale lock (pid 4242 is gone)')
         $log | Should -Match 'not armed'
         Test-Path $lock | Should -BeFalse
+    }
+
+    It 'logs a config line it could not use instead of dropping it' {
+        $w = New-SyncWorld -ConfigText "this is not config`nUPLOAD_WAIT=0`n"
+        Add-Staged $w '2026/05/A.HEIC'
+        Set-AvdLine -Path (Get-StatePath $w 'pushed.list') -Line @('2026/05/A.HEIC')
+        Set-Stamp $w
+        Invoke-AvdPhotosSync -Config $w.Config | Should -Be 0
+        (Get-SyncLog $w) | Should -Match 'WARNING: config: .*config: line 1: not a KEY=value assignment, ignored: this is not config'
     }
 
     It 're-announces the files Photos has not registered, on the third poll' {
