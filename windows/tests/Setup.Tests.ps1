@@ -408,7 +408,8 @@ Describe 'Java, acceleration and path guards' {
     It 'dies on an unusable hypervisor in a full run and only reports it in -Check' {
         New-File $T.State.Emulator 'emu'
         Mock -ModuleName AvdPhotos Invoke-AvdProcess { New-Result -Out "accel:`n11`nAEHD is not installed on this machine`naccel`n" -Code 1 }
-        { Assert-AvdSetupAcceleration 6>$null } | Should -Throw '*cannot use hardware acceleration*'
+        # The wording the README's Troubleshooting quotes.
+        { Assert-AvdSetupAcceleration 6>$null } | Should -Throw '*no hardware acceleration*'
         Get-SetupLog $T.State | Should -Match 'Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All'
         $c = New-TestSetup -Mode Check
         New-File $c.State.Emulator 'emu'
@@ -652,6 +653,28 @@ Describe 'cleanup (the EXIT trap)' {
         $s.EmuStartedByUs = $true; $s.Serial = ''
         Invoke-AvdSetupCleanup
         Should -Invoke -ModuleName AvdPhotos Invoke-AvdAdb -Times 0 -Exactly
+    }
+}
+
+Describe 'the summary' {
+    It 'reports the device id in -Check while the emulator runs, read-only' {
+        $c = New-TestSetup -Mode Check
+        $c.State.Serial = 'emulator-5556'
+        Mock -ModuleName AvdPhotos Invoke-AvdAdb { New-Result }
+        Mock -ModuleName AvdPhotos Get-AvdSetupGsfDeviceId { '4012345678901234567' }
+        Write-AvdSetupSummary 6>$null
+        Get-SetupLog $c.State | Should -Match 'device id: 4012345678901234567'
+        # Only `adb -s <serial> shell <read>`: no push, install, reboot or kill,
+        # and no device command that writes.
+        Should -Invoke -ModuleName AvdPhotos Invoke-AvdAdb -Times 0 -Exactly -ParameterFilter {
+            $ArgumentList[2] -ne 'shell' -or $ArgumentList[3] -match 'touch |rm -|>>|> /|--install-module|--restorecon|--sqlite| disable '
+        }
+    }
+    It 'does not look for it with no serial resolved' {
+        $c = New-TestSetup -Mode Check
+        Mock -ModuleName AvdPhotos Get-AvdSetupGsfDeviceId { throw 'not expected' }
+        Write-AvdSetupSummary 6>$null
+        Get-SetupLog $c.State | Should -Not -Match 'device id'
     }
 }
 
