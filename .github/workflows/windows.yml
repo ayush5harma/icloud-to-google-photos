@@ -55,7 +55,7 @@ jobs:
           Install-Module -Name Pester -RequiredVersion 5.9.1 -Scope CurrentUser -Force -SkipPublisherCheck
           Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force
 
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.1.0
 
       - name: Parse, PSScriptAnalyzer and Pester (WindowsOnly suites included)
         run: ./windows/tests/Invoke-Checks.ps1
@@ -78,7 +78,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.1.0
       - name: Python tests
         run: uv run --no-project --python 3.13 --with pytest pytest windows/tests/python -q
       - name: Reclaim invocation path (uv tool icloudpd, pinned library, empty list)
