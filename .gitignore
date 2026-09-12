@@ -1,0 +1,12 @@
+# Build artefacts. The app is built into /Applications (or --dest), never into
+# the checkout, so the only thing a build leaves here is its failure log.
+.build.log
+*.icon/
+*.iconset/
+
+# macOS
+.DS_Store
+
+# Python bytecode from `python3 -m py_compile`
+__pycache__/
+*.pyc
