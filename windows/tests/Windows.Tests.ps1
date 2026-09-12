@@ -52,7 +52,7 @@ Describe 'scheduled tasks as Task Scheduler reads them back' -Tag 'WindowsOnly' 
         $w.StartBoundary | Should -Match 'T05:30:00'
         (Task setup).Actions[0].Arguments | Should -Match '-Headless$'
     }
-    It 'registers the tray as plain pwsh, restarted on failure, at normal priority' {
+    It 'registers the tray as plain pwsh, with restart-on-failure set, at normal priority' {
         $t = Task tray
         $t.Actions[0].Execute | Should -Be $Pwsh
         $t.Actions[0].Arguments | Should -Match '-STA'
