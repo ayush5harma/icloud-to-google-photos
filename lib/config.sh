@@ -152,18 +152,27 @@ ap_defaults() {
 
 # ap_load_config: defaults, then the config file, then the caller's environment
 # back on top. Safe to call more than once.
+#
+# The snapshot tests whether the caller SET each key, not whether it is non-empty
+# (`${k+x}`), so an explicitly empty value survives: `KEEP_ICLOUD_DAYS= ` on the
+# command line means "no floor for this run" and must beat the config's 7, the
+# same way an empty value in the config file beats the default.
 ap_load_config() {
   local k v
   for k in $AP_KEYS; do
-    eval "v=\${$k-}"
-    [ -n "$v" ] && eval "AP_ENV_$k=\$v"
+    eval "v=\${$k+set}"
+    if [ "$v" = set ]; then
+      eval "AP_ENV_SET_$k=1; AP_ENV_$k=\${$k}"
+    else
+      eval "AP_ENV_SET_$k=0"
+    fi
   done
   ap_defaults
   # shellcheck disable=SC1090
   [ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
   for k in $AP_KEYS; do
-    eval "v=\${AP_ENV_$k-}"
-    [ -n "$v" ] && eval "$k=\$v"
+    eval "v=\${AP_ENV_SET_$k-0}"
+    [ "$v" = 1 ] && eval "$k=\${AP_ENV_$k}"
   done
   # Deliberately NOT a second ap_defaults pass here: every key already has a
   # value, and a re-run would overwrite a key the config file set to an empty
