@@ -15,8 +15,11 @@
   responsible process: it gets "Operation not permitted" on every directory of
   the mount while a child of the app bundle lists it fine. `--sync` spawns the
   script as the app's child and waits. The wrapper waits for the app to exist so
-  a fresh machine mid-install does not fail the job; `exec` is fine because the
-  FINAL image is the app.
+  a fresh machine mid-install does not fail the job, but that wait is BOUNDED at
+  five minutes and then exits 78 (EX_CONFIG): a job sleeping forever looks
+  identical in `launchctl print` to a healthy idle one, and the whole design of
+  this pipeline is that a thing which is not working says so. `exec` is fine
+  because the FINAL image is the app.
 
   Background band with LowPriorityIO and Nice: calendar and interval jobs missed
   while the Mac slept all fire TOGETHER at wake, so priority, not scheduling, is
@@ -30,7 +33,7 @@
   <array>
     <string>/bin/bash</string>
     <string>-c</string>
-    <string>app="__APP_BIN__"; while [ ! -x "$app" ]; do sleep 300; done; exec "$app" --sync</string>
+    <string>app="__APP_BIN__"; n=0; while [ ! -x "$app" ]; do n=$((n+1)); [ "$n" -gt 60 ] &amp;&amp; { echo "$app never appeared - run build.sh" >&amp;2; exit 78; }; sleep 5; done; exec "$app" --sync</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>

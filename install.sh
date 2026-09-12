@@ -76,11 +76,24 @@ if [ "$MODE" = uninstall ]; then
   done
   head2 "Commands"
   for f in "$SRC_DIR"/bin/*; do
+    [ -f "$f" ] || continue
     n="$(basename "$f")"
     t="$BIN_DIR/$n"
-    # Only remove what we installed: a symlink into this checkout, or a copy of
-    # the same name. Never anything else that happens to share the name.
-    if [ -L "$t" ] || [ -f "$t" ]; then rm -f "$t"; say "removed $t"; fi
+    [ -e "$t" ] || [ -L "$t" ] || continue
+    # ONLY WHAT WE INSTALLED. An install writes symlinks and nothing else, so
+    # anything that is not a symlink resolving INTO this checkout or into our own
+    # libexec belongs to someone else -- a package manager's binary of the same
+    # name, a script the user wrote -- and removing it would be this installer
+    # deleting a stranger's file.
+    if [ -L "$t" ]; then
+      r="$(readlink -f "$t" 2>/dev/null || true)"
+      case "$r" in
+        "$SRC_DIR"/*|"$LIBEXEC"/*) rm -f "$t"; say "removed $t" ;;
+        *) say "left $t (a symlink to ${r:-nowhere}, not ours)" ;;
+      esac
+    else
+      say "left $t (not a symlink we created)"
+    fi
   done
   if [ -d "$LIBEXEC" ]; then rm -rf "$LIBEXEC"; say "removed $LIBEXEC"; fi
   head2 "App"
@@ -148,6 +161,9 @@ if [ -f "$CONFIG_FILE" ]; then
 else
   ap_write_default_config && say "wrote $CONFIG_FILE"
 fi
+# It holds an Apple ID and may hold a GITHUB_TOKEN, whoever wrote it.
+ap_secure_config
+[ $? -eq 10 ] && say "tightened $CONFIG_FILE to 0600 (it holds an Apple ID)"
 [ -n "$ICLOUD_USERNAME" ] || say "SET ICLOUD_USERNAME in $CONFIG_FILE before arming."
 
 if [ "$WANT_APP" -eq 1 ]; then
@@ -163,6 +179,15 @@ if [ "$WANT_AGENTS" -eq 1 ]; then
     src="$SRC_DIR/launchd/$a.plist.template"
     dst="$AGENT_DIR/$label.plist"
     [ -f "$src" ] || { say "missing template $src"; continue; }
+    # The two agents that ARE the app: without it there is nothing to load, and
+    # the sync in particular must run as the app (that is what gives it the
+    # file-provider grant), so loading it here would only schedule a job that
+    # waits for a binary nobody is going to build.
+    if [ "$WANT_APP" -eq 0 ] && { [ "$a" = "sync" ] || [ "$a" = "menubar" ]; }; then
+      say "skipping $label (--no-app: it runs the app bundle)"
+      rm -f "$dst"
+      continue
+    fi
     # The placeholders are substituted with `|` as the sed delimiter, so a path
     # containing `/` needs no escaping; a path containing `|` would, and none of
     # these can (they are directories under $HOME or /Applications).
