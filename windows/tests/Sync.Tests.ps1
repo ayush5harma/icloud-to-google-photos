@@ -475,6 +475,32 @@ Describe 'a whole sync against the fake device' {
         }
     }
 
+    It 'backs up a staged path outside YYYY/MM but never hands it to the reclaim (its device name does not reverse)' {
+        $w = New-SyncWorld
+        $Fake.Downloads.Add('2026/05/IMG_0001.HEIC')
+        Add-Staged $w 'Imported/x.jpg'
+        Invoke-AvdPhotosSync -Config $w.Config | Should -Be 0
+        @($Fake.Pushes) | Should -Be @('/sdcard/DCIM/Camera/2026_05_IMG_0001.HEIC', '/sdcard/DCIM/Camera/Imported_x.jpg')
+        (Get-SyncLog $w) | Should -Match (ConvertTo-LogPattern 'UPLOAD CONFIRMED: 2 file(s) backed up to Google Photos')
+        @(Get-ChildItem -LiteralPath $Fake.Dcim).Count | Should -Be 0
+        $Fake.ReclaimCalls[0].Pending | Should -Be @('2026/05/IMG_0001.HEIC')
+        Assert-CleanFake
+    }
+
+    It 'reclaims a stale lock and says so in the log' {
+        $w = New-SyncWorld -Unarmed
+        $lock = Get-StatePath $w 'sync.lock'
+        $null = [System.IO.Directory]::CreateDirectory($lock)
+        [System.IO.File]::WriteAllText((Join-Path $lock 'pid'), "4242`n")
+        [System.IO.File]::SetLastWriteTimeUtc((Join-Path $lock 'pid'), [datetime]::UtcNow.AddMinutes(-5))
+        Mock -ModuleName AvdPhotos Get-AvdProcessStartTick { $null } -ParameterFilter { $Id -eq 4242 }
+        Invoke-AvdPhotosSync -Config $w.Config | Should -Be 0
+        $log = Get-SyncLog $w
+        $log | Should -Match (ConvertTo-LogPattern 'reclaiming a stale lock (pid 4242 is gone)')
+        $log | Should -Match 'not armed'
+        Test-Path $lock | Should -BeFalse
+    }
+
     It 're-announces the files Photos has not registered, on the third poll' {
         $w = New-SyncWorld
         foreach ($r in '2026/05/IMG_0001.HEIC', '2026/05/IMG_0003.HEIC', '2026/06/IMG_0002.MOV') { $Fake.Downloads.Add($r) }
