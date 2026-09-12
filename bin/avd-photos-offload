@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 # Reclaim iCloud space on demand -- the command-line twin of the menu bar's
 # "Offload from iCloud". Forces DELETE_FROM_ICLOUD for this one run; the sync
-# still refuses to delete anything without a last-upload-confirmed stamp, so this
-# is safe to run before the pipeline has proven itself (it just does nothing).
-exec "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/avd-photos-sync" --offload "$@"
+# still deletes nothing unless the last verify pass confirmed its batch cleanly,
+# so this is safe to run before the pipeline has proven itself (it just says so
+# and does nothing).
+#
+#   avd-photos-offload             run the sync with reclaim forced on
+#   avd-photos-offload --dry-run   report what WOULD leave iCloud and stop:
+#                                  no emulator, no downloads, no deletions,
+#                                  no ledger changes. Run this before arming.
+SELF="$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")"
+case "${1:-}" in
+  --dry-run) exec "$SELF/avd-photos-sync" --reclaim-dry-run ;;
+  *)         exec "$SELF/avd-photos-sync" --offload "$@" ;;
+esac

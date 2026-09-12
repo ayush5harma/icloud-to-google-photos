@@ -42,7 +42,12 @@ DEVICE_ID_FILE="$STATE_DIR/device.id"
 DEVICE_BUSY="$STATE_DIR/device-busy"
 GPHOTOS_PKG="com.google.android.apps.photos"
 AVD_EMU="$AVD_SDK_ROOT/emulator/emulator"
-SER="emulator-5554"
+# Resolved by NAME in step 3 (ap_emulator_serial), never assumed: emulator-5554
+# is just the first free console port, and any emulator started before this one
+# owns it instead. Empty until then, and nothing before step 3 talks to a device.
+SER=""
+# --reclaim-dry-run: report what the iCloud reclaim WOULD delete and stop.
+RECLAIM_DRY_RUN=0
 
 ap_seed_path "$AVD_SDK_ROOT/platform-tools"
 
@@ -119,11 +124,19 @@ device_each() {
 # Staged path for a device file name: the YYYY_MM_name device naming reverses
 # directly; any other name reverses through the ledger, matched on the whole
 # basename.
+#
+# THE FALLBACK ANSWERS ONLY WHEN THE MATCH IS UNIQUE. iCloud basenames repeat
+# across months (IMG_0001.HEIC exists in many years), so a first-match lookup
+# could hand the reclaim step a DIFFERENT photo's staged path than the one
+# Google Photos confirmed. Returning nothing instead means that device file maps
+# to no staged path, so its original simply stays in iCloud -- the safe
+# direction, and the only one available without more evidence.
 rel_of_devname() {
   local b="$1"
   case "$b" in
     [0-9][0-9][0-9][0-9]_[0-9][0-9]_?*) printf '%s/%s/%s\n' "${b:0:4}" "${b:5:2}" "${b:8}" ;;
-    *) awk -v b="$b" 'substr($0, length($0) - length(b)) == "/" b { print; exit }' "$LEDGER" 2>/dev/null ;;
+    *) awk -v b="$b" 'substr($0, length($0) - length(b)) == "/" b { n++; hit=$0 }
+                      END { if (n == 1) print hit }' "$LEDGER" 2>/dev/null ;;
   esac
 }
 
@@ -152,13 +165,28 @@ enumerate_staging() {  # sorted relative media paths on stdout; rc 1 if find com
 # a small library, not a broken walk.
 reclaim_icloud() {
   local pend out stats rlog ver spec py rc n i pid c
-  [ -f "$RECLAIMED" ] || : > "$RECLAIMED"
+  # THE GATE, in ONE place, because this is the step that deletes photographs:
+  # nothing leaves iCloud unless the last verify pass confirmed its whole batch
+  # cleanly. The stamp is written only by that pass and DELETED by a pass that
+  # could not confirm, so a pipeline that breaks stops reclaiming on the very
+  # next run -- including a run that finds a pending list left over from a
+  # healthier one, which is exactly the case this check exists for. A dry run
+  # deletes nothing and is allowed without it.
+  if [ "$RECLAIM_DRY_RUN" != "1" ] && [ ! -f "$STATE_DIR/last-upload-confirmed" ]; then
+    log "iCloud reclaim SKIPPED: the last verify did not confirm its batch, so nothing is deleted ($(count_lines "$RECLAIM_PENDING") confirmed file(s) stay pending)"
+    return 0
+  fi
+  # A dry run creates nothing, not even an empty ledger.
+  [ "$RECLAIM_DRY_RUN" = "1" ] || [ -f "$RECLAIMED" ] || : > "$RECLAIMED"
   rlog="$LOG_DIR/reclaim.log"
   log_init "$rlog"
   pend="$(mktemp)"; out="$(mktemp)"; stats="$(mktemp)"
-  sort -u "$RECLAIM_PENDING" | comm -23 - <(sort -u "$RECLAIMED") > "$pend"
+  sort -u "$RECLAIM_PENDING" | comm -23 - <(sort -u "$RECLAIMED" 2>/dev/null) > "$pend"
   n="$(count_lines "$pend")"
-  if [ "$n" -eq 0 ]; then rm -f "$pend" "$out" "$stats"; return 0; fi
+  if [ "$n" -eq 0 ]; then
+    [ "$RECLAIM_DRY_RUN" = "1" ] && log "nothing pending: no confirmed file is waiting to leave iCloud"
+    rm -f "$pend" "$out" "$stats"; return 0
+  fi
   py=""
   for c in "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/avd-photos-reclaim.py" \
            "$HOME/.local/bin/avd-photos-reclaim.py"; do
@@ -172,9 +200,10 @@ reclaim_icloud() {
   [ -n "$ver" ] || { log "WARNING: cannot read icloudpd's version — reclaim skipped, $n file(s) stay in iCloud"; rm -f "$pend" "$out" "$stats"; return 0; }
   spec="icloudpd @ git+https://github.com/icloud-photos-downloader/icloud_photos_downloader@v$ver"
   phase "reclaiming iCloud space: $n confirmed file(s)"
-  log "iCloud reclaim: $n confirmed file(s) pending (icloudpd library $ver)"
+  log "iCloud reclaim${RECLAIM_DRY_RUN:+ (DRY RUN)}: $n confirmed file(s) pending (icloudpd library $ver)"
   ( uv run -q --python 3.13 --with "$spec" "$py" --username "$ICLOUD_USERNAME" --staging "$STAGING" \
       --pending "$pend" --out "$out" ${KEEP_ICLOUD_DAYS:+--keep-days "$KEEP_ICLOUD_DAYS"} \
+      ${RECLAIM_DRY_RUN:+--dry-run} \
       </dev/null >"$stats" 2>>"$rlog" ) & pid=$!
   i=0
   while kill -0 "$pid" 2>/dev/null; do
@@ -182,6 +211,15 @@ reclaim_icloud() {
     sleep 1; i=$((i+1))
   done
   wait "$pid" 2>/dev/null; rc=$?
+  # A DRY RUN CHANGES NO LEDGER. It reports what it would have deleted; writing
+  # those paths to reclaimed.list would take them off the pending list and the
+  # real run would then never delete them.
+  if [ "$RECLAIM_DRY_RUN" = "1" ]; then
+    log "iCloud reclaim (DRY RUN) rc=$rc: $(tr -d '\n' < "$stats")"
+    log "  nothing was deleted and no ledger changed — see $rlog for the per-file decisions"
+    rm -f "$pend" "$out" "$stats"
+    return 0
+  fi
   case "$rc" in
     0|1)
       cat "$out" >> "$RECLAIMED"; sort -u "$RECLAIMED" -o "$RECLAIMED"
@@ -203,18 +241,37 @@ reclaim_icloud() {
 # must not end the quote.
 shq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
 
-# ── Dormancy + prerequisites ─────────────────────────────────────────────────
-[ -f "$SENTINEL" ] || { log "not armed (no $SENTINEL) — skipping"; exit 0; }
-[ -d "$HOME/.android/avd/${AVD_NAME}.avd" ] || fail "no $AVD_NAME emulator — run avd-photos-setup"
-command -v adb >/dev/null 2>&1 || fail "adb missing from PATH"
-command -v "$ICLOUDPD" >/dev/null 2>&1 || fail "icloudpd ($ICLOUDPD) missing from PATH"
-
+# ── Modes ────────────────────────────────────────────────────────────────────
 # --offload (the menu item, the avd-photos-offload command): reclaim ON for this
 # run whatever the config says. Only confirmed files are ever deleted, so the
 # button is safe to press at any time.
 case " $* " in
   *" --offload "*) DELETE_FROM_ICLOUD=1; log "manual offload requested (--offload)" ;;
 esac
+case " $* " in
+  *" --reclaim-dry-run "*) RECLAIM_DRY_RUN=1 ;;
+esac
+
+# A DRY RUN of the reclaim only: which confirmed files would leave iCloud, and
+# whether their staged paths still resolve to assets in the library. It touches
+# no emulator, needs no arming (this is the check to run BEFORE arming), deletes
+# nothing and changes no ledger. It deliberately does not write a "done (" line,
+# which is what the status collector reads as a completed sync run.
+if [ "$RECLAIM_DRY_RUN" = "1" ]; then
+  command -v "$ICLOUDPD" >/dev/null 2>&1 || fail "icloudpd ($ICLOUDPD) missing from PATH"
+  [ -n "$ICLOUD_USERNAME" ] || fail "ICLOUD_USERNAME unset in $CONFIG_FILE"
+  log "reclaim DRY RUN (user $ICLOUD_USERNAME)"
+  phase "dry run: checking what would leave iCloud"
+  reclaim_icloud
+  log "dry run finished"
+  exit 0
+fi
+
+# ── Dormancy + prerequisites ─────────────────────────────────────────────────
+[ -f "$SENTINEL" ] || { log "not armed (no $SENTINEL) — skipping"; exit 0; }
+[ -d "$HOME/.android/avd/${AVD_NAME}.avd" ] || fail "no $AVD_NAME emulator — run avd-photos-setup"
+command -v adb >/dev/null 2>&1 || fail "adb missing from PATH"
+command -v "$ICLOUDPD" >/dev/null 2>&1 || fail "icloudpd ($ICLOUDPD) missing from PATH"
 [ -n "$ICLOUD_USERNAME" ] || fail "ICLOUD_USERNAME unset in $CONFIG_FILE"
 
 log "start (user $ICLOUD_USERNAME)"
@@ -312,13 +369,28 @@ if ! pgrep -f "qemu-system.*$AVD_NAME" >/dev/null 2>&1; then
 fi
 run_bounded 60 adb start-server
 phase "waiting for the emulator to boot"
+# WHICH DEVICE IS OURS. Ask every attached emulator its AVD name and take the
+# one that answers with ours (ap_emulator_serial, lib/proc.sh). A second
+# emulator on this Mac -- an app developer's, a CI job's -- owns 5554 whenever it
+# started first, and every push, query, prune and `emu kill` below would have
+# gone to it.
+for _ in $(seq 1 40); do
+  SER="$(ap_emulator_serial "$AVD_NAME")"
+  [ -n "$SER" ] && break
+  sleep 3
+done
+[ -n "$SER" ] || fail "no attached emulator answers to the name $AVD_NAME"
 booted=0
 for _ in $(seq 1 90); do
   [ "$(dev_out getprop sys.boot_completed)" = "1" ] && { booted=1; break; }
   sleep 3
 done
 [ "$booted" -eq 1 ] || fail "the emulator did not boot within 4.5 min"
-log "emulator up ($SER)"
+# Assert it again now that it is up: the resolution above raced a booting VM,
+# and everything after this line writes to the device.
+name_now="$(ap_avd_name_of "$SER")"
+[ "$name_now" = "$AVD_NAME" ] || fail "$SER is running '${name_now:-unknown}', not $AVD_NAME — refusing to touch it"
+log "emulator up ($SER is $AVD_NAME)"
 
 # ── 4. Push everything the ledger has not seen, then rescan ──────────────────
 run_bounded "$ADB_TIMEOUT" adb -s "$SER" shell "mkdir -p $DEST_DCIM"
