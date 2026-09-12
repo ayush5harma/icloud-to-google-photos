@@ -34,6 +34,7 @@ if ($Paths) {
     Write-Host ('{0,-10} {1}' -f 'sdk root', $cfg.AVD_SDK_ROOT)
     Write-Host ('{0,-10} {1}' -f 'emulator', $cfg.AVD_NAME)
     Write-Host ('{0,-10} {1}' -f 'avd home', $cfg.AVD_HOME)
+    Write-Host ('{0,-10} {1} (system image ABI {2})' -f 'machine', $cfg.ARCHITECTURE, $cfg.AVD_ABI)
     foreach ($w in $cfg.WARNINGS) { Write-Host "config: $w" }
     exit 0
 }
@@ -44,7 +45,7 @@ if ($Force) {
         $null = Protect-AvdFile -Path "$($cfg.CONFIG_FILE).bak"
         Write-Host "kept the previous config as $($cfg.CONFIG_FILE).bak"
     }
-    Write-AvdDefaultConfig -Path $cfg.CONFIG_FILE
+    Write-AvdDefaultConfig -Path $cfg.CONFIG_FILE -Architecture $cfg.ARCHITECTURE
     Write-Host "wrote $($cfg.CONFIG_FILE)"
     exit 0
 }
@@ -52,7 +53,7 @@ if ($Force) {
 if (Test-Path -LiteralPath $cfg.CONFIG_FILE) {
     Write-Host "$($cfg.CONFIG_FILE) already exists (-Force overwrites it, keeping a .bak)`n"
 } else {
-    Write-AvdDefaultConfig -Path $cfg.CONFIG_FILE
+    Write-AvdDefaultConfig -Path $cfg.CONFIG_FILE -Architecture $cfg.ARCHITECTURE
     Write-Host "wrote $($cfg.CONFIG_FILE)`n"
 }
 Write-Host ([System.IO.File]::ReadAllText($cfg.CONFIG_FILE))

@@ -47,7 +47,10 @@ if (-not $IsWindows) {
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Import-Module (Join-Path $PSScriptRoot 'lib' 'AvdPhotos.psm1') -Force
 $cfg = Get-AvdConfig
-$taskPwsh = Resolve-AvdTaskPwsh -Path (Get-Process -Id $PID).Path -ProgramFiles $env:ProgramFiles
+# The machine's architecture, not this pwsh's (an x64 pwsh on an Arm64 PC is
+# told AMD64): Get-AvdHostArchitecture, through the config.
+$arch = $cfg.ARCHITECTURE
+$taskPwsh = Resolve-AvdTaskPwsh -Path (Get-Process -Id $PID).Path -ProgramFiles $env:ProgramFiles -Architecture $arch
 $pwsh = $taskPwsh.Path
 $layoutLink = Get-AvdInstallLayout -RepoRoot $repoRoot -LocalAppData $env:LOCALAPPDATA
 $layoutCopy = Get-AvdInstallLayout -RepoRoot $repoRoot -LocalAppData $env:LOCALAPPDATA -Copy
@@ -103,24 +106,30 @@ if ($taskPwsh.Problem) {
     exit 1
 }
 if ($pwsh -ne (Get-Process -Id $PID).Path) { Write-Say "the tasks and shortcuts will run $pwsh (not the Microsoft Store PowerShell running this)" }
+$me = Get-AvdHostArchitecture
+Write-Say "architecture: $arch$(if ($me.Emulated) { " (this PowerShell is the $($me.Process) build, under emulation)" })"
+$pwshNote = Get-AvdTaskPwshNote -PwshArchitecture (Get-AvdExecutableArchitecture -Path $pwsh) -Architecture $arch
+if ($pwshNote) { Write-Say "NOTE: $pwshNote" }
 Add-AvdToolPath -Directory @((Join-Path $cfg.AVD_SDK_ROOT 'platform-tools'))
 $missing = [System.Collections.Generic.List[string]]::new()
-$hints = @{
-    java     = 'winget install Microsoft.OpenJDK.21'
-    git      = 'winget install Git.Git'
-    uv       = 'winget install astral-sh.uv'
-    icloudpd = 'uv tool install icloudpd'
-}
-foreach ($t in 'java', 'git', 'uv') {
+# Java serves only the Android SDK tools, which is to say the emulator; on
+# Windows on Arm there is none to build (the note below), so it is not asked
+# for there.
+$tools = if ($arch -eq 'Arm64') { @('git', 'uv') } else { @('java', 'git', 'uv') }
+foreach ($t in $tools) {
     if (-not (Get-Command -Name $t -CommandType Application -ErrorAction SilentlyContinue)) { $missing.Add($t) }
 }
 if (-not (Get-Command -Name $cfg.ICLOUDPD -CommandType Application -ErrorAction SilentlyContinue)) { $missing.Add('icloudpd') }
 if ($missing.Count) {
     Write-Say "MISSING: $($missing -join ' ')"
-    foreach ($m in $missing) { Write-Say "  $m`: $($hints[$m])" }
+    foreach ($m in $missing) { Write-Say "  $m`: $(Get-AvdInstallHint -Tool $m -Architecture $arch)" }
     Write-Say "See 'Windows > Requirements' in the README. Install them and re-run; nothing below needs them yet."
 } else {
     Write-Say 'all present'
+}
+if ($arch -eq 'Arm64') {
+    Write-Say ''
+    foreach ($l in (Get-AvdWindowsOnArmNote)) { Write-Say $l }
 }
 # adb.exe is not long-path aware, and a staged path past 260 characters then
 # fails to push; say so now rather than in a sync log weeks later.
@@ -159,7 +168,7 @@ Write-Head 'Config'
 if (Test-Path -LiteralPath $cfg.CONFIG_FILE) {
     Write-Say "keeping $($cfg.CONFIG_FILE)"
 } else {
-    Write-AvdDefaultConfig -Path $cfg.CONFIG_FILE
+    Write-AvdDefaultConfig -Path $cfg.CONFIG_FILE -Architecture $arch
     Write-Say "wrote $($cfg.CONFIG_FILE)"
 }
 # It holds an Apple ID and may hold a GITHUB_TOKEN, whoever wrote it.
@@ -225,4 +234,8 @@ Next, in a NEW PowerShell 7 window, in order:
 Watch it: the tray ring, ``avd-photos-status | ConvertFrom-Json``, or
   Get-Content -Wait "$(Join-Path $cfg.LOG_DIR 'sync.log')"
 "@ | Write-Host
+if ($arch -eq 'Arm64') {
+    Write-Host 'On Windows on Arm, steps 1 and 2 work now; steps 3 to 7 need the emulator, which'
+    Write-Host 'Google does not publish for Windows on Arm (the note under Requirements above).'
+}
 exit 0

@@ -131,7 +131,11 @@ function Get-AvdSystemToolPath {
 # execution alias would be the other way out, but whether Task Scheduler
 # starts an alias has not been tested here, so it is not relied on.
 function Resolve-AvdTaskPwsh {
-    param([Parameter(Mandatory)][string]$Path, [string]$ProgramFiles)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$ProgramFiles,
+        [AllowEmptyString()][string]$Architecture = (Get-AvdHostArchitecture).Os
+    )
     if ($Path -notmatch '[\\/]WindowsApps[\\/]') { return [pscustomobject]@{ Path = $Path; Problem = $null } }
     if ($ProgramFiles) {
         $msi = Join-Path $ProgramFiles 'PowerShell' '7' 'pwsh.exe'
@@ -139,8 +143,23 @@ function Resolve-AvdTaskPwsh {
     }
     [pscustomobject]@{
         Path    = $null
-        Problem = "this is the Microsoft Store PowerShell ($Path); its folder changes with every Store update, which would leave the scheduled tasks pointing at nothing. Install the MSI build (winget install --id Microsoft.PowerShell --source winget) and run install.ps1 again"
+        Problem = "this is the Microsoft Store PowerShell ($Path); its folder changes with every Store update, which would leave the scheduled tasks pointing at nothing. Install the MSI build ($(Get-AvdInstallHint -Tool pwsh -Architecture $Architecture)) and run install.ps1 again"
     }
+}
+
+# Whether the pwsh the tasks will run is the machine's own build. On Windows on
+# Arm an x64 pwsh works -- Windows runs it under emulation -- but every task and
+# the tray then run emulated too, so the installer says so and names the arm64
+# build. Asked of the file (its PE header), because the tasks may name a
+# different pwsh.exe from the one running the installer (Resolve-AvdTaskPwsh).
+# $null when there is nothing to say.
+function Get-AvdTaskPwshNote {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$PwshArchitecture,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Architecture
+    )
+    if ($Architecture -ne 'Arm64' -or -not $PwshArchitecture -or $PwshArchitecture -eq 'Arm64') { return $null }
+    "the tasks and the tray will run the $PwshArchitecture build of PowerShell, which Windows on Arm runs under emulation. It works; the native build is faster: $(Get-AvdInstallHint -Tool pwsh -Architecture Arm64), then run install.ps1 again from it"
 }
 
 # The current user as Task Scheduler names a principal.

@@ -96,9 +96,30 @@ Describe 'the pwsh the tasks name' {
         $r.Problem | Should -BeNullOrEmpty
     }
     It 'refuses a Store install alone, naming the fix' {
-        $r = Resolve-AvdTaskPwsh -Path $Store -ProgramFiles (Join-Path $TestDrive 'empty')
+        $r = Resolve-AvdTaskPwsh -Path $Store -ProgramFiles (Join-Path $TestDrive 'empty') -Architecture X64
         $r.Path | Should -BeNullOrEmpty
-        $r.Problem | Should -Match ([regex]::Escape('winget install --id Microsoft.PowerShell --source winget'))
+        $r.Problem | Should -Match ([regex]::Escape('winget install --id Microsoft.PowerShell --source winget)'))
+    }
+    It 'names the arm64 MSI on Windows on Arm' {
+        $arm = 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.6.0_arm64__8wekyb3d8bbwe\pwsh.exe'
+        $r = Resolve-AvdTaskPwsh -Path $arm -ProgramFiles (Join-Path $TestDrive 'empty') -Architecture Arm64
+        $r.Problem | Should -Match ([regex]::Escape('winget install --id Microsoft.PowerShell --source winget --architecture arm64'))
+    }
+}
+
+Describe 'the pwsh the tasks run, on Windows on Arm' {
+    It 'says nothing for a native pwsh, or on an x64 PC' {
+        Get-AvdTaskPwshNote -PwshArchitecture Arm64 -Architecture Arm64 | Should -BeNullOrEmpty
+        Get-AvdTaskPwshNote -PwshArchitecture X64 -Architecture X64 | Should -BeNullOrEmpty
+        # A file that is not a PE (unknown) is no reason to say anything.
+        Get-AvdTaskPwshNote -PwshArchitecture '' -Architecture Arm64 | Should -BeNullOrEmpty
+    }
+    It 'names an emulated x64 or x86 pwsh on an Arm64 PC, and the arm64 build' {
+        foreach ($p in 'X64', 'X86') {
+            $n = Get-AvdTaskPwshNote -PwshArchitecture $p -Architecture Arm64
+            $n | Should -Match "the $p build of PowerShell, which Windows on Arm runs under emulation"
+            $n | Should -Match ([regex]::Escape('--architecture arm64'))
+        }
     }
 }
 
@@ -174,6 +195,9 @@ Describe 'avd-photos-arm and avd-photos-config' {
         [System.IO.File]::AppendAllText($cfgFile, "not an assignment`n")
         $r = Run 'avd-photos-config.ps1' @('-Paths')
         $r.StdOut | Should -Match 'avd home'
+        # The machine this child ran on, with the ABI that follows from it.
+        $h = (Get-AvdHostArchitecture).Os
+        $r.StdOut | Should -Match ("machine\s+$h \(system image ABI " + [regex]::Escape($(if ($IsWindows) { Get-AvdDefaultAbi -Architecture $h } else { 'arm64-v8a' })) + '\)')
         $r.StdOut | Should -Match 'config: .*not a KEY=value assignment'
         (Run 'avd-photos-config.ps1' @('-Force')).ExitCode | Should -Be 0
         Test-Path "$cfgFile.bak" | Should -BeTrue
