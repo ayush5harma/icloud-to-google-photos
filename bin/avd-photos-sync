@@ -200,10 +200,25 @@ reclaim_icloud() {
   [ -n "$ver" ] || { log "WARNING: cannot read icloudpd's version — reclaim skipped, $n file(s) stay in iCloud"; rm -f "$pend" "$out" "$stats"; return 0; }
   spec="icloudpd @ git+https://github.com/icloud-photos-downloader/icloud_photos_downloader@v$ver"
   phase "reclaiming iCloud space: $n confirmed file(s)"
-  log "iCloud reclaim${RECLAIM_DRY_RUN:+ (DRY RUN)}: $n confirmed file(s) pending (icloudpd library $ver)"
-  ( uv run -q --python 3.13 --with "$spec" "$py" --username "$ICLOUD_USERNAME" --staging "$STAGING" \
-      --pending "$pend" --out "$out" ${KEEP_ICLOUD_DAYS:+--keep-days "$KEEP_ICLOUD_DAYS"} \
-      ${RECLAIM_DRY_RUN:+--dry-run} \
+  # BUILD THE FLAGS FROM THE VALUES, NEVER WITH `${VAR:+...}` ON A 0/1 VARIABLE.
+  # `${RECLAIM_DRY_RUN:+--dry-run}` expands whenever the variable is NON-EMPTY,
+  # and its default is the string "0" -- so every real reclaim ran as a dry run
+  # while the code below still consumed its output, recording photos as reclaimed
+  # that were never deleted and never retrying them. An array, seeded non-empty,
+  # because `"${arr[@]}"` on an EMPTY array aborts under `set -u` in bash 3.2,
+  # which is what /bin/bash is on a stock Mac.
+  local -a rargs
+  rargs=( --username "$ICLOUD_USERNAME" --staging "$STAGING" --pending "$pend" --out "$out" )
+  # 0 and empty both mean "no floor"; anything else is a day count.
+  case "${KEEP_ICLOUD_DAYS:-0}" in
+    0) ;;
+    *) rargs+=( --keep-days "$KEEP_ICLOUD_DAYS" ) ;;
+  esac
+  local dry=0
+  if [ "$RECLAIM_DRY_RUN" = "1" ]; then dry=1; rargs+=( --dry-run ); fi
+  [ "$dry" -eq 1 ] && log "iCloud reclaim (DRY RUN): $n confirmed file(s) pending (icloudpd library $ver)" \
+                   || log "iCloud reclaim: $n confirmed file(s) pending (icloudpd library $ver)"
+  ( uv run -q --python 3.13 --with "$spec" "$py" "${rargs[@]}" \
       </dev/null >"$stats" 2>>"$rlog" ) & pid=$!
   i=0
   while kill -0 "$pid" 2>/dev/null; do
@@ -211,12 +226,16 @@ reclaim_icloud() {
     sleep 1; i=$((i+1))
   done
   wait "$pid" 2>/dev/null; rc=$?
-  # A DRY RUN CHANGES NO LEDGER. It reports what it would have deleted; writing
-  # those paths to reclaimed.list would take them off the pending list and the
-  # real run would then never delete them.
-  if [ "$RECLAIM_DRY_RUN" = "1" ]; then
+  # A DRY RUN CHANGES NO LEDGER, decided TWICE: by the flag this run passed, and
+  # by what the reclaim itself reports in its stats. Consuming a dry run's output
+  # is the worst failure this pipeline has -- those paths would be recorded as
+  # reclaimed, dropped from the pending list, and never deleted from iCloud or
+  # looked at again -- so it is worth two independent reasons to refuse.
+  local said_dry; said_dry="$(jq -r '.dry_run // false' "$stats" 2>/dev/null)"
+  if [ "$dry" -eq 1 ] || [ "$said_dry" = "true" ]; then
     log "iCloud reclaim (DRY RUN) rc=$rc: $(tr -d '\n' < "$stats")"
     log "  nothing was deleted and no ledger changed — see $rlog for the per-file decisions"
+    [ "$dry" -eq 0 ] && log "WARNING: that run reported dry_run without being asked to — nothing was recorded"
     rm -f "$pend" "$out" "$stats"
     return 0
   fi
@@ -291,7 +310,10 @@ icp_args=( --username "$ICLOUD_USERNAME" --directory "$STAGING"
 # earlier run having confirmed uploads. Step 6 offloads per file, after
 # confirmation, and nothing else ever leaves iCloud.
 if [ "$DELETE_FROM_ICLOUD" = "1" ]; then
-  log "iCloud reclaim ON: confirmed uploads are deleted from iCloud after verification${KEEP_ICLOUD_DAYS:+ (keeping the newest $KEEP_ICLOUD_DAYS day(s))}"
+  case "${KEEP_ICLOUD_DAYS:-0}" in
+    0) log "iCloud reclaim ON: confirmed uploads are deleted from iCloud after verification" ;;
+    *) log "iCloud reclaim ON: confirmed uploads are deleted from iCloud after verification (keeping the newest $KEEP_ICLOUD_DAYS day(s))" ;;
+  esac
 else
   log "iCloud reclaim OFF (DELETE_FROM_ICLOUD=0 in $CONFIG_FILE): confirmed uploads stay in iCloud"
 fi

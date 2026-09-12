@@ -82,7 +82,8 @@ def main() -> int:
     staging = Path(a.staging)
     pending = {ln.strip() for ln in Path(a.pending).read_text().splitlines() if ln.strip()}
     if not pending:
-        print(json.dumps({"pending": 0, "walked": 0, "deleted": 0, "held": 0, "kept": 0, "not_found": 0}))
+        print(json.dumps({"pending": 0, "walked": 0, "deleted": 0, "held": 0, "kept": 0,
+                          "not_found": 0, "dry_run": a.dry_run}))
         return 0
 
     try:
@@ -129,7 +130,8 @@ def main() -> int:
 
     remaining = set(pending)
     reclaimed: list[str] = []
-    stats = {"pending": len(pending), "walked": 0, "deleted": 0, "held": 0, "kept": 0, "not_found": 0, "errors": 0}
+    stats = {"pending": len(pending), "walked": 0, "deleted": 0, "held": 0, "kept": 0,
+             "not_found": 0, "errors": 0, "dry_run": a.dry_run}
 
     for photo in library.all:
         stats["walked"] += 1
@@ -203,9 +205,19 @@ def main() -> int:
         log.info("NOT FOUND in iCloud (already gone): %s", rel)
         reclaimed.append(rel)
 
-    with open(a.out, "a") as f:
-        for rel in reclaimed:
-            f.write(rel + "\n")
+    # A DRY RUN WRITES NOTHING TO --out. The caller appends that file to its
+    # reclaimed ledger and drops those paths from its pending list, so a dry
+    # run's would-have-deleted paths landing there would record photos as
+    # reclaimed while they are still in iCloud, and nothing would ever retry
+    # them. The caller refuses a dry run's output as well; this is the other
+    # half of that guard, at the only place that can be sure.
+    if not a.dry_run:
+        with open(a.out, "a") as f:
+            for rel in reclaimed:
+                f.write(rel + "\n")
+    else:
+        log.info("[DRY RUN] %d path(s) would have been recorded as reclaimed; --out not written",
+                 len(reclaimed))
     print(json.dumps(stats))
     return 0 if stats["errors"] == 0 else 1
 
