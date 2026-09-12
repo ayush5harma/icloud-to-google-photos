@@ -1,0 +1,9 @@
+# The on-device scripts are pushed to the emulator and run by Android's sh,
+# which reads a CR as part of the command, so a checkout with
+# core.autocrlf=true (the Git for Windows default) must still write them LF.
+windows/device/*.sh text eol=lf
+# Test fixtures are compared byte for byte with what the code writes (LF),
+# so a Windows checkout must not rewrite them CRLF either (measured on
+# windows-latest, 2026-09-13: the config.ini fixture came out CRLF and two
+# tests compared it with the LF the port writes).
+windows/tests/fixtures/** text eol=lf
