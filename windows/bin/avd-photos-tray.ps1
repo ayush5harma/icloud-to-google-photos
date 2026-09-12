@@ -175,8 +175,11 @@ function Update-AvdTrayMenu {
     $old = @($Menu.Items)
     $Menu.SuspendLayout()
     try {
-        $Menu.Items.Clear()
+        # Dispose while the strip still owns them: an owned ToolStripItem
+        # removes itself on Dispose and records IsDisposed, which one disposed
+        # after removal does not (measured on windows-latest, 2026-09-13).
         foreach ($o in $old) { $o.Dispose() }
+        $Menu.Items.Clear()
         foreach ($i in $Model) { [void]$Menu.Items.Add((New-AvdTrayMenuItem -Item $i -Font $Font -OnClick $OnClick)) }
     } finally { $Menu.ResumeLayout() }
 }
