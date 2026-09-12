@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Boot the emulator in SOFTWARE GL, which is the only mode that can render
+# Google's account sign-in page. Use this for the one-time sign-in and nothing
+# else: everything after is much faster on the default Metal path (avd-start).
+#
+# The symptom this exists for: the login screen never appears, or the Sign in
+# button does nothing at all, with no error anywhere. GMS renders the login in a
+# Chromium WebView, which cannot create a GL context under `-gpu auto`
+# (EGL_BAD_CONFIG, then "Application Error: com.google.android.gms" before a
+# single pixel is drawn) and stalls forever on the Play Services splash under
+# `-gpu host`. It reads exactly like Google refusing an uncertified device, which
+# sends you off chasing Play certification instead.
+AVD_GPU="${AVD_SIGNIN_GPU:-swiftshader_indirect}" \
+  exec "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/avd-photos-setup" --start "$@"

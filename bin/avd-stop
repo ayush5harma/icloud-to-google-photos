@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Graceful shutdown: sync, then `emu kill`, then wait for the process to go.
+exec "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/avd-photos-setup" --stop "$@"

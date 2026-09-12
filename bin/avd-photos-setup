@@ -1,0 +1,1016 @@
+#!/usr/bin/env bash
+# Rooted Android TABLET emulator: Magisk + NeoZygisk + the Google Photos spoof
+# module, set up and KEPT CURRENT entirely from the CLI, zero taps. The
+# reasoning, the measurements and the traps are in the README -- read "How it
+# works" and "Traps" before changing anything here.
+#
+# MODES:  (no args) set up and update      --check  report versions, change nothing
+#         --headless  no emulator window (what the weekly agent uses)
+#         --start     just boot the emulator and leave it running (avd-start)
+#         --stop      graceful shutdown (avd-stop)
+#         --bootstrap resume an unfinished setup; a no-op once setup completed
+#
+# THE SDK ROOT IS DELIBERATELY ITS OWN: rooting rewrites ramdisk.img in place, so
+# a read-only or package-managed SDK can never be rooted.
+#
+# NOTHING IS VERSION-PINNED -- a re-run IS the update (SDK tools, system image,
+# Magisk, NeoZygisk, the modules all resolve to newest on each run). Two updates
+# stay OPT-IN because both destroy a working signed-in instance and no scheduled
+# job could undo them: recreating the emulator onto a newer API (AVD_RECREATE=1,
+# old instance kept as .bak) and re-patching the ramdisk for a newer Magisk
+# (AVD_REROOT=1, can leave it unbootable). Both are REPORTED.
+#
+# HONEST CEILING: the Pixel free-original-quality perk is a spoof of a 2016
+# device and Google can withdraw or detect it at any time. This automates the
+# setup, not the outcome.
+
+set -uo pipefail
+
+LIB_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/../lib"
+# shellcheck disable=SC1091
+. "$LIB_DIR/config.sh"
+# shellcheck disable=SC1091
+. "$LIB_DIR/log.sh"
+# shellcheck disable=SC1091
+. "$LIB_DIR/proc.sh"
+
+ap_load_config
+
+SDK_ROOT="$AVD_SDK_ROOT"
+STAMPS="$STATE_DIR/stamps"
+LOG="$LOG_DIR/setup.log"
+EMU_LOG="$LOG_DIR/emulator.log"
+# THE DONE MARKER, and it is written only after the LAST phase succeeds. The
+# bootstrap agent runs at every login and must resume an interrupted build rather
+# than declare victory: keying it on the emulator's config.ini (which appears in
+# phase 2 of eight) made a run interrupted during the multi-GB download a no-op
+# until the weekly agent came round.
+SETUP_DONE="$STATE_DIR/setup-complete"
+DEV_TIMEOUT="${DEV_TIMEOUT:-60}"
+BOOT_WAIT="${BOOT_WAIT:-90}"               # x3s; a cold boot is slow
+GPHOTOS_PKG="com.google.android.apps.photos"
+PIXELIFY_REPO="Xposed-Modules-Repo/io.github.samson910022.pixelifyphotos"
+PIXELIFY_PKG="io.github.samson910022.pixelifyphotos"
+VECTOR_REPO="JingMatrix/Vector"
+NEOZYGISK_REPO="JingMatrix/NeoZygisk"
+# ── Magisk modules flashed from GitHub releases, in order ────────────────────
+# "repo|module-id|asset-regex|note", stamp-tracked by release tag so a re-run
+# re-flashes ONLY when upstream moves. NeoZygisk provides Zygisk and has its own
+# phase before these. GPhotosUnlimited spoofs Build fields, native properties AND
+# PackageManager.hasSystemFeature(), which is what Photos reads to pick the
+# backup tier; it SUPERSEDES PixelifyPhotos (Build fields only), so Pixelify is
+# disabled when it is installed.
+MAGISK_MODULES=(
+  "Rev4N1/GPhotosUnlimited|unlimitedphotos|\\.zip$|Google Photos Unlimited Backup"
+)
+# DELIBERATELY NOT FLASHED, each for a measured reason:
+#   5ec1cff/TrickyStore -- keystore attestation spoofing, added while the spoof
+#     was still broken on the theory that Photos gates the perk on Play
+#     Integrity. It does not: the working configuration is NeoZygisk +
+#     GPhotosUnlimited and nothing else.
+#   MeowDump/Integrity-Box (playintegrityfix) -- its default profile claims
+#     RELEASE=CANARY and api_level=32 on an API-37 device, so Android resolves
+#     NULL Resources and the process dies in handleBindApplication: Play Store
+#     crashed on every launch and Photos lost its account after any force-stop.
+#     Revisiting means editing custom.pif.prop to the device's real API level
+#     FIRST, never flashing it as shipped.
+#   KernelSU-Modules-Repo/magic_mount_rs -- a metamodule supplying Magic Mount to
+#     KernelSU variants; Magisk has it natively.
+VCLI="/data/adb/modules/zygisk_vector/cli"
+
+CHECK_ONLY=0; HEADLESS=0; START_ONLY=0; STOP_ONLY=0; BOOTSTRAP=0
+for a in "$@"; do
+  case "$a" in
+    --check) CHECK_ONLY=1 ;;
+    --headless) HEADLESS=1 ;;
+    --start) START_ONLY=1 ;;
+    --stop) STOP_ONLY=1 ;;
+    --bootstrap) BOOTSTRAP=1 ;;
+    *) echo "usage: ${0##*/} [--check] [--headless] [--start|--stop] [--bootstrap]" >&2; exit 2 ;;
+  esac
+done
+
+# FRESH-MACHINE BOOTSTRAP: runs at login so a new Mac builds the whole rooted
+# stack unattended. It MUST be a no-op once setup has COMPLETED -- the full path
+# boots an emulator and downloads several GB -- and an interrupted build must
+# resume at the next login, which is why the marker is the last phase's, not the
+# emulator directory's.
+if [ "$BOOTSTRAP" -eq 1 ]; then
+  [ -f "$SETUP_DONE" ] && exit 0
+  HEADLESS=1   # nobody asked for a window at login
+fi
+
+ap_seed_path "$SDK_ROOT/platform-tools"
+mkdir -p "$STAMPS"
+
+# SINGLE INSTANCE (single_flight_lock, lib/proc.sh). The weekly agent can fire
+# while a manual run is mid-flight, and two concurrent phase_root runs race on
+# ramdisk.img, its backup, `adb root` and the config.ini rewrite -- i.e. they can
+# leave an unbootable emulator.
+LOCK="$STATE_DIR/setup.lock"
+single_flight_lock "$LOCK"
+case $? in
+  1) echo "another avd-photos-setup is running (pid $SFL_PID) — exiting" >&2; exit 0 ;;
+  2) echo "cannot take lock $LOCK" >&2; exit 1 ;;
+esac
+
+# Shut down an emulator WE started. The weekly headless run otherwise leaves a
+# 6 GB / 6-core qemu resident until reboot. An emulator that was already running
+# belongs to the user and is left alone.
+EMU_STARTED_BY_US=0
+cleanup() {
+  local rc=$?
+  # --start exists precisely to LEAVE the emulator running, so never reap it there.
+  if [ "$EMU_STARTED_BY_US" -eq 1 ] && [ "$HEADLESS" -eq 1 ] && [ "$START_ONLY" -eq 0 ]; then
+    adb -s "${SER:-}" shell sync >/dev/null 2>&1
+    adb -s "${SER:-}" emu kill >/dev/null 2>&1
+  fi
+  rm -rf "$LOCK"
+  exit "$rc"
+}
+trap cleanup EXIT INT TERM
+
+log_init "$LOG"
+say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; printf '== %s\n' "$*" >>"$LOG"; }
+step() { printf '  %s\n' "$*"; printf '   %s\n' "$*" >>"$LOG"; }
+warn() { printf '  \033[33m! %s\033[0m\n' "$*"; printf '   ! %s\n' "$*" >>"$LOG"; }
+die()  { printf '\033[31mERROR: %s\033[0m\n' "$*" >&2; printf '   ERROR %s\n' "$*" >>"$LOG"; exit 1; }
+
+for t in sdkmanager adb jq curl python3; do
+  command -v "$t" >/dev/null 2>&1 || die "$t not on PATH"
+done
+
+EMU="$SDK_ROOT/emulator/emulator"
+SER="emulator-5554"
+
+# avdmanager cannot be pointed at a non-default SDK root by environment in every
+# packaging (some wrappers PREPEND their own path to ANDROID_HOME and the tool
+# then answers "Package path is not valid ... : null"); sdkmanager escapes this
+# via --sdk_root. So the writable root gets its OWN cmdline-tools, bootstrapped
+# once by whatever sdkmanager is on PATH, and everything after uses those.
+BOOT_SDKM="$(command -v sdkmanager)"
+SDKM="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+AVDM="$SDK_ROOT/cmdline-tools/latest/bin/avdmanager"
+sdkm() {
+  if [ -x "$SDKM" ]; then "$SDKM" --sdk_root="$SDK_ROOT" "$@"
+  else "$BOOT_SDKM" --sdk_root="$SDK_ROOT" "$@"; fi
+}
+
+stamp_get() { cat "$STAMPS/$1" 2>/dev/null; }
+stamp_set() { printf '%s' "$2" >"$STAMPS/$1"; }
+
+# Latest release JSON for a GitHub repo, memoised for an hour. Fetching each
+# release twice (tag, then asset URL) tripled the round-trips against the
+# unauthenticated 60/hour limit AND raced -- a release published between the two
+# recorded a stamp that did not match the flashed asset.
+#
+# THE LIMIT IS REAL AND THE FALLBACK IS THE POINT: 60 requests per hour per IP,
+# shared with everything else on the network. When the API does not answer, a
+# STALE cached answer is used and said so (the pipeline then keeps whatever
+# version it has, which is correct -- nothing here is pinned and the next run
+# updates); with no cache at all the caller sees an empty answer, reports
+# "latest: ?" and changes nothing. GITHUB_TOKEN raises the limit to 5,000/hour
+# and is optional.
+GH_WARNED=0
+gh_latest() {
+  local repo="$1" f code cfg
+  f="$STATE_DIR/gh-$(printf '%s' "$repo" | tr '/' '_').json"
+  [ -s "$f" ] && [ -z "$(find "$f" -mmin +60 2>/dev/null)" ] && { cat "$f"; return 0; }
+  cfg=""
+  if [ -n "$GITHUB_TOKEN" ]; then
+    # The token goes through a 0600 curl config file, never argv: anything on a
+    # command line is readable through `ps` by every process of this user.
+    cfg="$(mktemp)"; chmod 600 "$cfg"
+    printf 'header = "Authorization: Bearer %s"\n' "$GITHUB_TOKEN" >"$cfg"
+  fi
+  code="$(curl -sL --retry 2 --connect-timeout 15 --max-time 30 \
+            -H "Accept: application/vnd.github+json" ${cfg:+--config "$cfg"} \
+            -o "$f.tmp" -w '%{http_code}' \
+            "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null)"
+  [ -n "$cfg" ] && rm -f "$cfg"
+  if [ "$code" = "200" ] && [ -s "$f.tmp" ]; then
+    mv "$f.tmp" "$f"; cat "$f"; return 0
+  fi
+  rm -f "$f.tmp"
+  if [ -s "$f" ]; then
+    warn "GitHub API answered $code for $repo — using the cached release info ($(( $(stamp_age "$f") / 3600 ))h old)"
+    cat "$f"; return 0
+  fi
+  if [ "$GH_WARNED" -eq 0 ]; then
+    GH_WARNED=1
+    case "$code" in
+      403|429) warn "GitHub API rate limit reached (60 requests/hour unauthenticated)."
+               warn "Version checks are skipped this run; set GITHUB_TOKEN in the config to raise it." ;;
+      *)       warn "GitHub API unreachable (HTTP ${code:-none}) — version checks skipped this run." ;;
+    esac
+  fi
+  return 1
+}
+# Downloads need their own bound: --max-time 30 suits a JSON document and not a
+# 150 MB image, while no bound at all lets a stalled server hang the weekly agent
+# forever. --speed-limit catches the server that accepts and trickles.
+fetch() {
+  curl -fL --retry 3 --connect-timeout 20 --max-time 900 \
+       --speed-limit 2048 --speed-time 60 -o "$1" "$2" 2>/dev/null
+}
+
+# Time-bounded device shell (dev_capture, lib/proc.sh) returning the device
+# command's OWN status: without that, failures on the device were discarded and
+# surfaced later as a confusing missing-file error. 0.1 s polls -- the 1 s floor
+# cost ~1 s on each of ~20 call sites plus 90 more inside every wait_boot.
+# `merge` keeps the device's stderr in the output callers print.
+dev() { dev_capture "$SER" "$DEV_TIMEOUT" 0.1 merge "$@"; }
+
+emu_running() { pgrep -f "qemu-system.*$AVD_NAME" >/dev/null 2>&1; }
+# KEEP THE VERSION-SHAPED FILTER. The magisk binary lives in Magisk's tmpfs, not
+# on PATH, and `magisk -v` on an UNROOTED device prints "magisk: inaccessible or
+# not found" on STDOUT -- a bare -n test reads that error text as a version and
+# silently skips the whole rooting phase.
+# ROOT ROUTE: on a userdebug image `adb root` works; on a `user` build it is
+# refused and privileged commands must go through Magisk's `su`. Detect once,
+# route everything through rdev(), and the rest of the script need not care.
+ADB_ROOT_OK=0
+try_adb_root() {
+  run_bounded 30 adb -s "$SER" root >/dev/null 2>&1
+  sleep 4
+  run_bounded 60 adb -s "$SER" wait-for-device
+  if dev 'id -u' | tr -d '\r' | grep -q '^0$'; then ADB_ROOT_OK=1; else ADB_ROOT_OK=0; fi
+}
+# Privileged device command: plain when adb is root, else via su.
+rdev() {
+  if [ "$ADB_ROOT_OK" -eq 1 ]; then dev "$@"
+  else dev "su -c '$*'"; fi
+}
+
+MAGISK=/debug_ramdisk/magisk
+magisk_ver()  { rdev "$MAGISK -v" 2>/dev/null | tr -d '\r' | head -1 | grep -E '^[0-9]+\.[0-9]+' || true; }
+# Zygisk health is "is NeoZygisk's daemon actually running", NOT Magisk's
+# `zygisk` setting flag. The flag only says the built-in implementation is
+# switched on, which on Android 17 is precisely the thing that does not work.
+zygisk_on()   { dev 'pidof zygiskd64 >/dev/null 2>&1 && echo ok' | grep -q '^ok$'; }
+# NOTE: rdev, not dev -- /data/adb is 0700 root, so an unprivileged test always
+# says "absent" and the phase then tries to reflash a module that is running.
+neozygisk_installed() { rdev '[ -d /data/adb/modules/zygisksu ] && echo ok' | grep -q '^ok$'; }
+pkg_installed() { dev "pm list packages 2>/dev/null" | grep -q "package:$1"; }
+pkg_vercode() { dev "dumpsys package $1 2>/dev/null" | grep -m1 -oE 'versionCode=[0-9]+' | cut -d= -f2; }
+
+# The device id for google.com/android/uncertified. NOT readable through the
+# usual gservices query: on google_apis the GSF package is inert, so it answers
+# "No result found" even after a successful check-in, which reads as "this device
+# has no id and can never be registered" and is wrong. GMS holds the real id, in
+# two places that agree.
+gsf_device_id() {
+  local id
+  id="$(dev 'cat /data/data/com.google.android.gms/shared_prefs/Checkin.xml 2>/dev/null' \
+        | tr -d '\r' | sed -n 's/.*name="android_id">\([0-9]*\)<.*/\1/p' | head -1)"
+  [ -n "$id" ] || id="$(dev 'sqlite3 /data/data/com.google.android.gms/databases/gservices.db "select value from main where name=\"android_id\";" 2>/dev/null' \
+        | tr -d '\r' | grep -E '^[0-9]{15,25}$' | head -1)"
+  printf '%s' "$id"
+}
+
+# Newest API level offered for this tag/ABI, list cached for a day. Google names
+# API levels as POINT RELEASES now (`android-37.0`), not the bare integers this
+# was first written against, so both parsers match `android-<N>` and
+# `android-<N.M>` and VERSION-sort them (37.0 > 36.1 > 36). The version must be
+# followed immediately by `;`, which with the exact `;${AVD_TAG};` match excludes
+# the -beta/-rc/CANARY builds and the 16 KB `_ps16k` variants -- those resist
+# ramdisk patching.
+latest_api() {
+  local c="$STATE_DIR/sdk-images.list"
+  if [ ! -s "$c" ] || [ -n "$(find "$c" -mmin +1440 2>/dev/null)" ]; then
+    sdkm --list 2>/dev/null >"$c.tmp" && mv "$c.tmp" "$c" || rm -f "$c.tmp"
+  fi
+  grep -oE "system-images;android-[0-9]+(\.[0-9]+)?;${AVD_TAG};${AVD_ABI}" "$c" 2>/dev/null \
+    | sed -E 's/.*android-([0-9]+(\.[0-9]+)?);.*/\1/' | sort -Vr | head -1
+}
+installed_apis() {
+  ls -1 "$SDK_ROOT/system-images" 2>/dev/null | sed -nE 's/^android-([0-9]+(\.[0-9]+)?)$/\1/p' | sort -Vr
+}
+
+# Bound on WALL CLOCK, not on iterations: `for i in 1..BOOT_WAIT; sleep 3` claimed
+# 4.5 min, but each pass also pays for its dev() call, so a wedged adb stretched
+# the same loop past an hour inside a caller that assumed minutes.
+wait_boot() {
+  local end=$((SECONDS + BOOT_WAIT * 3))
+  while [ "$SECONDS" -lt "$end" ]; do
+    [ "$(dev getprop sys.boot_completed | tr -d '\r')" = "1" ] && { step "boot complete"; return 0; }
+    sleep 3
+  done
+  return 1
+}
+
+boot_emulator() {
+  if emu_running; then step "emulator already running"; else
+    # Seeded with a real flag, never left empty: under bash 3.2 (what launchd
+    # resolves) `"${empty[@]}"` with `set -u` aborts as unbound, which killed
+    # every non-headless run on its launch line.
+    local extra=(-no-boot-anim)
+    [ "$HEADLESS" -eq 1 ] && extra+=(-no-window)
+    step "launching $AVD_NAME$( [ "$HEADLESS" -eq 1 ] && printf ' (headless)')"
+    EMU_STARTED_BY_US=1
+    ANDROID_HOME="$SDK_ROOT" ANDROID_SDK_ROOT="$SDK_ROOT" \
+      nohup "$EMU" -avd "$AVD_NAME" -no-snapshot \
+        -gpu "$AVD_GPU" -netdelay none -netspeed full "${extra[@]}" >>"$EMU_LOG" 2>&1 &
+    sleep 8
+  fi
+  run_bounded 60 adb start-server
+  # -s "$SER": a bare wait-for-device returns on ANY transport, so a stale
+  # `adb connect` entry satisfied it instantly while this emulator was booting.
+  run_bounded 120 adb -s "$SER" wait-for-device
+  wait_boot || die "the emulator did not finish booting — see $EMU_LOG"
+  # EVERY boot drops adbd back to the shell user, after which
+  # `magisk --install-module` fails with a bare "Run this command with root" that
+  # reads as a Magisk problem rather than a missing `adb root`.
+  try_adb_root
+}
+
+# TWO DIFFERENT REBOOTS, and using the wrong one silently loses the work.
+# restart_emulator after a HOST-side ramdisk patch, because QEMU reads
+# ramdisk.img once at VM start and `adb reboot` re-runs the same in-memory copy;
+# reboot_wait after a MAGISK MODULE, because `emu kill` discards unflushed writes
+# and lands module files as ZERO BYTES. emu kill is safe ONLY before any module
+# exists. Do not collapse these two.
+restart_emulator() {
+  step "restarting the emulator process (a host-side ramdisk patch is only read at VM start)"
+  dev sync >/dev/null 2>&1
+  run_bounded 30 adb -s "$SER" emu kill
+  local end=$((SECONDS + 60))
+  while [ "$SECONDS" -lt "$end" ] && emu_running; do sleep 2; done
+  if emu_running; then pkill -f "qemu-system.*$AVD_NAME" 2>/dev/null; sleep 3; fi
+  EMU_STARTED_BY_US=0          # boot_emulator sets it again for the new process
+  boot_emulator
+}
+
+reboot_wait() {
+  # GRACEFUL `adb reboot`, never `adb emu kill`: emu kill made every module
+  # install look cursed -- files landed as ZERO BYTES and /data/adb/modules was
+  # empty at the next boot, so a module that installed cleanly ("Welcome to
+  # Vector! ... Done") simply vanished. sync + adb reboot persists it intact.
+  step "rebooting the emulator (graceful; emu kill loses unflushed module writes)"
+  dev sync >/dev/null 2>&1
+  run_bounded 30 adb -s "$SER" reboot
+  # Wait for the device to GO DOWN first: `adb reboot` is asynchronous, so a bare
+  # sleep+wait_boot reads sys.boot_completed=1 from the system that is about to
+  # shut down and calls the reboot finished before it began.
+  local gone=0 end=$((SECONDS + 60))
+  while [ "$SECONDS" -lt "$end" ]; do
+    dev getprop sys.boot_completed >/dev/null 2>&1 || { gone=1; break; }
+    sleep 2
+  done
+  [ "$gone" -eq 1 ] || sleep 12
+  if ! emu_running; then sleep 2; boot_emulator; return 0; fi
+  run_bounded 120 adb -s "$SER" wait-for-device
+  wait_boot || warn "the emulator is slow to come back after the reboot"
+  try_adb_root
+}
+
+# ── 1. SDK: update tools, ensure the newest image is downloaded ──────────────
+API=""
+phase_sdk() {
+  say "SDK ($SDK_ROOT)"
+  local newest; newest="$(latest_api)"
+  local have; have="$(installed_apis | head -1)"
+  [ -n "$newest" ] || newest="$have"
+  [ -n "$newest" ] || die "could not resolve any $AVD_TAG/$AVD_ABI system image"
+
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    local emuver=""
+    [ -x "$EMU" ] && emuver="$( "$EMU" -version 2>/dev/null | head -1 | sed -E 's/.*version ([0-9.]+).*/\1/' )"
+    step "emulator: ${emuver:-absent}"
+    step "system images installed: $(installed_apis | tr '\n' ' ')"
+    step "newest available API: $newest"
+    API="${have:-$newest}"; return 0
+  fi
+
+  step "updating SDK tools"
+  yes | sdkm --licenses >/dev/null 2>&1
+  [ -x "$AVDM" ] || { step "bootstrapping cmdline-tools into the writable root"
+                      sdkm --install "cmdline-tools;latest" >/dev/null 2>&1; }
+  sdkm --update >/dev/null 2>&1 && step "cmdline-tools/emulator/platform-tools current" \
+    || warn "sdkmanager --update failed (offline?)"
+
+  if [ ! -d "$SDK_ROOT/system-images/android-${newest}/${AVD_TAG}/${AVD_ABI}" ]; then
+    step "downloading system-images;android-${newest};${AVD_TAG};${AVD_ABI} (multi-GB, one time)"
+    run_bounded 5400 sdkm --install \
+      "emulator" "platform-tools" "cmdline-tools;latest" "system-images;android-${newest};${AVD_TAG};${AVD_ABI}" \
+      || warn "system image install failed or timed out"
+  fi
+  [ -x "$EMU" ] || die "emulator binary missing under $SDK_ROOT"
+
+  # An existing emulator stays on its own API: userdata cannot migrate across API
+  # levels, so silently recreating it would wipe a signed-in Photos instance.
+  local ini="$HOME/.android/avd/${AVD_NAME}.avd/config.ini"
+  if [ -f "$ini" ]; then
+    # Anchor on the trailing `/`, not a greedy `.*`: `image.sysdir.1=
+    # system-images/android-37.0/...` read with a bare `([0-9]+)` yields "37",
+    # which never equals the resolved "37.0" (so it warns about a newer API
+    # forever) and builds a system-images/android-37 ramdisk path that does not
+    # exist (so phase_root dies).
+    API="$(grep -m1 '^image.sysdir.1=' "$ini" 2>/dev/null | sed -E 's|.*android-([0-9]+(\.[0-9]+)?)/.*|\1|')"
+    [ -n "$API" ] || API="$newest"
+    if [ "$API" != "$newest" ]; then
+      if [ "${AVD_RECREATE:-0}" = "1" ]; then
+        # MOVE ASIDE, never rm -rf: a recreate steps onto an API level this
+        # pipeline has not rooted before, where the patch can fail, and deleting
+        # first would leave no working emulator and no way back. One backup kept.
+        local prev="$HOME/.android/avd/${AVD_NAME}.avd.api${API}.bak"
+        warn "recreating the emulator on API $newest (AVD_RECREATE=1) — userdata does NOT migrate"
+        rm -rf "$prev" "$prev.ini"
+        mv "$HOME/.android/avd/${AVD_NAME}.avd" "$prev" 2>/dev/null
+        mv "$HOME/.android/avd/${AVD_NAME}.ini" "$prev.ini" 2>/dev/null
+        warn "previous API $API instance kept at $prev"
+        warn "restore with: rm -rf ~/.android/avd/${AVD_NAME}.avd ~/.android/avd/${AVD_NAME}.ini &&"
+        warn "  mv $prev ~/.android/avd/${AVD_NAME}.avd && mv $prev.ini ~/.android/avd/${AVD_NAME}.ini"
+        API="$newest"
+      else
+        warn "the emulator is on API $API; API $newest is available. Recreating starts a"
+        warn "FRESH instance (userdata cannot migrate), so it is opt-in:"
+        warn "  AVD_RECREATE=1 $0"
+      fi
+    fi
+  else API="$newest"; fi
+  step "using API $API"
+}
+
+# ── 2. the tablet emulator ───────────────────────────────────────────────────
+phase_avd() {
+  say "Emulator ($AVD_NAME, device=$AVD_DEVICE, API $API)"
+  local ini="$HOME/.android/avd/${AVD_NAME}.avd/config.ini"
+  if [ -f "$ini" ]; then step "exists"; [ "$CHECK_ONLY" -eq 1 ] && return 0
+  else
+    [ "$CHECK_ONLY" -eq 1 ] && { warn "not created yet"; return 0; }
+    [ -x "$AVDM" ] || die "cmdline-tools missing under $SDK_ROOT (bootstrap failed)"
+    echo no | "$AVDM" --silent create avd -n "$AVD_NAME" \
+      -k "system-images;android-${API};${AVD_TAG};${AVD_ABI}" -d "$AVD_DEVICE" \
+      --abi "$AVD_ABI" -p "$HOME/.android/avd/${AVD_NAME}.avd" >/dev/null 2>&1 \
+      || die "avdmanager create failed"
+    step "created"
+  fi
+  local w="${AVD_RES%x*}" h="${AVD_RES#*x}"
+  python3 - "$ini" "$w" "$h" "$AVD_DPI" "$AVD_RAM" "$AVD_CORES" "$AVD_DISK" "$AVD_HEAP" "$AVD_GPU" <<'PY'
+import sys, pathlib
+ini, w, h, dpi, ram, cores, disk, heap, gpu = sys.argv[1:10]
+p = pathlib.Path(ini); kv = {}
+for line in p.read_text().splitlines():
+    if "=" in line and not line.startswith("#"):
+        k, _, v = line.partition("="); kv[k.strip()] = v.strip()
+kv.update({"hw.lcd.width": w, "hw.lcd.height": h, "hw.lcd.density": dpi,
+           "hw.ramSize": ram, "hw.cpu.ncore": cores, "disk.dataPartition.size": disk,
+           "hw.gpu.enabled": "yes", "hw.gpu.mode": gpu, "vm.heapSize": heap,
+           "hw.keyboard": "yes", "showDeviceFrame": "no"})
+p.write_text("\n".join(f"{k}={v}" for k, v in sorted(kv.items())) + "\n")
+print(f"   tuned {w}x{h}@{dpi}dpi, {ram}MB RAM, {cores} cores, {disk} data, heap {heap}, gpu {gpu}")
+PY
+}
+
+# ── 3. root: Magisk's OWN patcher, driven directly ───────────────────────────
+# rootAVD is the usual tool for this and is NOT used, because every one of its
+# failures is silent: it SELF-UPDATES from GitHub at run time (so any local patch
+# is discarded mid-run), its busybox probe requires the version banner to contain
+# "Magisk" when current builds say "topjohnwu", it invokes the binary as
+# `libbusybox.so` which busybox rejects as an unknown applet, and when its
+# version scrape returns nothing its selection menu spins forever printing
+# "invalid option". Left alone it quietly patches with its BUNDLED Magisk 25.2.
+#
+# Doing it directly instead: an emulator ramdisk.img is a bare compressed cpio
+# with NO Android boot header, so `boot_patch.sh` cannot unpack it ("Unable to
+# unpack boot image") and only the ramdisk section of Magisk's own sequence
+# applies. Two details are load-bearing, and are why the on-device script exports
+# and re-detects rather than assuming: magiskboot reads
+# KEEPVERITY/KEEPFORCEENCRYPT from the ENVIRONMENT (plain shell vars are ignored
+# and it silently patches with KEEPVERITY=[false]), and the ramdisk is
+# lz4_legacy, not gzip -- the wrong codec yields an unbootable image.
+ondevice_patch_script() {
+  cat <<'PATCH_EOS'
+#!/system/bin/sh
+set -e
+cd /data/local/tmp/magiskpatch
+export KEEPVERITY=true KEEPFORCEENCRYPT=true RECOVERYMODE=false VENDORBOOT=false
+PREINITDEVICE="${PREINITDEVICE:-}"
+cp -f ramdisk.img ramdisk.img.work
+# Keep this banner: it names the codec, so the second decompress-to-/dev/null
+# that used to exist purely to re-scrape it is unnecessary.
+./magiskboot decompress ramdisk.img.work ramdisk.cpio 2>&1 | tee /data/local/tmp/magiskpatch/decompress.log
+./magiskboot compress=xz magisk magisk.xz
+./magiskboot compress=xz stub.apk stub.xz
+./magiskboot compress=xz init-ld init-ld.xz
+{ echo "KEEPVERITY=$KEEPVERITY"; echo "KEEPFORCEENCRYPT=$KEEPFORCEENCRYPT"
+  echo "RECOVERYMODE=$RECOVERYMODE"; echo "VENDORBOOT=$VENDORBOOT"
+  # WITHOUT a preinit device Magisk has nowhere persistent to stage module data:
+  # "mount: preinit dir not found" every boot, module files as ZERO-BYTE files,
+  # /data/adb/modules wiped at the next boot. Resolved on the host.
+  [ -n "$PREINITDEVICE" ] && echo "PREINITDEVICE=$PREINITDEVICE"; } > config
+cp -af ramdisk.cpio ramdisk.cpio.orig
+./magiskboot cpio ramdisk.cpio \
+  "add 0750 init magiskinit" \
+  "mkdir 0750 overlay.d" \
+  "mkdir 0750 overlay.d/sbin" \
+  "add 0644 overlay.d/sbin/magisk.xz magisk.xz" \
+  "add 0644 overlay.d/sbin/stub.xz stub.xz" \
+  "add 0644 overlay.d/sbin/init-ld.xz init-ld.xz" \
+  "patch" "backup ramdisk.cpio.orig" "mkdir 000 .backup" \
+  "add 000 .backup/.magisk config"
+FMT=$(sed -n 's/.*Detected format: \[*\([a-z0-9_]*\).*/\1/p' /data/local/tmp/magiskpatch/decompress.log | head -1)
+[ -n "$FMT" ] || FMT=lz4_legacy
+echo "codec: $FMT"
+rm -f ramdiskpatched.img
+./magiskboot compress=$FMT ramdisk.cpio ramdiskpatched.img
+ls -la ramdiskpatched.img
+PATCH_EOS
+}
+
+# On this emulator Magisk's own staged copies under /data/adb/magisk land as
+# ZERO-BYTE files, surfacing as "Incomplete Magisk install" and then "Failed to
+# execute BusyBox shell". Refilling them from the APK is what the Magisk app's
+# "Additional Setup" would do with a tap.
+magisk_complete_env() {
+  local W=/data/local/tmp/magiskpatch
+  dev "
+    mkdir -p /data/adb/magisk
+    cd $W
+    cat lib/arm64-v8a/libmagisk.so       > /data/adb/magisk/magisk
+    cat lib/arm64-v8a/libmagiskboot.so   > /data/adb/magisk/magiskboot
+    cat lib/arm64-v8a/libmagiskinit.so   > /data/adb/magisk/magiskinit
+    cat lib/arm64-v8a/libmagiskpolicy.so > /data/adb/magisk/magiskpolicy
+    cat lib/arm64-v8a/libbusybox.so      > /data/adb/magisk/busybox
+    cat assets/stub.apk                  > /data/adb/magisk/stub.apk
+    cat assets/module_installer.sh       > /data/adb/magisk/module_installer.sh
+    cat assets/util_functions.sh         > /data/adb/magisk/util_functions.sh
+    chmod 755 /data/adb/magisk/*
+    MT=\$($MAGISK --path 2>/dev/null)
+    [ -n \"\$MT\" ] && { mkdir -p \$MT/.magisk/busybox
+      cat /data/adb/magisk/busybox > \$MT/.magisk/busybox/busybox
+      chmod 755 \$MT/.magisk/busybox/busybox; }
+  " >/dev/null 2>&1
+  rdev "$MAGISK --restorecon" >/dev/null 2>&1
+}
+
+phase_root() {
+  say "Boot"
+  # --check promises "report versions, change nothing": no boot (a non-headless
+  # one throws a window on screen), no `adb root`, no magisk_complete_env
+  # rewriting /data/adb/magisk. It also used to burn ~6 min of timeouts launching
+  # an emulator that had never been created.
+  if [ "$CHECK_ONLY" -eq 1 ] && ! emu_running; then
+    warn "emulator not running — on-device checks skipped (start it, or run without --check)"
+    return 0
+  fi
+  boot_emulator; step "adb $SER"
+
+  say "Magisk"
+  local latest; latest="$(gh_latest topjohnwu/Magisk | jq -r '.tag_name // empty' | sed 's/^v//')"
+  local cur; cur="$(magisk_ver)"
+  if [ -n "$cur" ]; then
+    step "installed: $cur${latest:+  (latest $latest)}"
+    if [ -n "$latest" ] && [ "${cur%%:*}" != "$latest" ] && [ "${AVD_REROOT:-0}" != "1" ]; then
+      warn "a newer Magisk ($latest) exists; re-patching can leave the emulator"
+      warn "unbootable, so it is opt-in: AVD_REROOT=1 $0"
+    fi
+    # magisk_complete_env rewrites eight files under /data/adb/magisk and runs
+    # restorecon, so --check must return BEFORE it.
+    [ "$CHECK_ONLY" -eq 1 ] && return 0
+    [ "${AVD_REROOT:-0}" != "1" ] && { magisk_complete_env; return 0; }
+  fi
+  [ "$CHECK_ONLY" -eq 1 ] && { warn "not rooted"; return 0; }
+
+  local rd="$SDK_ROOT/system-images/android-${API}/${AVD_TAG}/${AVD_ABI}/ramdisk.img"
+  [ -f "$rd" ] || die "ramdisk.img not found at $rd"
+  [ -f "$rd.backup" ] || cp -f "$rd" "$rd.backup"
+
+  local apk="$STATE_DIR/magisk-latest.apk"
+  local mu; mu="$(gh_latest topjohnwu/Magisk | jq -r '.assets[]?|select(.name|test("^Magisk-v.*\\.apk$"))|.browser_download_url' | head -1)"
+  [ -n "$mu" ] && fetch "$apk" "$mu"
+  [ -s "$apk" ] || die "could not fetch the Magisk APK"
+  step "patching ramdisk with Magisk ${latest:-latest}"
+
+  local W=/data/local/tmp/magiskpatch
+  dev "rm -rf $W; mkdir -p $W" >/dev/null 2>&1
+  adb -s "$SER" push "$apk" "$W/magisk.apk" >/dev/null 2>&1
+  adb -s "$SER" push "$rd.backup" "$W/ramdisk.img" >/dev/null 2>&1
+  dev "cd $W && unzip -o -q magisk.apk 'assets/*' 'lib/${AVD_ABI}/*' && \
+    cp lib/${AVD_ABI}/libmagiskboot.so magiskboot && cp lib/${AVD_ABI}/libmagiskinit.so magiskinit && \
+    cp lib/${AVD_ABI}/libmagisk.so magisk && cp lib/${AVD_ABI}/libinit-ld.so init-ld && \
+    cp assets/stub.apk stub.apk && chmod 755 magiskboot magiskinit magisk init-ld" >/dev/null 2>&1
+
+  # Ask Magisk if it is up to answer, else probe for the spare virtio partition.
+  local PRE=""
+  # PLAIN dev on purpose: this runs BEFORE Magisk exists, so there is no su to
+  # escalate with; it returns nothing and the /dev/block probe answers instead.
+  PRE="$(dev "$MAGISK --preinit-device" | tr -d '\r' | grep -E '^[a-z0-9]+$' | head -1)"
+  if [ -z "$PRE" ]; then
+    # Test with `[ -e ] && echo ok`, NEVER `ls | grep "$c"`: ls prints
+    # "ls: /dev/block/vdd1: No such file or directory", which CONTAINS the probe
+    # token, so the first candidate always "succeeds" and an arbitrary
+    # PREINITDEVICE lands in Magisk's config -- the zero-byte-modules case above.
+    for c in vdd1 vdc1 vdb1; do
+      dev "[ -e /dev/block/$c ] && echo ok" | grep -q '^ok$' && { PRE="$c"; break; }
+    done
+  fi
+  [ -n "$PRE" ] && step "preinit device: $PRE" || warn "no preinit device found — modules will not persist"
+
+  local ps="$STATE_DIR/patch-ramdisk.sh"; ondevice_patch_script > "$ps"
+  adb -s "$SER" push "$ps" "$W/patch-ramdisk.sh" >/dev/null 2>&1
+  dev "chmod 755 $W/patch-ramdisk.sh; PREINITDEVICE='$PRE' sh $W/patch-ramdisk.sh" 2>&1 | tail -4
+
+  # Stage then rename: `adb pull` truncates and streams into its destination, so
+  # an interrupted pull straight onto $rd leaves an unbootable emulator.
+  run_bounded 300 adb -s "$SER" pull "$W/ramdiskpatched.img" "$rd.new"
+  [ -s "$rd.new" ] || { rm -f "$rd.new"; die "the ramdisk patch produced nothing"; }
+  mv -f "$rd.new" "$rd" || die "could not install the patched ramdisk"
+  adb -s "$SER" install -r "$apk" >/dev/null 2>&1
+  # FULL VM restart, not reboot_wait (see restart_emulator): no Magisk module
+  # exists yet, so emu kill has nothing to lose and its `dev sync` still flushes
+  # the APK install above.
+  restart_emulator
+  cur="$(magisk_ver)"
+  if [ -n "$cur" ]; then step "Magisk active: $cur"; magisk_complete_env
+  else warn "Magisk not detected after patching — check $EMU_LOG"; fi
+}
+
+# ── Magisk modules from GitHub releases ──────────────────────────────────────
+module_present() { rdev "[ -d /data/adb/modules/$1 ] && echo ok" | grep -q '^ok$'; }
+
+# ── The Android 17 SELinux addition for Zygisk ───────────────────────────────
+# APPEND to NeoZygisk's own sepolicy.rule, NEVER overwrite it -- its first line
+# declares the zygisk_file type, and replacing it makes the socket resolve as
+# `unlabeled`. The one rule Android 17 genuinely adds is the magisk-labelled
+# memfd the module .so arrives on; without it injection dies at "recv_fds: No
+# control headers received" / "dlopen_ext from fd -1". `execute` is part of it:
+# read/write alone gets to fd 75 and then fails on "couldn't map segment 1",
+# which looks the same from outside. Both copies are written because Magisk only
+# STAGES a module's rules at boot and applies them at the NEXT one -- one reboot
+# instead of two.
+SEPOL_MEMFD='allow zygote magisk memfd_file { read write map open getattr execute }'
+ensure_sepolicy_rule() {
+  module_present zygisksu || return 0
+  local mod=/data/adb/modules/zygisksu/sepolicy.rule
+  dev "grep -qF '$SEPOL_MEMFD' $mod 2>/dev/null && echo ok" | grep -q '^ok$' && return 0
+  rdev "echo '$SEPOL_MEMFD' >> $mod
+        [ -d /metadata/watchdog/magisk ] && cp $mod /metadata/watchdog/magisk/sepolicy.rule
+        chmod 644 $mod /metadata/watchdog/magisk/sepolicy.rule 2>/dev/null
+        sync" >/dev/null 2>&1
+  step "sepolicy: added the Android 17 memfd rule (reboot to apply)"
+  return 1   # caller reboots
+}
+
+phase_modules() {
+  say "Magisk modules"
+  local need_reboot=0
+  if [ "$CHECK_ONLY" -eq 0 ]; then ensure_sepolicy_rule || need_reboot=1; fi
+  for spec in "${MAGISK_MODULES[@]}"; do
+    local repo="${spec%%|*}"; local rest="${spec#*|}"
+    local mid="${rest%%|*}"; rest="${rest#*|}"
+    local re="${rest%%|*}"; local note="${rest##*|}"
+
+    local tag; tag="$(gh_latest "$repo" | jq -r '.tag_name // empty')"
+    local have; have="$(stamp_get "mod-$mid")"
+    local present=0; module_present "$mid" && present=1
+    step "$note: ${have:-$( [ $present -eq 1 ] && echo present || echo none )}  latest: ${tag:-?}"
+    [ "$CHECK_ONLY" -eq 1 ] && continue
+    { [ "$present" -eq 0 ] || { [ -n "$tag" ] && [ "$have" != "$tag" ]; }; } || continue
+
+    local url; url="$(gh_latest "$repo" | jq -r --arg re "$re" '.assets[]? | select(.name|test($re)) | .browser_download_url' | head -1)"
+    if [ -z "$url" ]; then warn "no matching asset for $repo"; continue; fi
+    local zip="$STATE_DIR/mod-$mid.zip"
+    if ! fetch "$zip" "$url" || [ ! -s "$zip" ]; then warn "download failed: $repo"; continue; fi
+    adb -s "$SER" push "$zip" "/data/local/tmp/mod-$mid.zip" >/dev/null 2>&1
+    magisk_complete_env
+    rdev "$MAGISK --install-module /data/local/tmp/mod-$mid.zip" 2>/dev/null | tail -3
+    stamp_set "mod-$mid" "$tag"
+    step "flashed ${tag:-latest}"
+    need_reboot=1
+  done
+
+  # Integrity Box, if an earlier run flashed it, stays DISABLED: enabled it kills
+  # Play Store and drops the Photos account (see MAGISK_MODULES).
+  if module_present playintegrityfix && [ "$CHECK_ONLY" -eq 0 ]; then
+    if ! dev '[ -f /data/adb/modules/playintegrityfix/disable ] && echo ok' | grep -q '^ok$'; then
+      dev 'touch /data/adb/modules/playintegrityfix/disable' >/dev/null 2>&1
+      warn "disabled Integrity Box (its CANARY/api_level=32 profile breaks Play Store and the Photos account)"
+      need_reboot=1
+    fi
+  fi
+
+  # Two spoof hooks in one process is not additive, so Pixelify is disabled
+  # whenever the stronger GPhotosUnlimited is installed.
+  if module_present unlimitedphotos && rdev "$VCLI modules ls" 2>/dev/null | grep -q "$PIXELIFY_PKG"; then
+    if rdev "$VCLI modules ls" 2>/dev/null | grep "$PIXELIFY_PKG" | grep -qi enabled; then
+      [ "$CHECK_ONLY" -eq 0 ] && {
+        rdev "$VCLI modules disable $PIXELIFY_PKG" >/dev/null 2>&1
+        step "disabled PixelifyPhotos (superseded by GPhotosUnlimited)"
+      }
+    fi
+  fi
+
+  [ "$need_reboot" -eq 1 ] && [ "$CHECK_ONLY" -eq 0 ] && reboot_wait
+  return 0
+}
+
+# ── Play Store ───────────────────────────────────────────────────────────────
+# `google_apis` ships NO store: com.android.vending is a LicenseChecker STUB that
+# answers the licensing API only, and the real Phonesky exists solely in
+# `google_apis_playstore` -- which cannot be run here because it is a `user`
+# build with adb root disabled. So the real store is lifted out of Google's OWN
+# certified image -- never a third-party APK -- and re-homed as a Magisk module:
+#   system/product/priv-app/Phonesky/Phonesky.apk   the real store, privileged
+#   system/product/app/LicenseChecker/.replace      deletes the stub that would
+#                                                   otherwise own the package name
+# No permissions overlay is needed: the image's own
+# privapp-permissions-google-p.xml already grants com.android.vending its
+# privileged permissions. The APK is cached locally and, if SHARED_CACHE_DIR
+# resolves, in a synced folder, so only a cold machine pays the extraction
+# (2.7 GB image, a throwaway donor emulator, pull, delete both).
+#
+# This is what makes Google Photos UPDATEABLE -- without it Photos is frozen at
+# whatever build the system image shipped.
+PHONESKY_CACHE="$STATE_DIR/phonesky/Phonesky.apk"
+PHONESKY_SHARED=""
+[ -n "$SHARED_CACHE_DIR" ] && [ -d "$(dirname "$SHARED_CACHE_DIR")" ] \
+  && PHONESKY_SHARED="$SHARED_CACHE_DIR/Phonesky.apk"
+
+playstore_installed() {
+  # The stub is versionCode 1801; the real store is ~85 million.
+  local vc; vc="$(pkg_vercode com.android.vending)"
+  [ -n "$vc" ] && [ "$vc" -gt 1000000 ] 2>/dev/null
+}
+
+phonesky_fetch() {
+  [ -s "$PHONESKY_CACHE" ] && return 0
+  mkdir -p "$(dirname "$PHONESKY_CACHE")"
+  if [ -n "$PHONESKY_SHARED" ] && [ -s "$PHONESKY_SHARED" ]; then
+    cp -f "$PHONESKY_SHARED" "$PHONESKY_CACHE" && { step "Phonesky from the shared cache"; return 0; }
+  fi
+  # The donor is the certified image of the SAME API level, so the store build
+  # matches the system the module re-homes it into.
+  local donor_api="${PLAYSTORE_DONOR_API:-$API}"
+  step "extracting Phonesky from Google's certified android-$donor_api image (one time, ~2.7 GB)"
+  run_bounded 5400 sdkm --install "system-images;android-${donor_api};google_apis_playstore;${AVD_ABI}" \
+    || { warn "could not download the certified image"; return 1; }
+  local donor="phonesky-donor"
+  rm -rf "$HOME/.android/avd/$donor.avd" "$HOME/.android/avd/$donor.ini"
+  echo no | "$AVDM" --silent create avd -n "$donor" \
+    -k "system-images;android-${donor_api};google_apis_playstore;${AVD_ABI}" -d "$AVD_DEVICE" \
+    --abi "$AVD_ABI" -p "$HOME/.android/avd/$donor.avd" >/dev/null 2>&1 \
+    || { warn "could not create the donor emulator"; return 1; }
+  # The donor must not collide with our own emulator on 5554.
+  local was_running=0; emu_running && { was_running=1; run_bounded 60 adb -s "$SER" emu kill; sleep 6; }
+  ANDROID_HOME="$SDK_ROOT" ANDROID_SDK_ROOT="$SDK_ROOT" \
+    nohup "$EMU" -avd "$donor" -no-snapshot -no-boot-anim -no-window \
+      -gpu swiftshader_indirect >>"$EMU_LOG" 2>&1 &
+  sleep 25
+  run_bounded 60 adb start-server
+  local ok=0 end=$((SECONDS+300))
+  while [ "$SECONDS" -lt "$end" ]; do
+    [ "$(dev getprop sys.boot_completed | tr -d '\r')" = "1" ] && { ok=1; break; }
+    sleep 3
+  done
+  if [ "$ok" -eq 1 ]; then
+    run_bounded 300 adb -s "$SER" pull /product/priv-app/Phonesky/Phonesky.apk "$PHONESKY_CACHE"
+  fi
+  run_bounded 60 adb -s "$SER" emu kill; sleep 6
+  pkill -f "qemu-system.*$donor" 2>/dev/null
+  rm -rf "$HOME/.android/avd/$donor.avd" "$HOME/.android/avd/$donor.ini"
+  rm -rf "$SDK_ROOT/system-images/android-${donor_api}/google_apis_playstore"
+  [ "$was_running" -eq 1 ] && boot_emulator
+  if [ -s "$PHONESKY_CACHE" ]; then
+    step "extracted Phonesky ($(( $(/usr/bin/stat -f %z "$PHONESKY_CACHE") / 1048576 )) MB)"
+    if [ -n "$PHONESKY_SHARED" ]; then
+      mkdir -p "$(dirname "$PHONESKY_SHARED")" 2>/dev/null \
+        && cp -f "$PHONESKY_CACHE" "$PHONESKY_SHARED" 2>/dev/null \
+        && step "cached to $SHARED_CACHE_DIR for the next machine"
+    fi
+    return 0
+  fi
+  warn "Phonesky extraction failed"; return 1
+}
+
+phase_playstore() {
+  say "Play Store"
+  if playstore_installed; then
+    step "real Play Store present (versionCode $(pkg_vercode com.android.vending))"
+    return 0
+  fi
+  step "only the LicenseChecker stub is present (versionCode $(pkg_vercode com.android.vending))"
+  [ "$CHECK_ONLY" -eq 1 ] && { warn "Play Store not installed"; return 0; }
+  phonesky_fetch || return 1
+  adb -s "$SER" push "$PHONESKY_CACHE" /data/local/tmp/Phonesky.apk >/dev/null 2>&1 \
+    || { warn "could not push Phonesky"; return 1; }
+  magisk_complete_env
+  rdev '
+M=/data/adb/modules/phonesky
+rm -rf $M; mkdir -p $M/system/product/priv-app/Phonesky $M/system/product/app/LicenseChecker
+cat > $M/module.prop <<EOF
+id=phonesky
+name=Google Play Store (Phonesky)
+version=from google_apis_playstore
+versionCode=1
+author=avd-photos-setup
+description=Real Play Store for the google_apis image, which ships only a LicenseChecker stub.
+EOF
+cp /data/local/tmp/Phonesky.apk $M/system/product/priv-app/Phonesky/Phonesky.apk
+chmod 644 $M/system/product/priv-app/Phonesky/Phonesky.apk
+touch $M/system/product/app/LicenseChecker/.replace
+find $M -type d -exec chmod 755 {} \;
+' >/dev/null 2>&1
+  rdev "$MAGISK --restorecon" >/dev/null 2>&1
+  step "module staged; rebooting"
+  reboot_wait
+  if playstore_installed; then step "Play Store active (versionCode $(pkg_vercode com.android.vending))"
+  else warn "Play Store did not take — check /data/adb/modules/phonesky"; return 1; fi
+}
+
+# ── 4. Zygisk + the spoof + Photos, each tracked against latest ──────────────
+phase_photos() {
+  say "Google Photos"
+  # Nothing to install: google_apis images ship Photos as a SYSTEM app at
+  # /product/app/Photos. A future image dropping it is a real finding, not
+  # something to paper over by sideloading from an untrusted mirror.
+  #
+  # BUT the system build is NOT what stays running. Once Phonesky is in, Play
+  # Store AUTO-UPDATES Photos over it into /data/app and `dumpsys package` lists
+  # both (the active one first, the image build under "Hidden system packages").
+  # A /data/app codePath is the pipeline working, and it is the ONLY thing that
+  # modernises the Photos UI; the spoof and the unlimited-backup perk both
+  # survive it. pkg_vercode greps -m1, so it reports the ACTIVE build.
+  local have_code; have_code="$(pkg_vercode "$GPHOTOS_PKG")"
+  if [ -n "$have_code" ]; then
+    step "present (active versionCode $have_code; Play Store may update it over the image build)"
+  else
+    warn "Google Photos is NOT present in this image. google_apis is supposed to"
+    warn "ship it at /product/app/Photos — check AVD_TAG=$AVD_TAG is right."
+  fi
+}
+
+phase_zygisk() {
+  # MAGISK'S BUILT-IN ZYGISK CANNOT INJECT ON ANDROID 17 -- use NeoZygisk.
+  # Getting it wrong cost a whole failed migration, and it is visible as a 3x
+  # zygote restart loop at every boot rather than as an injection error.
+  # NeoZygisk REPLACES the built-in implementation, so Magisk's own `zygisk` flag
+  # must be turned OFF or the two contend.
+  say "Zygisk (NeoZygisk)"
+  local ntag nhave
+  ntag="$(gh_latest "$NEOZYGISK_REPO" | jq -r '.tag_name // empty')"
+  nhave="$(stamp_get neozygisk)"
+  if neozygisk_installed; then step "installed: ${nhave:-present}  latest: ${ntag:-?}"
+  else step "not installed  latest: ${ntag:-?}"; fi
+  if [ "$CHECK_ONLY" -eq 0 ] && { ! neozygisk_installed || { [ -n "$ntag" ] && [ "$nhave" != "$ntag" ]; }; }; then
+    local nu
+    nu="$(gh_latest "$NEOZYGISK_REPO" | jq -r '.assets[]? | select(.name|test("release\\.zip$")) | .browser_download_url' | head -1)"
+    if [ -n "$nu" ] && fetch "$STATE_DIR/neozygisk.zip" "$nu" && [ -s "$STATE_DIR/neozygisk.zip" ]; then
+      adb -s "$SER" push "$STATE_DIR/neozygisk.zip" /data/local/tmp/neozygisk.zip >/dev/null 2>&1
+      magisk_complete_env
+      rdev "$MAGISK --install-module /data/local/tmp/neozygisk.zip" 2>/dev/null | tail -3
+      rdev "$MAGISK --sqlite \"REPLACE INTO settings (key,value) VALUES('zygisk',0)\"" >/dev/null 2>&1
+      stamp_set neozygisk "$ntag"; step "flashed ${ntag:-latest}; built-in Zygisk disabled"
+      reboot_wait
+    else warn "could not fetch the NeoZygisk module zip"; fi
+  fi
+  if zygisk_on; then step "zygiskd running"
+  elif [ "$CHECK_ONLY" -eq 1 ]; then warn "zygiskd not running"
+  else warn "zygiskd not running — the spoof cannot inject; re-run after a reboot"; fi
+}
+
+# ── Vector + Pixelify: the ALTERNATIVE spoof path, OFF by default ────────────
+# Two ways exist to make Photos see a Pixel, and running both is worse than
+# either: they hook the same process and the second wins unpredictably.
+# AVD_SPOOF=module (default) is GPhotosUnlimited, verified working with SELinux
+# ENFORCING; AVD_SPOOF=vector is Vector + PixelifyPhotos, a framework, a daemon
+# and an APK that needs its own boot before vector-cli answers. Vector is kept as
+# the fallback if a Photos build ever stops honouring the module.
+phase_vector() {
+  if [ "$AVD_SPOOF" != "vector" ]; then
+    say "Vector / Pixelify"
+    step "skipped (AVD_SPOOF=$AVD_SPOOF); GPhotosUnlimited is the active spoof"
+    return 0
+  fi
+  say "Vector (Xposed framework)"
+  local vtag; vtag="$(gh_latest "$VECTOR_REPO" | jq -r '.tag_name // empty')"
+  local vhave; vhave="$(stamp_get vector)"
+  local vpresent=0
+  dev 'ls /data/adb/modules/zygisk_vector >/dev/null 2>&1 && echo yes' 2>/dev/null | grep -q yes && vpresent=1
+  step "installed: ${vhave:-$( [ $vpresent -eq 1 ] && echo present || echo none )}  latest: ${vtag:-?}"
+  if [ "$CHECK_ONLY" -eq 0 ] && { [ "$vpresent" -eq 0 ] || { [ -n "$vtag" ] && [ "$vhave" != "$vtag" ]; }; }; then
+    # Vector ships a FLASHABLE MAGISK MODULE zip (module.prop / customize.sh /
+    # update-binary), NOT an APK -- flash it, never unzip-and-install it.
+    local vu; vu="$(gh_latest "$VECTOR_REPO" | jq -r '.assets[]? | select(.name|test("Release.*\\.zip$")) | .browser_download_url' | head -1)"
+    if [ -n "$vu" ] && fetch "$STATE_DIR/vector.zip" "$vu" && [ -s "$STATE_DIR/vector.zip" ]; then
+      adb -s "$SER" push "$STATE_DIR/vector.zip" /data/local/tmp/vector.zip >/dev/null 2>&1
+      magisk_complete_env
+      rdev "$MAGISK --install-module /data/local/tmp/vector.zip" 2>/dev/null | tail -4
+      stamp_set vector "$vtag"; step "flashed $vtag"; reboot_wait
+    else warn "could not fetch the Vector module zip"; fi
+  fi
+
+  say "PixelifyPhotos"
+  local ptag; ptag="$(gh_latest "$PIXELIFY_REPO" | jq -r '.tag_name // empty')"
+  local phave; phave="$(stamp_get pixelify)"
+  local pinst=0; pkg_installed "$PIXELIFY_PKG" && pinst=1
+  step "installed: ${phave:-$( [ $pinst -eq 1 ] && echo present || echo none )}  latest: ${ptag:-?}"
+  if [ "$CHECK_ONLY" -eq 0 ] && { [ "$pinst" -eq 0 ] || { [ -n "$ptag" ] && [ "$phave" != "$ptag" ]; }; }; then
+    local pu; pu="$(gh_latest "$PIXELIFY_REPO" | jq -r '.assets[]? | select(.name|test("\\.apk$")) | .browser_download_url' | head -1)"
+    if [ -n "$pu" ] && fetch "$STATE_DIR/pixelify.apk" "$pu" \
+       && adb -s "$SER" install -r -g "$STATE_DIR/pixelify.apk" >/dev/null 2>&1; then
+      stamp_set pixelify "$ptag"; step "installed $ptag"
+    else warn "Pixelify install failed"; fi
+  fi
+
+  say "Scope Pixelify to Google Photos"
+  # Vector is configured through its OWN cli: `modules ls`, not `list`.
+  if rdev "$VCLI status" 2>/dev/null | grep -q 'Framework Version'; then
+    if [ "$CHECK_ONLY" -eq 0 ]; then
+      rdev "$VCLI modules enable $PIXELIFY_PKG" 2>/dev/null | tail -2
+      rdev "$VCLI scope set $PIXELIFY_PKG $GPHOTOS_PKG/0" 2>/dev/null | tail -1
+    fi
+    rdev "$VCLI scope ls $PIXELIFY_PKG" 2>/dev/null | sed 's/^/    /' | head -4
+  else warn "vector-cli not responding — the framework needs one boot after flashing; re-run"; fi
+}
+
+# ── --start / --stop: just run the emulator, no setup work ───────────────────
+# So nobody hand-types an `emulator -avd ...` line and gets the GPU flag wrong
+# (see AVD_GPU in lib/config.sh: the failure is silent). boot_emulator owns the
+# flags; these modes reuse it. SELinux stays ENFORCING -- the one rule Zygisk
+# needs comes from ensure_sepolicy_rule, not from a global downgrade.
+if [ "$STOP_ONLY" -eq 1 ]; then
+  say "Stop"
+  if emu_running; then
+    dev sync >/dev/null 2>&1
+    run_bounded 30 adb -s "$SER" emu kill
+    n=0; while [ "$n" -lt 30 ] && emu_running; do sleep 2; n=$((n+1)); done
+    emu_running && { pkill -f "qemu-system.*$AVD_NAME" 2>/dev/null; sleep 2; }
+    emu_running && warn "still running" || step "stopped"
+  else step "not running"; fi
+  exit 0
+fi
+
+if [ "$START_ONLY" -eq 1 ]; then
+  say "Start"
+  [ -f "$HOME/.android/avd/${AVD_NAME}.avd/config.ini" ] \
+    || die "no $AVD_NAME emulator yet — run avd-photos-setup first"
+  boot_emulator
+  step "ready: $SER"
+  [ "$AVD_SPOOF" = "vector" ] && rdev "$VCLI status" 2>/dev/null | sed 's/^/    /' | head -3
+  exit 0
+fi
+
+phase_sdk
+phase_avd
+phase_root
+phase_zygisk
+phase_modules
+phase_vector
+phase_photos
+PLAYSTORE_OK=0
+phase_playstore && PLAYSTORE_OK=1
+
+say "Summary"
+zygisk_on && step "Zygisk: ON" || warn "Zygisk: not confirmed"
+selinux_mode="$(dev getenforce 2>/dev/null | tr -d '\r')"
+[ "$selinux_mode" = "Enforcing" ] && step "SELinux: Enforcing (sepolicy rule, not a global downgrade)" \
+                                  || warn "SELinux: $selinux_mode"
+if [ "$AVD_SPOOF" = "vector" ]; then
+  rdev "$VCLI status" 2>/dev/null | sed 's/^/    /' | head -5
+  pkg_installed "$PIXELIFY_PKG" && step "Pixelify: installed" || warn "Pixelify: missing"
+else
+  module_present unlimitedphotos && step "Spoof: GPhotosUnlimited (Magisk module)" \
+                                 || warn "Spoof: GPhotosUnlimited MISSING"
+fi
+pkg_installed "$GPHOTOS_PKG"  && step "Google Photos: installed" || warn "Google Photos: NOT installed"
+
+if [ "$CHECK_ONLY" -eq 0 ]; then
+  # Seed the config on first run. Never overwrite an edited one.
+  if [ ! -f "$CONFIG_FILE" ]; then
+    ap_write_default_config && step "seeded $CONFIG_FILE — set ICLOUD_USERNAME before arming"
+  fi
+  # THE DONE MARKER, written only here: every phase ran, the last one (Play
+  # Store) succeeded, and the emulator is rooted with its spoof in place. A run
+  # that died earlier leaves no marker, so the login bootstrap resumes it.
+  if [ "$PLAYSTORE_OK" -eq 1 ] && [ -n "$(magisk_ver)" ] \
+     && [ -f "$HOME/.android/avd/${AVD_NAME}.avd/config.ini" ]; then
+    date +%s > "$SETUP_DONE"
+  else
+    rm -f "$SETUP_DONE"
+    warn "setup did not complete — the next login (or another run) resumes it"
+  fi
+
+  acct="${GOOGLE_ACCOUNT:-the Google account you will sign in with}"
+  DEVID="$(gsf_device_id)"
+  cat <<EOF
+
+Next: open Google Photos in the emulator, sign in as $acct, Backup ON
+(Original quality), and check it presents as a Pixel. Then arm the sync with
+'avd-photos-arm'.
+
+SIGN-IN NEEDS A ONE-TIME DEVICE REGISTRATION. This image is userdebug/dev-keys,
+so Google treats it as an uncertified device and refuses account sign-in until
+the device id below is registered. Register it ONCE, as $acct, then reboot the
+emulator and wait a few minutes:
+
+    device id:  ${DEVID:-<unknown - boot the emulator and re-run>}
+    register:   https://www.google.com/android/uncertified/
+
+If sign-in still fails afterwards, force a fresh check-in and try again:
+    adb -s $SER shell am broadcast -a android.server.checkin.CHECKIN
+
+The login page only renders under software GL: use 'avd-signin', not 'avd-start'.
+EOF
+fi
