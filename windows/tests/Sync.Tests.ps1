@@ -363,6 +363,7 @@ Describe 'a whole sync against the fake device' {
         $log | Should -Match (ConvertTo-LogPattern '; 0 still pending')
         # Drained and confirmed: the emulator is stopped, gracefully.
         $Fake.EmuKills | Should -Be 1
+        $Fake.ProcessKills | Should -Be 0
         $log | Should -Match (ConvertTo-LogPattern 'emulator stopped: device drained, batch confirmed')
         Test-Path (Get-StatePath $w 'device-busy') | Should -BeFalse
         $log | Should -Match (ConvertTo-LogPattern 'done (3 pushed this run)')
@@ -406,6 +407,67 @@ Describe 'a whole sync against the fake device' {
         Test-Path (Get-StatePath $w 'device-busy') | Should -BeTrue
         $Fake.EmuKills | Should -Be 0
         $log | Should -Match (ConvertTo-LogPattern 'done (3 pushed this run)')
+        Assert-CleanFake
+    }
+
+    It '(4b) deletes the stamp and reclaims nothing when a file failed permanently, even with every file uploaded' {
+        $w = New-SyncWorld -Environment @{ UPLOAD_WAIT = '0' }
+        Set-Stamp $w
+        foreach ($r in '2026/05/IMG_0001.HEIC', '2026/05/IMG_0003.HEIC', '2026/06/IMG_0002.MOV') { $Fake.Downloads.Add($r) }
+        # Uploaded (its dedup_key is in remote_media) AND flagged permanently
+        # failed, so only the failed half of the gate can refuse this batch.
+        [void]$Fake.PermFailed.Add('2026_05_IMG_0003.HEIC')
+        Invoke-AvdPhotosSync -Config $w.Config | Should -Be 0
+        $log = Get-SyncLog $w
+        $log | Should -Match (ConvertTo-LogPattern 'WARNING: upload NOT complete - 3 of 3 done (3 registered by Photos), 0 pending, 1 permanently failed')
+        $log | Should -Not -Match 'UPLOAD CONFIRMED'
+        Test-Path (Get-StatePath $w 'last-upload-confirmed') | Should -BeFalse
+        @(Get-Line $w 'upload-status')[0] | Should -Match '^3 3 1 \d+$'
+        $log | Should -Match (ConvertTo-LogPattern 'iCloud reclaim SKIPPED: the last verify did not confirm its batch')
+        $Fake.ReclaimCalls.Count | Should -Be 0
+        Test-Path (Get-StatePath $w 'reclaimed.list') | Should -BeFalse
+        $log | Should -Not -Match 'emulator stopped'
+        Assert-CleanFake
+    }
+
+    It '(4c) confirms nothing and reclaims nothing when no coherent copy of the Photos DB ever arrives' {
+        $w = New-SyncWorld -Environment @{ UPLOAD_WAIT = '0' }
+        Set-Stamp $w
+        Set-AvdLine -Path (Get-StatePath $w 'reclaim-pending.list') -Line @('2025/01/LEFT_BY_AN_EARLIER_RUN.HEIC')
+        foreach ($r in '2026/05/IMG_0001.HEIC', '2026/06/IMG_0002.MOV') { $Fake.Downloads.Add($r) }
+        $Fake.CopyFails = $true
+        Invoke-AvdPhotosSync -Config $w.Config | Should -Be 0
+        $log = Get-SyncLog $w
+        $log | Should -Match (ConvertTo-LogPattern 'could not get a coherent copy of the Photos DB (retried 3x)')
+        $log | Should -Match (ConvertTo-LogPattern 'WARNING: upload NOT complete - 0 of 2 done (0 registered by Photos), 2 pending, 0 permanently failed')
+        Test-Path (Get-StatePath $w 'last-upload-confirmed') | Should -BeFalse
+        # Nothing confirmed, so nothing pruned and nothing new pending; the
+        # list an earlier run left is held back by the gate too.
+        @(Get-ChildItem -LiteralPath $Fake.Dcim).Count | Should -Be 2
+        Get-Line $w 'reclaim-pending.list' | Should -Be @('2025/01/LEFT_BY_AN_EARLIER_RUN.HEIC')
+        $log | Should -Match (ConvertTo-LogPattern 'iCloud reclaim SKIPPED: the last verify did not confirm its batch')
+        $Fake.ReclaimCalls.Count | Should -Be 0
+        # Every failed copy still removed its ~230 MB staging copy on /sdcard.
+        @($Fake.Calls | Where-Object { $_ -ceq '-s emulator-5556 shell rm -f /sdcard/gphotos0.db /sdcard/gphotos0.db-wal /sdcard/gphotos0.db-shm' }).Count | Should -BeGreaterOrEqual 3
+        Test-Path (Get-StatePath $w 'device-busy') | Should -BeTrue
+        $Fake.EmuKills | Should -Be 0
+        Assert-CleanFake
+    }
+
+    It 'ends the emulator process when a graceful stop has not worked within 60 s (macOS only waits)' {
+        $w = New-SyncWorld
+        $Fake.Downloads.Add('2026/05/IMG_0001.HEIC')
+        $Fake.IgnoresKill = $true
+        $before = $Fake.Clock
+        Invoke-AvdPhotosSync -Config $w.Config | Should -Be 0
+        $log = Get-SyncLog $w
+        $log | Should -Match (ConvertTo-LogPattern 'UPLOAD CONFIRMED: 1 file(s) backed up to Google Photos')
+        $Fake.EmuKills | Should -Be 1
+        $log | Should -Match (ConvertTo-LogPattern 'WARNING: the emulator did not stop within 60 s - ending its process')
+        $log | Should -Not -Match 'emulator stopped: device drained'
+        $Fake.ProcessKills | Should -Be 1
+        $Fake.Running | Should -BeFalse
+        ($Fake.Clock - $before) | Should -BeGreaterOrEqual 60
         Assert-CleanFake
     }
 

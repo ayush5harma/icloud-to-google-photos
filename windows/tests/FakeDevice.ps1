@@ -71,6 +71,9 @@ function New-FakeDevice {
         Booted       = $true
         AndroidId    = 'a1b2c3d4e5f60718'
         HasSqlite    = $false
+        # The `su -c cp` of the Photos DB copies nothing (su refused, the DB
+        # missing), so every pull of it fails: no host copy is ever coherent.
+        CopyFails    = $false
         ShortPush    = [System.Collections.Generic.HashSet[string]]::new()
         Indexed      = [System.Collections.Generic.HashSet[string]]::new()
         Unregistered = [System.Collections.Generic.HashSet[string]]::new()
@@ -84,6 +87,9 @@ function New-FakeDevice {
         Phases       = [System.Collections.Generic.List[string]]::new()
         EmuStarts    = [System.Collections.Generic.List[string]]::new()
         EmuKills     = 0
+        # A wedged emulator: `emu kill` answers OK and the VM keeps running.
+        IgnoresKill  = $false
+        ProcessKills = 0
         Snapshots    = 0
         # icloudpd: the files it downloads into Staging (staging-relative
         # paths), extra output, how many polls it stays alive, its exit code.
@@ -268,6 +274,8 @@ function Invoke-FakeShell {
     # The two su commands, compared whole: they are the argv words of the macOS
     # script, joined by adb exactly as it joins them.
     if ($Command -ceq "su -c cp $db $db-wal $db-shm /sdcard/ 2>/dev/null; chmod 644 /sdcard/gphotos0.db*") {
+        # `2>/dev/null; chmod` hides a failed cp: the shell still exits 0.
+        if ($Fake.CopyFails) { return (New-FakeResult) }
         Update-FakePhotoDb -Fake $Fake
         foreach ($s in '', '-wal', '-shm') {
             $src = Join-Path $Fake.Data "gphotos0.db$s"
@@ -329,7 +337,11 @@ function Invoke-FakeAdb {
             }
         }
         'emu' {
-            if ($a.Count -eq 4 -and $a[3] -eq 'kill') { $Fake.Running = $false; $Fake.EmuKills++; return (New-FakeResult -StdOut "OK: killing emulator, bye bye`r`n") }
+            if ($a.Count -eq 4 -and $a[3] -eq 'kill') {
+                if (-not $Fake.IgnoresKill) { $Fake.Running = $false }
+                $Fake.EmuKills++
+                return (New-FakeResult -StdOut "OK: killing emulator, bye bye`r`n")
+            }
         }
         'shell' { return (Invoke-FakeShell -Fake $Fake -Command (($a[3..($a.Count - 1)]) -join ' ')) }
     }
@@ -398,7 +410,7 @@ function Register-FakeDeviceMock {
         $script:Fake.Running = $true
         [pscustomobject]@{ Id = 0 }
     }
-    Mock -ModuleName AvdPhotos Stop-AvdEmulatorProcess { $script:Fake.Running = $false }
+    Mock -ModuleName AvdPhotos Stop-AvdEmulatorProcess { $script:Fake.Running = $false; $script:Fake.ProcessKills++ }
     Mock -ModuleName AvdPhotos Get-AvdCommandPath { $script:Fake.IcloudpdPath } -ParameterFilter { $Name -eq 'icloudpd' }
     Mock -ModuleName AvdPhotos Start-AvdProcess {
         $script:Fake.IcloudpdArgs = $ArgumentList
