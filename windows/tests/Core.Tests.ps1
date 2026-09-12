@@ -72,9 +72,101 @@ Describe 'Resolve-AvdHome' {
     }
 }
 
+Describe 'the machine architecture, not the process''s' {
+    It 'answers X64 on an x64 PC and Arm64 on an Arm64 PC for a native pwsh' {
+        $x = Get-AvdHostArchitecture -OsArchitecture X64 -ProcessArchitecture X64 -Environment @{ PROCESSOR_ARCHITECTURE = 'AMD64' }
+        $x.Os | Should -Be 'X64'
+        $x.Process | Should -Be 'X64'
+        $x.Emulated | Should -BeFalse
+        $a = Get-AvdHostArchitecture -OsArchitecture Arm64 -ProcessArchitecture Arm64 -Environment @{ PROCESSOR_ARCHITECTURE = 'ARM64' }
+        $a.Os | Should -Be 'Arm64'
+        $a.Process | Should -Be 'Arm64'
+        $a.Emulated | Should -BeFalse
+    }
+    It 'answers Arm64 for an x64 pwsh under emulation, which is told PROCESSOR_ARCHITECTURE=AMD64' {
+        $e = Get-AvdHostArchitecture -OsArchitecture Arm64 -ProcessArchitecture X64 -Environment @{ PROCESSOR_ARCHITECTURE = 'AMD64' }
+        $e.Os | Should -Be 'Arm64'
+        $e.Process | Should -Be 'X64'
+        $e.Emulated | Should -BeTrue
+    }
+    It 'takes PROCESSOR_ARCHITEW6432 as the machine when the runtime answers with the process''s view' {
+        $e = Get-AvdHostArchitecture -OsArchitecture X64 -ProcessArchitecture X64 -Environment @{ PROCESSOR_ARCHITECTURE = 'AMD64'; PROCESSOR_ARCHITEW6432 = 'ARM64' }
+        $e.Os | Should -Be 'Arm64'
+        $e.Emulated | Should -BeTrue
+    }
+    It 'answers for a 32-bit x86 pwsh under WOW64, on either machine' {
+        $onArm = Get-AvdHostArchitecture -OsArchitecture Arm64 -ProcessArchitecture X86 -Environment @{ PROCESSOR_ARCHITECTURE = 'x86'; PROCESSOR_ARCHITEW6432 = 'ARM64' }
+        $onArm.Os | Should -Be 'Arm64'
+        $onArm.Process | Should -Be 'X86'
+        $onArm.Emulated | Should -BeTrue
+        $onX64 = Get-AvdHostArchitecture -OsArchitecture X64 -ProcessArchitecture X86 -Environment @{ PROCESSOR_ARCHITECTURE = 'x86'; PROCESSOR_ARCHITEW6432 = 'AMD64' }
+        $onX64.Os | Should -Be 'X64'
+        $onX64.Process | Should -Be 'X86'
+        $onX64.Emulated | Should -BeTrue
+    }
+    It 'falls back to the environment when the runtime gives nothing' {
+        $e = Get-AvdHostArchitecture -OsArchitecture '' -ProcessArchitecture '' -Environment @{ PROCESSOR_ARCHITECTURE = 'ARM64' }
+        $e.Os | Should -Be 'Arm64'
+        $e.Process | Should -Be 'Arm64'
+    }
+    It 'spells every name one way' {
+        foreach ($n in 'X64', 'AMD64', 'x64', 'x86_64') { ConvertTo-AvdArchitectureName $n | Should -Be 'X64' -Because $n }
+        foreach ($n in 'Arm64', 'ARM64', 'aarch64') { ConvertTo-AvdArchitectureName $n | Should -Be 'Arm64' -Because $n }
+        foreach ($n in 'X86', 'x86', 'i686') { ConvertTo-AvdArchitectureName $n | Should -Be 'X86' -Because $n }
+        ConvertTo-AvdArchitectureName 'RiscV64' | Should -Be 'RiscV64'
+        ConvertTo-AvdArchitectureName $null | Should -Be ''
+    }
+    It 'answers for this host with the runtime''s own values' {
+        $h = Get-AvdHostArchitecture
+        $h.Os | Should -Be (ConvertTo-AvdArchitectureName ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture))
+        $h.Process | Should -Be (ConvertTo-AvdArchitectureName ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture))
+    }
+}
+
+Describe 'an executable''s architecture, from its PE header' {
+    BeforeAll {
+        # A DOS header whose e_lfanew points at "PE\0\0" and the machine field.
+        function New-PeHeader([int]$Machine, [int]$Offset = 0x80) {
+            $b = [byte[]]::new(0x100)
+            $b[0] = 0x4D; $b[1] = 0x5A
+            [System.BitConverter]::GetBytes([int]$Offset).CopyTo($b, 0x3C)
+            $b[$Offset] = 0x50; $b[$Offset + 1] = 0x45
+            [System.BitConverter]::GetBytes([uint16]$Machine).CopyTo($b, $Offset + 4)
+            , $b
+        }
+    }
+    It 'reads x64, arm64 and x86 and nothing else' {
+        Get-AvdPeArchitecture -Header (New-PeHeader 0x8664) | Should -Be 'X64'
+        Get-AvdPeArchitecture -Header (New-PeHeader 0xAA64) | Should -Be 'Arm64'
+        Get-AvdPeArchitecture -Header (New-PeHeader 0x014C) | Should -Be 'X86'
+        Get-AvdPeArchitecture -Header (New-PeHeader 0x01C4) | Should -Be ''
+    }
+    It 'refuses what is not a PE header rather than guessing' {
+        Get-AvdPeArchitecture -Header ([System.Text.Encoding]::ASCII.GetBytes('#!/bin/sh' + (' ' * 80))) | Should -Be ''
+        # e_lfanew past the bytes that were read.
+        $far = New-PeHeader 0x8664
+        [System.BitConverter]::GetBytes([int]0x1000).CopyTo($far, 0x3C)
+        Get-AvdPeArchitecture -Header $far | Should -Be ''
+        $noSig = New-PeHeader 0x8664; $noSig[0x80] = 0
+        Get-AvdPeArchitecture -Header $noSig | Should -Be ''
+        Get-AvdPeArchitecture -Header ([byte[]]@(0x4D, 0x5A)) | Should -Be ''
+        Get-AvdPeArchitecture -Header $null | Should -Be ''
+    }
+    It 'reads a file, and answers empty for a missing or empty one' {
+        $f = Join-Path $TestDrive 'tool.exe'
+        [System.IO.File]::WriteAllBytes($f, (New-PeHeader 0xAA64))
+        Get-AvdExecutableArchitecture -Path $f | Should -Be 'Arm64'
+        Get-AvdExecutableArchitecture -Path (Join-Path $TestDrive 'nope.exe') | Should -Be ''
+        $empty = Join-Path $TestDrive 'empty.exe'
+        [System.IO.File]::WriteAllBytes($empty, [byte[]]@())
+        Get-AvdExecutableArchitecture -Path $empty | Should -Be ''
+        Get-AvdExecutableArchitecture -Path '' | Should -Be ''
+    }
+}
+
 Describe 'Get-AvdDefault' {
-    It 'uses x86_64, four cores and Windows locations on Windows' {
-        $d = Get-AvdDefault -Platform Windows -Environment (New-WinEnv)
+    It 'uses x86_64, four cores and Windows locations on an x64 PC' {
+        $d = Get-AvdDefault -Platform Windows -Environment (New-WinEnv) -Architecture X64
         $d.AVD_ABI | Should -Be 'x86_64'
         $d.AVD_CORES | Should -Be '4'
         $d.AVD_SDK_ROOT | Should -Be 'C:\Users\me\AppData\Local\android-avd-sdk'
@@ -82,14 +174,50 @@ Describe 'Get-AvdDefault' {
         $d.ICLOUD_DIR | Should -Be 'C:\Users\me\iCloudDrive'
         $d.SHARED_CACHE_DIR | Should -Be 'C:\Users\me\iCloudDrive\avd-photos'
     }
+    It 'uses arm64-v8a on Windows on Arm, and nothing else changes with the architecture' {
+        $a = Get-AvdDefault -Platform Windows -Environment (New-WinEnv) -Architecture Arm64
+        $x = Get-AvdDefault -Platform Windows -Environment (New-WinEnv) -Architecture X64
+        $a.AVD_ABI | Should -Be 'arm64-v8a'
+        foreach ($k in (Get-AvdConfigKey)) {
+            if ($k -eq 'AVD_ABI') { continue }
+            $a[$k] | Should -Be $x[$k] -Because $k
+        }
+    }
+    It 'keeps the macOS defaults on Unix whatever the architecture' {
+        (Get-AvdDefault -Platform Unix -Environment @{ HOME = '/Users/me' } -Architecture X64).AVD_ABI | Should -Be 'arm64-v8a'
+        (Get-AvdDefault -Platform Unix -Environment @{ HOME = '/Users/me' } -Architecture Arm64).AVD_CORES | Should -Be '8'
+    }
     It 'keeps every other default identical to macOS' {
-        $w = Get-AvdDefault -Platform Windows -Environment (New-WinEnv)
+        $w = Get-AvdDefault -Platform Windows -Environment (New-WinEnv) -Architecture X64
         $u = Get-AvdDefault -Platform Unix -Environment @{ HOME = '/Users/me' }
         $platformKeys = 'STAGING', 'ICLOUD_DIR', 'SHARED_CACHE_DIR', 'AVD_SDK_ROOT', 'AVD_ABI', 'AVD_CORES'
         foreach ($k in (Get-AvdConfigKey)) {
             if ($platformKeys -contains $k) { continue }
             $w[$k] | Should -Be $u[$k] -Because $k
         }
+    }
+}
+
+Describe 'what to install, per architecture' {
+    It 'names the same winget packages, pinned to arm64 on Windows on Arm' {
+        Get-AvdInstallHint -Tool pwsh -Architecture X64 | Should -Be 'winget install --id Microsoft.PowerShell --source winget'
+        Get-AvdInstallHint -Tool pwsh -Architecture Arm64 | Should -Be 'winget install --id Microsoft.PowerShell --source winget --architecture arm64'
+        Get-AvdInstallHint -Tool java -Architecture X64 | Should -Be 'winget install Microsoft.OpenJDK.21'
+        Get-AvdInstallHint -Tool java -Architecture Arm64 | Should -Be 'winget install Microsoft.OpenJDK.21 --architecture arm64'
+        Get-AvdInstallHint -Tool git -Architecture Arm64 | Should -Be 'winget install Git.Git --architecture arm64'
+        Get-AvdInstallHint -Tool uv -Architecture Arm64 | Should -Be 'winget install astral-sh.uv --architecture arm64'
+    }
+    It 'installs icloudpd''s own build on x64 and its pure-Python wheel under Python 3.13 on Arm64' {
+        Get-AvdInstallHint -Tool icloudpd -Architecture X64 | Should -Be 'uv tool install icloudpd'
+        Get-AvdInstallHint -Tool icloudpd -Architecture Arm64 | Should -Be 'uv tool install --python 3.13 icloudpd'
+        $a = Get-AvdIcloudpdInstallArgument -Architecture Arm64
+        , $a | Should -BeOfType [string[]]
+        $a | Should -Be @('tool', 'install', '--python', '3.13', 'icloudpd')
+    }
+    It 'treats a config without an architecture as x64' {
+        Get-AvdConfigArchitecture ([pscustomobject]@{ PLATFORM = 'Windows' }) | Should -Be ''
+        Get-AvdConfigArchitecture ([pscustomobject]@{ ARCHITECTURE = 'Arm64' }) | Should -Be 'Arm64'
+        Get-AvdInstallHint -Tool java -Architecture '' | Should -Be 'winget install Microsoft.OpenJDK.21'
     }
 }
 
@@ -266,6 +394,23 @@ Describe 'Get-AvdConfig precedence' {
         $c.AVD_HOME | Should -Be 'C:\avd'
         $c.LABEL_PREFIX | Should -Be 'com.ayushsharma.icloud-to-google-photos'
     }
+    It 'carries the machine''s architecture, and the AVD_ABI default follows it unless AVD_ABI is set' {
+        $e = @{}; foreach ($k in $base.Keys) { $e[$k] = $base[$k] }
+        $a = Get-AvdConfig -Environment $e -Platform Windows -Architecture Arm64 -NoCreate
+        $a.ARCHITECTURE | Should -Be 'Arm64'
+        $a.AVD_ABI | Should -Be 'arm64-v8a'
+        $a.SOURCES.AVD_ABI | Should -Be 'default'
+        (Get-AvdConfig -Environment $e -Platform Windows -Architecture X64 -NoCreate).AVD_ABI | Should -Be 'x86_64'
+        $e['AVD_ABI'] = 'x86_64'
+        (Get-AvdConfig -Environment $e -Platform Windows -Architecture Arm64 -NoCreate).AVD_ABI | Should -Be 'x86_64'
+    }
+    It 'asks the machine, through the environment it was given, when no architecture is passed' {
+        $e = @{}; foreach ($k in $base.Keys) { $e[$k] = $base[$k] }
+        (Get-AvdConfig -Environment $e -Platform Windows -NoCreate).ARCHITECTURE | Should -Be (Get-AvdHostArchitecture -Environment $e).Os
+        $e['PROCESSOR_ARCHITECTURE'] = 'x86'
+        $e['PROCESSOR_ARCHITEW6432'] = 'ARM64'
+        (Get-AvdConfig -Environment $e -Platform Windows -NoCreate).ARCHITECTURE | Should -Be 'Arm64'
+    }
 }
 
 Describe 'ConvertTo-AvdInt' {
@@ -279,11 +424,24 @@ Describe 'ConvertTo-AvdInt' {
 }
 
 Describe 'the default config file' {
-    It 'parses with no warnings and sets only ICLOUD_USERNAME, to empty' {
-        $r = ConvertFrom-AvdConfigText -Text (Get-AvdDefaultConfigText -Platform Windows) -Seed @{} -Environment @{} -HomeDir 'C:\h'
-        $r.Warnings.Count | Should -Be 0
-        @($r.Values.Keys) | Should -Be @('ICLOUD_USERNAME')
-        $r.Values.ICLOUD_USERNAME | Should -Be ''
+    It 'parses with no warnings and sets only ICLOUD_USERNAME, to empty, on either architecture' {
+        foreach ($arch in 'X64', 'Arm64') {
+            $r = ConvertFrom-AvdConfigText -Text (Get-AvdDefaultConfigText -Platform Windows -Architecture $arch) -Seed @{} -Environment @{} -HomeDir 'C:\h'
+            $r.Warnings.Count | Should -Be 0 -Because $arch
+            @($r.Values.Keys) | Should -Be @('ICLOUD_USERNAME') -Because $arch
+            $r.Values.ICLOUD_USERNAME | Should -Be ''
+        }
+    }
+    It 'shows the ABI of the machine''s architecture, commented out' {
+        $x = Get-AvdDefaultConfigText -Platform Windows -Architecture X64
+        $x | Should -Match '(?m)^#AVD_ABI=x86_64\r?$'
+        $x | Should -Not -Match 'arm64-v8a'
+        $a = Get-AvdDefaultConfigText -Platform Windows -Architecture Arm64
+        $a | Should -Match '(?m)^#AVD_ABI=arm64-v8a\r?$'
+        $a | Should -Match 'Windows on Arm'
+        $a | Should -Not -Match '@ABI_LINES@'
+        # CRLF throughout, the ABI lines included.
+        ($a -replace "`r`n", '') | Should -Not -Match "`n"
     }
     It 'uses CRLF on Windows, since it is the one file a person edits by hand' {
         (Get-AvdDefaultConfigText -Platform Windows) | Should -Match "`r`n"

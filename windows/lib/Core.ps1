@@ -49,6 +49,106 @@ function Get-AvdPlatform {
     if ($IsWindows) { 'Windows' } else { 'Unix' }
 }
 
+# -- The machine's architecture -------------------------------------------------
+
+# One spelling per architecture, whoever is asked: .NET says X64 / Arm64 / X86,
+# PROCESSOR_ARCHITECTURE says AMD64 / ARM64 / x86, Google's SDK manifest says
+# x64 / aarch64. Anything else comes back as given.
+function ConvertTo-AvdArchitectureName {
+    param([AllowEmptyString()][AllowNull()][string]$Name)
+    $n = ([string]$Name).Trim()
+    if ($n -match '^(?i:x64|amd64|x86_64|x86-64)$') { return 'X64' }
+    if ($n -match '^(?i:arm64|aarch64)$') { return 'Arm64' }
+    if ($n -match '^(?i:x86|i[3-6]86)$') { return 'X86' }
+    $n
+}
+
+# THE MACHINE, NOT THIS PROCESS. Windows 11 on Arm runs x64 and x86 programs
+# under emulation, and an emulated program is told what it was built for: an
+# x64 pwsh on an Arm64 PC sees PROCESSOR_ARCHITECTURE=AMD64.
+# RuntimeInformation.OSArchitecture asks the OS instead and answers Arm64 inside
+# an emulated x64 process (.NET 7 and later; pwsh 7.4 runs on .NET 8).
+# PROCESSOR_ARCHITEW6432 is the second witness: Windows sets it in a WOW64
+# (32-bit x86) process to the machine's architecture. Arm64 wins when either
+# says so, because no x64 machine reports Arm64 by mistake, while an emulated
+# process is exactly the one that can under-report.
+# Os is what the machine is, Process what this pwsh was built for, Emulated
+# whether the two differ. The inputs are parameters so the tests can give every
+# combination on any host; CI checks the real answers on both architectures
+# (windows/tests/Test-HostArchitecture.ps1).
+function Get-AvdHostArchitecture {
+    param(
+        [AllowEmptyString()][string]$OsArchitecture = [string][System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture,
+        [AllowEmptyString()][string]$ProcessArchitecture = [string][System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture,
+        [System.Collections.IDictionary]$Environment = (Get-AvdEnvironment)
+    )
+    $w6432 = if ($Environment.Contains('PROCESSOR_ARCHITEW6432')) { ConvertTo-AvdArchitectureName $Environment['PROCESSOR_ARCHITEW6432'] } else { '' }
+    $pa = if ($Environment.Contains('PROCESSOR_ARCHITECTURE')) { ConvertTo-AvdArchitectureName $Environment['PROCESSOR_ARCHITECTURE'] } else { '' }
+    $os = ConvertTo-AvdArchitectureName $OsArchitecture
+    if ($w6432 -eq 'Arm64') { $os = 'Arm64' }
+    elseif (-not $os) { $os = if ($w6432) { $w6432 } else { $pa } }
+    $proc = ConvertTo-AvdArchitectureName $ProcessArchitecture
+    if (-not $proc) { $proc = $pa }
+    [pscustomobject]@{ Os = $os; Process = $proc; Emulated = ($os -ne $proc) }
+}
+
+# What a Windows executable was built for, from its PE header: the machine
+# field after the "PE\0\0" signature the DOS header's e_lfanew points at. X64,
+# Arm64 or X86; '' for anything else. Where a NATIVE program matters -- the pwsh
+# the scheduled tasks run, the Java sdkmanager runs on -- the file is asked,
+# not the process doing the asking.
+function Get-AvdPeArchitecture {
+    param([AllowEmptyCollection()][AllowNull()][byte[]]$Header)
+    if ($null -eq $Header -or $Header.Length -lt 64 -or $Header[0] -ne 0x4D -or $Header[1] -ne 0x5A) { return '' }
+    $pe = [System.BitConverter]::ToInt32($Header, 0x3C)
+    if ($pe -lt 0 -or $pe + 6 -gt $Header.Length) { return '' }
+    if ($Header[$pe] -ne 0x50 -or $Header[$pe + 1] -ne 0x45 -or $Header[$pe + 2] -ne 0 -or $Header[$pe + 3] -ne 0) { return '' }
+    switch ([int][System.BitConverter]::ToUInt16($Header, $pe + 4)) {
+        0x8664 { return 'X64' }
+        0xAA64 { return 'Arm64' }
+        0x014C { return 'X86' }
+    }
+    ''
+}
+
+function Get-AvdExecutableArchitecture {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return '' }
+    $buf = [byte[]]::new(4096)
+    $n = 0
+    try {
+        $fs = [System.IO.File]::OpenRead($Path)
+        try { $n = $fs.Read($buf, 0, $buf.Length) } finally { $fs.Dispose() }
+    } catch { return '' }
+    if ($n -le 0) { return '' }
+    $head = [byte[]]::new($n)
+    [System.Array]::Copy($buf, $head, $n)
+    Get-AvdPeArchitecture -Header $head
+}
+
+# The system-image ABI a Windows PC of this architecture can boot natively
+# (the AVD_ABI default; see Get-AvdDefault).
+function Get-AvdDefaultAbi {
+    param([AllowEmptyString()][string]$Architecture)
+    if ($Architecture -eq 'Arm64') { 'arm64-v8a' } else { 'x86_64' }
+}
+
+# The one message for Windows on Arm, as lines: the installer prints it, the
+# setup stops with it, and the README and DESIGN.md (decision 16) say the
+# same. What was read, and when, is in that decision.
+function Get-AvdWindowsOnArmNote {
+    , ([string[]]@(
+            'Windows on Arm: no Android Emulator. Google''s SDK index lists the emulator for Windows'
+            'on x64 only (read 2026-09-13), and the x64 build cannot stand in: under Windows'' x64'
+            'emulation no hypervisor can run an x86_64 system image, because hardware virtualisation'
+            'runs guests of the host''s own instruction set. So avd-photos-setup cannot build the'
+            'rooted emulator on this PC, and an armed sync stops before its emulator step.'
+            'Everything else runs natively: the commands, the scheduled tasks, the tray, icloudpd'
+            'and the ledgers. avd-photos-setup reads Google''s index again on every run and goes'
+            'ahead once it lists an emulator for Windows on Arm.'
+        ))
+}
+
 function Get-AvdConfigKey {
     , $script:AvdKeys
 }
@@ -162,15 +262,21 @@ function Resolve-AvdHome {
 # where the platform decides:
 #   STAGING, ICLOUD_DIR, AVD_SDK_ROOT  Windows locations (iCloud for Windows
 #                                      mounts iCloud Drive at %USERPROFILE%\iCloudDrive)
-#   AVD_ABI    x86_64: a Windows host runs x86_64 images under WHPX or AEHD;
-#              arm64-v8a images do not boot on an x86 host.
+#   AVD_ABI    by the machine's architecture (-Architecture, Os of
+#              Get-AvdHostArchitecture). x86_64 on an x64 PC: WHPX and AEHD
+#              run x86_64 guests, and arm64-v8a images do not boot on an x86
+#              host. arm64-v8a on Windows on Arm: hardware virtualisation runs
+#              guests of the host's own instruction set, so those are the only
+#              images an Arm64 PC could boot natively -- once Google publishes
+#              an emulator for it (DESIGN.md decision 16).
 #   AVD_CORES  4, not 8: the macOS value is an M2 Pro's performance-core count,
 #              and a guest with as many vCPUs as a laptop has cores starves the
 #              host that is also running icloudpd and adb.
 function Get-AvdDefault {
     param(
         [Parameter(Mandatory)][ValidateSet('Windows', 'Unix')][string]$Platform,
-        [Parameter(Mandatory)][System.Collections.IDictionary]$Environment
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Environment,
+        [string]$Architecture = (Get-AvdHostArchitecture).Os
     )
     $homeDir = Get-AvdHomeDirectory -Platform $Platform -Environment $Environment
     if ($Platform -eq 'Windows') {
@@ -178,7 +284,7 @@ function Get-AvdDefault {
         $staging = Join-AvdPath Windows $homeDir, 'Pictures\icloud-photos-staging'
         $icloudDir = Join-AvdPath Windows $homeDir, 'iCloudDrive'
         $sdkRoot = Join-AvdPath Windows $localAppData, 'android-avd-sdk'
-        $abi = 'x86_64'
+        $abi = Get-AvdDefaultAbi -Architecture $Architecture
         $cores = '4'
     } else {
         $staging = Join-AvdPath Unix $homeDir, 'Pictures/icloud-photos-staging'
@@ -383,14 +489,19 @@ function Get-AvdConfig {
     param(
         [System.Collections.IDictionary]$Environment,
         [ValidateSet('Windows', 'Unix')][string]$Platform,
+        # The machine's architecture (X64, Arm64): Get-AvdHostArchitecture's Os
+        # when omitted. It is not a config key -- the key list is the macOS
+        # contract -- but a fact about the machine, like PLATFORM.
+        [string]$Architecture,
         # Do not create the config, state and log directories (the status reader
         # and the tests use this; everything else creates them, as ap_load_config does).
         [switch]$NoCreate
     )
     if ($null -eq $Environment) { $Environment = Get-AvdEnvironment }
     if (-not $Platform) { $Platform = Get-AvdPlatform }
+    if (-not $Architecture) { $Architecture = (Get-AvdHostArchitecture -Environment $Environment).Os }
     $paths = Get-AvdPathSet -Platform $Platform -Environment $Environment
-    $defaults = Get-AvdDefault -Platform $Platform -Environment $Environment
+    $defaults = Get-AvdDefault -Platform $Platform -Environment $Environment -Architecture $Architecture
 
     # What a $NAME in the file sees before the file assigns it: the environment
     # value when set, else the default -- what a sourced file sees on macOS.
@@ -429,6 +540,7 @@ function Get-AvdConfig {
     }
 
     $cfg['PLATFORM'] = $Platform
+    $cfg['ARCHITECTURE'] = $Architecture
     $cfg['HOME_DIR'] = $paths.HOME_DIR
     $cfg['CONFIG_DIR'] = $paths.CONFIG_DIR
     $cfg['STATE_DIR'] = $paths.STATE_DIR
@@ -470,7 +582,17 @@ function Get-AvdConfigInt {
 # Written with the platform's line endings, since it is the one file here a
 # person edits by hand (Notepad reads LF too; the parser reads either).
 function Get-AvdDefaultConfigText {
-    param([ValidateSet('Windows', 'Unix')][string]$Platform = (Get-AvdPlatform))
+    param(
+        [ValidateSet('Windows', 'Unix')][string]$Platform = (Get-AvdPlatform),
+        [string]$Architecture = (Get-AvdHostArchitecture).Os
+    )
+    $abiLines = if ($Architecture -eq 'Arm64') {
+        "# arm64-v8a: the only ABI a Windows on Arm PC can boot natively, once Google`n" +
+        "# publishes an Android Emulator for it (see Windows on Arm in the README).`n" +
+        '#AVD_ABI=arm64-v8a'
+    } else {
+        "# x86_64 is the only ABI a Windows x86 host can run.`n#AVD_ABI=x86_64"
+    }
     $text = @'
 # icloud-to-google-photos configuration (Windows). Read, not executed:
 # KEY=value, one per line; everything after the = is the value, so a path with
@@ -496,8 +618,7 @@ ICLOUD_USERNAME=
 # writable, and ASCII-only: rooting rewrites the system image's ramdisk.img in
 # place, and the emulator mishandles non-ASCII paths.
 #AVD_SDK_ROOT=%LOCALAPPDATA%\android-avd-sdk
-# x86_64 is the only ABI a Windows x86 host can run.
-#AVD_ABI=x86_64
+@ABI_LINES@
 # host = the GPU driver, fast. The one-time Google sign-in uses avd-signin
 # (software GL) regardless; leave this alone.
 #AVD_GPU=host
@@ -536,9 +657,10 @@ ICLOUD_USERNAME=
 # lookups. The pipeline works without it.
 #GITHUB_TOKEN=
 '@
+    $text = (ConvertTo-AvdLf $text).Replace('@ABI_LINES@', $abiLines)
     # A final newline, or a line a person appends to the file joins the last
     # comment and is silently lost.
-    $text = (ConvertTo-AvdLf $text).TrimEnd("`n") + "`n"
+    $text = $text.TrimEnd("`n") + "`n"
     if ($Platform -eq 'Windows') { $text = $text.Replace("`n", "`r`n") }
     $text
 }
@@ -576,10 +698,14 @@ function Protect-AvdFile {
 }
 
 function Write-AvdDefaultConfig {
-    param([Parameter(Mandatory)][string]$Path, [ValidateSet('Windows', 'Unix')][string]$Platform = (Get-AvdPlatform))
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [ValidateSet('Windows', 'Unix')][string]$Platform = (Get-AvdPlatform),
+        [string]$Architecture = (Get-AvdHostArchitecture).Os
+    )
     $dir = Split-Path -Parent $Path
     if ($dir) { $null = New-Item -ItemType Directory -Force -Path $dir }
-    [System.IO.File]::WriteAllText($Path, (Get-AvdDefaultConfigText -Platform $Platform), $script:Utf8NoBom)
+    [System.IO.File]::WriteAllText($Path, (Get-AvdDefaultConfigText -Platform $Platform -Architecture $Architecture), $script:Utf8NoBom)
     $null = Protect-AvdFile -Path $Path
 }
 
@@ -1242,6 +1368,50 @@ function Get-AvdIcloudpdVersion {
 function Get-AvdIcloudpdSpec {
     param([Parameter(Mandatory)][string]$Version)
     "icloudpd @ git+https://github.com/icloud-photos-downloader/icloud_photos_downloader@v$Version"
+}
+
+# -- What to install, per architecture ----------------------------------------
+
+# The `uv` arguments that install icloudpd. icloudpd publishes Windows builds
+# for amd64 only: the frozen executable in its release and in its win_amd64
+# wheel (v1.32.3, read on GitHub and PyPI 2026-09-13). On Arm64 uv takes the
+# pure-Python wheel instead, whose own metadata says Requires-Python
+# >=3.10,<3.14 (PyPI's index says only >=2), so the tool gets Python 3.13 --
+# the version the reclaim runs under, which uv installs as a native aarch64
+# build. On x64 the frozen build needs no particular Python.
+function Get-AvdIcloudpdInstallArgument {
+    param([AllowEmptyString()][string]$Architecture = (Get-AvdHostArchitecture).Os)
+    if ($Architecture -eq 'Arm64') { return , ([string[]]@('tool', 'install', '--python', '3.13', 'icloudpd')) }
+    , ([string[]]@('tool', 'install', 'icloudpd'))
+}
+
+# The one place the install commands are spelled, so the installer, the
+# setup's Java messages, the sync's icloudpd message and the README agree.
+# winget already prefers a machine's native build; on Arm64 the commands say
+# --architecture arm64 anyway, so an x64 build winget would otherwise settle
+# for cannot leave a tool under emulation. Each package publishes an arm64
+# installer (winget-pkgs, 2026-09-13: Microsoft.PowerShell 7.6.6.0,
+# Microsoft.OpenJDK.21 21.0.12.101, Git.Git 2.55.0.3, astral-sh.uv 0.12.13).
+function Get-AvdInstallHint {
+    param(
+        [Parameter(Mandatory)][ValidateSet('pwsh', 'java', 'git', 'uv', 'icloudpd')][string]$Tool,
+        [AllowEmptyString()][string]$Architecture = (Get-AvdHostArchitecture).Os
+    )
+    $arch = if ($Architecture -eq 'Arm64') { ' --architecture arm64' } else { '' }
+    switch ($Tool) {
+        'pwsh' { return "winget install --id Microsoft.PowerShell --source winget$arch" }
+        'java' { return "winget install Microsoft.OpenJDK.21$arch" }
+        'git' { return "winget install Git.Git$arch" }
+        'uv' { return "winget install astral-sh.uv$arch" }
+    }
+    'uv ' + ((Get-AvdIcloudpdInstallArgument -Architecture $Architecture) -join ' ')
+}
+
+# A config's ARCHITECTURE, or '' for a config built without one (a test's
+# hand-made object): '' is never Arm64, so such a config keeps the x64 paths.
+function Get-AvdConfigArchitecture {
+    param($Config)
+    if ($null -ne $Config -and $Config.PSObject.Properties['ARCHITECTURE']) { [string]$Config.ARCHITECTURE } else { '' }
 }
 
 # -- Paths inside this checkout ------------------------------------------------

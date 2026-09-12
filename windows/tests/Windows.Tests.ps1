@@ -1,5 +1,7 @@
 #Requires -Version 7.2
-# What only real Windows can answer, run by CI on windows-latest: Task
+# What only real Windows can answer, run by CI on windows-latest (x64) and
+# windows-11-arm (Arm64): the machine's architecture read back from real
+# executables, Task
 # Scheduler's reading of the task definitions, the registry type of the user
 # PATH, the config ACL, cmd.exe's handling of a .bat's arguments, a process
 # tree kill, the detached emulator launch, and the shell's shortcuts. Tagged
@@ -141,6 +143,20 @@ Describe 'the process runner on Windows' -Tag 'WindowsOnly' {
     It 'queries emulator processes through CIM without error when none runs' {
         $found = Get-AvdEmulatorProcess -AvdName ('no-such-avd-' + [guid]::NewGuid().ToString('N'))
         $found.Count | Should -Be 0
+    }
+}
+
+Describe 'the architecture of real executables' -Tag 'WindowsOnly' {
+    It 'reads this pwsh.exe as the architecture this process runs as' {
+        $want = ConvertTo-AvdArchitectureName ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture)
+        Get-AvdExecutableArchitecture -Path $Pwsh | Should -Be $want
+    }
+    It 'answers the machine''s architecture the same whether asked of .NET or of Windows'' environment' {
+        $h = Get-AvdHostArchitecture
+        $native = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+        # A native pwsh (what CI runs here) sees its own architecture in both.
+        if (-not $h.Emulated) { $h.Os | Should -Be (ConvertTo-AvdArchitectureName $native) }
+        $h.Os | Should -BeIn @('X64', 'Arm64')
     }
 }
 
