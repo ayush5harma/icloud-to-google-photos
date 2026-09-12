@@ -121,9 +121,11 @@ EMU_STARTED_BY_US=0
 cleanup() {
   local rc=$?
   # --start exists precisely to LEAVE the emulator running, so never reap it there.
-  if [ "$EMU_STARTED_BY_US" -eq 1 ] && [ "$HEADLESS" -eq 1 ] && [ "$START_ONLY" -eq 0 ]; then
-    adb -s "${SER:-}" shell sync >/dev/null 2>&1
-    adb -s "${SER:-}" emu kill >/dev/null 2>&1
+  # An empty $SER means nothing was ever resolved, and `adb -s ""` would address
+  # whatever single device happens to be attached.
+  if [ "$EMU_STARTED_BY_US" -eq 1 ] && [ "$HEADLESS" -eq 1 ] && [ "$START_ONLY" -eq 0 ] && [ -n "${SER:-}" ]; then
+    adb -s "$SER" shell sync >/dev/null 2>&1
+    adb -s "$SER" emu kill >/dev/null 2>&1
   fi
   rm -rf "$LOCK"
   exit "$rc"
@@ -141,7 +143,11 @@ for t in sdkmanager adb jq curl python3; do
 done
 
 EMU="$SDK_ROOT/emulator/emulator"
-SER="emulator-5554"
+# Resolved by NAME in boot_emulator (ap_emulator_serial, lib/proc.sh), never
+# assumed: emulator-5554 is only the first free console port, so any emulator
+# started before this one owns it -- and this script flashes modules, patches a
+# ramdisk and reboots whatever serial it is handed.
+SER=""
 
 # avdmanager cannot be pointed at a non-default SDK root by environment in every
 # packaging (some wrappers PREPEND their own path to ANDROID_HOME and the tool
@@ -212,6 +218,36 @@ gh_latest() {
 fetch() {
   curl -fL --retry 3 --connect-timeout 20 --max-time 900 \
        --speed-limit 2048 --speed-time 60 -o "$1" "$2" 2>/dev/null
+}
+
+# verify_asset <key> <tag> <file>: record this asset's sha256 beside its release
+# tag, and refuse it if the same tag ever produces different bytes.
+#
+# WHAT THIS IS AND IS NOT. Everything flashed here is an unsigned artefact from a
+# GitHub release, fetched over TLS, and TLS only says the bytes came from
+# GitHub -- not that the release is the one that was reviewed. Nothing here is
+# version-pinned by design (a re-run is the update), so a hash pinned in this
+# repository would be wrong by the next release and is not on offer. What IS on
+# offer is that a tag cannot change under you: the first time a tag is seen its
+# hash is recorded in stamps/, and a later download of that SAME tag must match
+# or nothing is flashed. That catches a re-uploaded asset and a corrupted or
+# truncated download; it does not catch a malicious NEW release, which is the
+# residual risk the README states plainly.
+verify_asset() {
+  local key="$1" tag="${2:-untagged}" f="$3" have want
+  [ -s "$f" ] || { warn "empty download for $key"; return 1; }
+  have="$(/usr/bin/shasum -a 256 "$f" 2>/dev/null | awk '{print $1}')"
+  [ -n "$have" ] || { warn "could not hash $f"; return 1; }
+  want="$(stamp_get "sha-$key-$tag")"
+  if [ -n "$want" ] && [ "$want" != "$have" ]; then
+    warn "REFUSING $key $tag: its bytes changed since this machine first saw that tag"
+    warn "  recorded ${want:0:16}…  downloaded ${have:0:16}…"
+    warn "  delete $STAMPS/sha-$key-$tag to accept the new bytes deliberately"
+    return 1
+  fi
+  [ -n "$want" ] || stamp_set "sha-$key-$tag" "$have"
+  step "$key $tag sha256 ${have:0:16}…${want:+ (matches the recorded hash)}"
+  return 0
 }
 
 # Time-bounded device shell (dev_capture, lib/proc.sh) returning the device
@@ -314,10 +350,26 @@ boot_emulator() {
     sleep 8
   fi
   run_bounded 60 adb start-server
+  # WHICH DEVICE IS OURS: ask every attached emulator its AVD name and take the
+  # one that answers with ours. Bounded, because the console answers before the
+  # guest has booted but not instantly.
+  SER=""
+  local rend=$((SECONDS + 180))
+  while [ "$SECONDS" -lt "$rend" ]; do
+    SER="$(ap_emulator_serial "$AVD_NAME")"
+    [ -n "$SER" ] && break
+    sleep 3
+  done
+  [ -n "$SER" ] || die "no attached emulator answers to the name $AVD_NAME — see $EMU_LOG"
+  step "device: $SER"
   # -s "$SER": a bare wait-for-device returns on ANY transport, so a stale
   # `adb connect` entry satisfied it instantly while this emulator was booting.
   run_bounded 120 adb -s "$SER" wait-for-device
   wait_boot || die "the emulator did not finish booting — see $EMU_LOG"
+  # Assert once more now that it is up. Everything after this line patches,
+  # flashes and reboots, so being sure of the target is worth one console call.
+  local nm; nm="$(ap_avd_name_of "$SER")"
+  [ "$nm" = "$AVD_NAME" ] || die "$SER is running '${nm:-unknown}', not $AVD_NAME — refusing to touch it"
   # EVERY boot drops adbd back to the shell user, after which
   # `magisk --install-module` fails with a bare "Run this command with root" that
   # reads as a Magisk problem rather than a missing `adb root`.
@@ -581,6 +633,7 @@ phase_root() {
   local mu; mu="$(gh_latest topjohnwu/Magisk | jq -r '.assets[]?|select(.name|test("^Magisk-v.*\\.apk$"))|.browser_download_url' | head -1)"
   [ -n "$mu" ] && fetch "$apk" "$mu"
   [ -s "$apk" ] || die "could not fetch the Magisk APK"
+  verify_asset magisk "$latest" "$apk" || die "the Magisk APK did not verify — nothing was patched"
   step "patching ramdisk with Magisk ${latest:-latest}"
 
   local W=/data/local/tmp/magiskpatch
@@ -673,6 +726,7 @@ phase_modules() {
     if [ -z "$url" ]; then warn "no matching asset for $repo"; continue; fi
     local zip="$STATE_DIR/mod-$mid.zip"
     if ! fetch "$zip" "$url" || [ ! -s "$zip" ]; then warn "download failed: $repo"; continue; fi
+    verify_asset "mod-$mid" "$tag" "$zip" || { warn "not flashing $mid"; continue; }
     adb -s "$SER" push "$zip" "/data/local/tmp/mod-$mid.zip" >/dev/null 2>&1
     magisk_complete_env
     rdev "$MAGISK --install-module /data/local/tmp/mod-$mid.zip" 2>/dev/null | tail -3
@@ -737,12 +791,20 @@ playstore_installed() {
 phonesky_fetch() {
   [ -s "$PHONESKY_CACHE" ] && return 0
   mkdir -p "$(dirname "$PHONESKY_CACHE")"
-  if [ -n "$PHONESKY_SHARED" ] && [ -s "$PHONESKY_SHARED" ]; then
-    cp -f "$PHONESKY_SHARED" "$PHONESKY_CACHE" && { step "Phonesky from the shared cache"; return 0; }
-  fi
   # The donor is the certified image of the SAME API level, so the store build
   # matches the system the module re-homes it into.
   local donor_api="${PLAYSTORE_DONOR_API:-$API}"
+  if [ -n "$PHONESKY_SHARED" ] && [ -s "$PHONESKY_SHARED" ]; then
+    # The shared copy was written by another machine, so it gets the same
+    # trust-on-first-use check as a download: on this machine's second run the
+    # recorded hash must still match.
+    if cp -f "$PHONESKY_SHARED" "$PHONESKY_CACHE" \
+       && verify_asset phonesky "api$donor_api" "$PHONESKY_CACHE"; then
+      step "Phonesky from the shared cache"; return 0
+    fi
+    warn "the shared Phonesky copy did not verify — extracting it again"
+    rm -f "$PHONESKY_CACHE"
+  fi
   step "extracting Phonesky from Google's certified android-$donor_api image (one time, ~2.7 GB)"
   run_bounded 5400 sdkm --install "system-images;android-${donor_api};google_apis_playstore;${AVD_ABI}" \
     || { warn "could not download the certified image"; return 1; }
@@ -752,28 +814,48 @@ phonesky_fetch() {
     -k "system-images;android-${donor_api};google_apis_playstore;${AVD_ABI}" -d "$AVD_DEVICE" \
     --abi "$AVD_ABI" -p "$HOME/.android/avd/$donor.avd" >/dev/null 2>&1 \
     || { warn "could not create the donor emulator"; return 1; }
-  # The donor must not collide with our own emulator on 5554.
-  local was_running=0; emu_running && { was_running=1; run_bounded 60 adb -s "$SER" emu kill; sleep 6; }
+  # Free our own emulator's memory for the donor, and remember to bring it back.
+  # It is killed by its RESOLVED serial, and the donor is then found by ITS name
+  # rather than by assuming it inherited the port the other one just released.
+  local was_running=0
+  if emu_running; then
+    was_running=1
+    [ -n "$SER" ] && run_bounded 60 adb -s "$SER" emu kill
+    sleep 6
+  fi
   ANDROID_HOME="$SDK_ROOT" ANDROID_SDK_ROOT="$SDK_ROOT" \
     nohup "$EMU" -avd "$donor" -no-snapshot -no-boot-anim -no-window \
       -gpu swiftshader_indirect >>"$EMU_LOG" 2>&1 &
   sleep 25
   run_bounded 60 adb start-server
-  local ok=0 end=$((SECONDS+300))
+  local dser="" ok=0 end=$((SECONDS+300))
   while [ "$SECONDS" -lt "$end" ]; do
-    [ "$(dev getprop sys.boot_completed | tr -d '\r')" = "1" ] && { ok=1; break; }
+    dser="$(ap_emulator_serial "$donor")"
+    [ -n "$dser" ] && break
     sleep 3
   done
-  if [ "$ok" -eq 1 ]; then
-    run_bounded 300 adb -s "$SER" pull /product/priv-app/Phonesky/Phonesky.apk "$PHONESKY_CACHE"
+  if [ -z "$dser" ]; then
+    warn "the donor emulator never attached — no Phonesky this run"
+  else
+    step "donor: $dser"
+    while [ "$SECONDS" -lt "$end" ]; do
+      [ "$(dev_capture "$dser" "$DEV_TIMEOUT" 0.1 merge getprop sys.boot_completed | tr -d '\r')" = "1" ] \
+        && { ok=1; break; }
+      sleep 3
+    done
   fi
-  run_bounded 60 adb -s "$SER" emu kill; sleep 6
+  if [ "$ok" -eq 1 ]; then
+    run_bounded 300 adb -s "$dser" pull /product/priv-app/Phonesky/Phonesky.apk "$PHONESKY_CACHE"
+  fi
+  [ -n "$dser" ] && run_bounded 60 adb -s "$dser" emu kill
+  sleep 6
   pkill -f "qemu-system.*$donor" 2>/dev/null
   rm -rf "$HOME/.android/avd/$donor.avd" "$HOME/.android/avd/$donor.ini"
   rm -rf "$SDK_ROOT/system-images/android-${donor_api}/google_apis_playstore"
   [ "$was_running" -eq 1 ] && boot_emulator
   if [ -s "$PHONESKY_CACHE" ]; then
     step "extracted Phonesky ($(( $(/usr/bin/stat -f %z "$PHONESKY_CACHE") / 1048576 )) MB)"
+    verify_asset phonesky "api$donor_api" "$PHONESKY_CACHE" || true
     if [ -n "$PHONESKY_SHARED" ]; then
       mkdir -p "$(dirname "$PHONESKY_SHARED")" 2>/dev/null \
         && cp -f "$PHONESKY_CACHE" "$PHONESKY_SHARED" 2>/dev/null \
@@ -856,7 +938,8 @@ phase_zygisk() {
   if [ "$CHECK_ONLY" -eq 0 ] && { ! neozygisk_installed || { [ -n "$ntag" ] && [ "$nhave" != "$ntag" ]; }; }; then
     local nu
     nu="$(gh_latest "$NEOZYGISK_REPO" | jq -r '.assets[]? | select(.name|test("release\\.zip$")) | .browser_download_url' | head -1)"
-    if [ -n "$nu" ] && fetch "$STATE_DIR/neozygisk.zip" "$nu" && [ -s "$STATE_DIR/neozygisk.zip" ]; then
+    if [ -n "$nu" ] && fetch "$STATE_DIR/neozygisk.zip" "$nu" && [ -s "$STATE_DIR/neozygisk.zip" ] \
+       && verify_asset neozygisk "$ntag" "$STATE_DIR/neozygisk.zip"; then
       adb -s "$SER" push "$STATE_DIR/neozygisk.zip" /data/local/tmp/neozygisk.zip >/dev/null 2>&1
       magisk_complete_env
       rdev "$MAGISK --install-module /data/local/tmp/neozygisk.zip" 2>/dev/null | tail -3
@@ -893,7 +976,8 @@ phase_vector() {
     # Vector ships a FLASHABLE MAGISK MODULE zip (module.prop / customize.sh /
     # update-binary), NOT an APK -- flash it, never unzip-and-install it.
     local vu; vu="$(gh_latest "$VECTOR_REPO" | jq -r '.assets[]? | select(.name|test("Release.*\\.zip$")) | .browser_download_url' | head -1)"
-    if [ -n "$vu" ] && fetch "$STATE_DIR/vector.zip" "$vu" && [ -s "$STATE_DIR/vector.zip" ]; then
+    if [ -n "$vu" ] && fetch "$STATE_DIR/vector.zip" "$vu" && [ -s "$STATE_DIR/vector.zip" ] \
+       && verify_asset vector "$vtag" "$STATE_DIR/vector.zip"; then
       adb -s "$SER" push "$STATE_DIR/vector.zip" /data/local/tmp/vector.zip >/dev/null 2>&1
       magisk_complete_env
       rdev "$MAGISK --install-module /data/local/tmp/vector.zip" 2>/dev/null | tail -4
@@ -909,6 +993,7 @@ phase_vector() {
   if [ "$CHECK_ONLY" -eq 0 ] && { [ "$pinst" -eq 0 ] || { [ -n "$ptag" ] && [ "$phave" != "$ptag" ]; }; }; then
     local pu; pu="$(gh_latest "$PIXELIFY_REPO" | jq -r '.assets[]? | select(.name|test("\\.apk$")) | .browser_download_url' | head -1)"
     if [ -n "$pu" ] && fetch "$STATE_DIR/pixelify.apk" "$pu" \
+       && verify_asset pixelify "$ptag" "$STATE_DIR/pixelify.apk" \
        && adb -s "$SER" install -r -g "$STATE_DIR/pixelify.apk" >/dev/null 2>&1; then
       stamp_set pixelify "$ptag"; step "installed $ptag"
     else warn "Pixelify install failed"; fi
