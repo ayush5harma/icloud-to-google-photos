@@ -522,7 +522,9 @@ ICLOUD_USERNAME=
 # lookups. The pipeline works without it.
 #GITHUB_TOKEN=
 '@
-    $text = ConvertTo-AvdLf $text
+    # A final newline, or a line a person appends to the file joins the last
+    # comment and is silently lost.
+    $text = (ConvertTo-AvdLf $text).TrimEnd("`n") + "`n"
     if ($Platform -eq 'Windows') { $text = $text.Replace("`n", "`r`n") }
     $text
 }
