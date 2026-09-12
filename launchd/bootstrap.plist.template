@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  FRESH-MACHINE BOOTSTRAP, at every login: the first login after install builds
+  the whole rooted stack unattended, and a build that was interrupted resumes at
+  the next one. The script returns IMMEDIATELY once setup COMPLETED (its marker
+  is written after the last phase, not when the emulator directory appears), so
+  every later login costs one stat(2) -- the heavy path boots an emulator and
+  pulls several GB and must never run per login.
+
+  The Google sign-in and the iCloud two-factor login still need a human, so a new
+  machine ends at "signed out but fully built".
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>__LABEL__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__BIN_DIR__/avd-photos-setup</string>
+    <string>--bootstrap</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>5</integer>
+  <key>StandardOutPath</key><string>/dev/null</string>
+  <key>StandardErrorPath</key><string>__LOG_DIR__/bootstrap.launchd.log</string>
+</dict>
+</plist>

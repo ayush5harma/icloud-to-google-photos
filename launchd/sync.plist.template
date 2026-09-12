@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The sync job. Rendered by install.sh; __PLACEHOLDERS__ are substituted there.
+
+  StartInterval 900 plus RunAtLoad, because the icloudpd incremental pass IS the
+  "anything new in iCloud" check: a quiet tick costs about a minute and no VM.
+  launchd does not wake a sleeping Mac for it and collapses missed ticks into one
+  at wake; the script is single-flight, so an overlapping tick logs one line and
+  exits. RunAtLoad matters for a laptop that is shut down most nights, which a
+  calendar tick would effectively never reach.
+
+  IT RUNS THE APP BINARY, NOT THE SCRIPT. Listing a cloud-provider staging tree
+  is permission-gated per app, and a bash that launchd spawned is its own
+  responsible process: it gets "Operation not permitted" on every directory of
+  the mount while a child of the app bundle lists it fine. `--sync` spawns the
+  script as the app's child and waits. The wrapper waits for the app to exist so
+  a fresh machine mid-install does not fail the job; `exec` is fine because the
+  FINAL image is the app.
+
+  Background band with LowPriorityIO and Nice: calendar and interval jobs missed
+  while the Mac slept all fire TOGETHER at wake, so priority, not scheduling, is
+  what keeps this out of the way. stdout goes to /dev/null because the script
+  owns its own rotated log; stderr is kept, and in normal operation it is empty.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>__LABEL__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-c</string>
+    <string>app="__APP_BIN__"; while [ ! -x "$app" ]; do sleep 300; done; exec "$app" --sync</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AVD_PHOTOS_BIN_DIR</key><string>__BIN_DIR__</string>
+  </dict>
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>5</integer>
+  <key>StandardOutPath</key><string>/dev/null</string>
+  <key>StandardErrorPath</key><string>__LOG_DIR__/sync.launchd.log</string>
+</dict>
+</plist>

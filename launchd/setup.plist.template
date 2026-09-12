@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The weekly re-run, which IS the update: nothing in this stack is pinned, so
+  avd-photos-setup re-resolves the SDK tools, the system image, Magisk,
+  NeoZygisk and the spoof module every time. --headless because a weekly job must
+  never throw an emulator window onto the screen at 05:30 on a Saturday.
+
+  It deliberately does NOT recreate the emulator onto a newer API or re-patch the
+  ramdisk for a newer Magisk: both destroy a working signed-in instance, so it
+  REPORTS and leaves AVD_RECREATE / AVD_REROOT to a human.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>__LABEL__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__BIN_DIR__/avd-photos-setup</string>
+    <string>--headless</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict>
+      <key>Weekday</key><integer>6</integer>
+      <key>Hour</key><integer>5</integer>
+      <key>Minute</key><integer>30</integer>
+    </dict>
+  </array>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>5</integer>
+  <key>StandardOutPath</key><string>/dev/null</string>
+  <key>StandardErrorPath</key><string>__LOG_DIR__/setup.launchd.log</string>
+</dict>
+</plist>

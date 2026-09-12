@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Photo Sync, the resident menu-bar app. Interactive and NOT the Background band
+  the other agents use: a person is looking at it, and throttling it like a
+  nightly batch job makes it visibly stale.
+
+  The wrapper WAITS for the app rather than failing: build.sh may not have
+  produced it yet on a fresh machine, and a missing binary under KeepAlive is a
+  respawn-every-ten-seconds loop.
+
+  AVD_PHOTOS_BIN_DIR tells the app where the pipeline's scripts are, so the
+  status collector, "Offload from iCloud" and the --sync fallback all resolve
+  without guessing.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>__LABEL__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-c</string>
+    <string>app="__APP_BIN__"; while [ ! -x "$app" ]; do sleep 300; done; exec "$app"</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AVD_PHOTOS_BIN_DIR</key><string>__BIN_DIR__</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>/dev/null</string>
+  <key>StandardErrorPath</key><string>__LOG_DIR__/menubar.launchd.log</string>
+</dict>
+</plist>

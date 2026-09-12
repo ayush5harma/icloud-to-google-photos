@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Rebuild the "Google Photos (AVD)" Dock launcher and its icon AT LOGIN; cheap
+  and idempotent. It is a login agent rather than an install-time step because of
+  the ICON: an .icns holds ONE image, so avd-photos-app picks the light or dark
+  pinwheel from the current appearance AT BUILD TIME, and rebuilding it at each
+  login is what makes the Dock icon follow a light/dark switch.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>__LABEL__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__BIN_DIR__/avd-photos-app</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>5</integer>
+  <key>StandardOutPath</key><string>/dev/null</string>
+  <key>StandardErrorPath</key><string>__LOG_DIR__/app.launchd.log</string>
+</dict>
+</plist>
