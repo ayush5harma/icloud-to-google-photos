@@ -1187,7 +1187,9 @@ function Invoke-AvdVerifyStep {
                 $r = Get-AvdRelOfDevname -Name $dp.Substring($dp.LastIndexOf('/') + 1) -Ledger $ledger
                 if ($r) { $r }
             }
-            Add-AvdLine -Path $c.ReclaimPending -Line ([string[]]@($toReclaim))
+            # Filtered, not wrapped: @() of an empty foreach is @($null), one
+            # element, which would append an empty line to the pending list.
+            Add-AvdLine -Path $c.ReclaimPending -Line ([string[]]@($toReclaim | Where-Object { $_ }))
             $remain = ConvertTo-AvdDigit (Get-AvdDeviceOutput $c @("ls $dcim 2>/dev/null | wc -l"))
             Write-AvdSyncLog $c "reclaimed emulator space: removed $npr confirmed file(s) from DCIM ($(if ($remain) { $remain } else { '0' }) remain on device)"
             if ((ConvertTo-AvdInt -Value $remain -Default 1) -eq 0) { Remove-Item -LiteralPath $c.DeviceBusy -Force -ErrorAction SilentlyContinue }
