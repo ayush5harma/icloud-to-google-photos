@@ -358,9 +358,10 @@ function ConvertFrom-AvdConfigText {
 
 # THE CONFIG, resolved: environment > config file > default, decided by
 # whether the caller SET a variable rather than whether it is non-empty
-# (lib/config.sh's rule, commit 3b71bbc). One Windows limit: cmd and
-# PowerShell cannot easily create an EMPTY environment variable (assigning ''
-# deletes it), so "no floor for this run" is KEEP_ICLOUD_DAYS=0 there.
+# (lib/config.sh's rule, commit 3b71bbc). An empty variable counts as set
+# when it exists (pwsh 7.6.5's `$env:KEY = ''` keeps one, measured
+# 2026-09-13), but cmd cannot make one (`set KEY=` deletes it), so the README
+# gives KEEP_ICLOUD_DAYS=0 as the way to say "no floor for this run".
 #
 # SHARED_CACHE_DIR's default follows the FINAL ICLOUD_DIR, so a config that
 # moves iCloud Drive moves the cache with it, as the README's table says.

@@ -10,6 +10,10 @@ a Pixel, waits for Google Photos to actually upload them, checks each upload
 against Google Photos' own database, and only then deletes those exact photos
 from iCloud. A menu-bar ring shows which stage the current batch is in.
 
+It runs on Windows 11 too -- the same pipeline, config and ledgers, driven by
+Task Scheduler and a tray icon instead of launchd and the menu bar. See
+[Windows](#windows).
+
 The reason for the emulator is the only interesting part: Google Photos gives
 original-quality backup, with no counting against Google One storage, to a 2016
 Pixel. A rooted Android emulator running a Magisk module that spoofs those device
@@ -267,6 +271,9 @@ ignore it.
 
 ## Requirements
 
+This section and the four after it are the Mac's; Windows has its own under
+[Windows](#windows).
+
 - **Apple silicon Mac, macOS 14 or newer.** The emulator is `arm64-v8a` and the
   tuning defaults assume roughly 8 performance cores and 16 GB.
 - **Xcode Command Line Tools** (`xcode-select --install`) for `swiftc`. Full
@@ -459,6 +466,277 @@ something used `adb emu kill` after a module install. Re-run
 
 ---
 
+## Windows
+
+The same pipeline on Windows 11: the same icloudpd pass, the same rooted
+emulator with the same spoof, the same `dedup_key` verification against Google
+Photos' own database, and the same per-file, gated iCloud reclaim -- run by
+`bin/avd-photos-reclaim.py` itself, unchanged. The config keys, ledgers, state
+files, phase strings and status JSON are the same, so "How it works" above and
+"Config and state contract" below hold on both platforms. What changes is the
+machinery around it: PowerShell 7 scripts in `windows\` instead of bash, Task
+Scheduler instead of launchd, a tray icon instead of the menu bar, and an
+`x86_64` system image instead of `arm64-v8a`. Every Windows-specific decision
+and the reason for it is in [`windows/DESIGN.md`](windows/DESIGN.md).
+
+**Where the port stands.** It was written on a Mac and is checked on real
+Windows by CI (`windows-latest`: every PowerShell file, the scheduled tasks as
+Task Scheduler reads them back, the process and quoting rules, the reclaim
+script's import path). No hosted runner can boot an Android emulator, so the
+emulator, the Magisk patch, the Google sign-in and a real upload have not yet
+run on Windows. "First run on Windows" at the end of this section says what to
+watch and what to paste back if a step fails.
+
+### Requirements (Windows)
+
+- **Windows 11 on x64, with hardware virtualisation.** VT-x or AMD-V on in the
+  firmware, and the **Windows Hypervisor Platform** feature, which the emulator
+  uses (WHPX). In an elevated PowerShell:
+  `Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All`,
+  then reboot. The alternative accelerator, AEHD, works only with Hyper-V and
+  virtualisation-based security off. Windows on Arm is untested.
+- **PowerShell 7.4 or newer**: `winget install Microsoft.PowerShell`. Every
+  command below runs in `pwsh`, not in Windows PowerShell 5.1 or cmd.
+- **A JDK 17 or newer** for the Android SDK tools: `winget install Microsoft.OpenJDK.21`.
+- **Git** (`winget install Git.Git`): for the clone, and because the reclaim
+  runs against icloudpd's source at the installed version, which uv fetches
+  with git.
+- **uv and icloudpd**: `winget install astral-sh.uv`, then `uv tool install icloudpd`.
+- **Nothing else.** The setup downloads the Android command-line tools
+  (checked against the SHA-1 and size in Google's own repository manifest),
+  the emulator, platform-tools (adb) and the system image into the pipeline's
+  own SDK root. There is no `sqlite3` to install: Google Photos' database is
+  read with Python's `sqlite3` under the same uv.
+- About **16 GB of RAM** (the guest takes 6 GB) and **30 GB of disk**, plus
+  the staging tree at its peak.
+- **ASCII-only paths** for the SDK root and the AVD directory: the emulator
+  mishandles anything else, and the setup refuses such a path by name rather
+  than failing somewhere obscure (see Troubleshooting).
+
+### Install (Windows)
+
+```powershell
+git clone https://github.com/ayush5harma/icloud-to-google-photos
+cd icloud-to-google-photos
+.\windows\install.ps1
+```
+
+`install.ps1` puts `windows\bin` on your user PATH, writes the default config
+if there is none (readable by you and SYSTEM only, the Windows form of 0600),
+creates two Start Menu shortcuts ("Photo Sync" and "Google Photos (AVD)"),
+registers four scheduled tasks and starts the tray. Options: `-Copy` (a
+self-contained copy under `%LOCALAPPDATA%\avd-photos\app`, so the checkout can
+be deleted), `-NoTasks`, `-NoTray`, `-VisibleConsole` (see Troubleshooting),
+`-Uninstall`. Run it as yourself, not as administrator: the tasks run as the
+user who registers them. If you downloaded the repository as a ZIP rather than
+cloning it, run `Get-ChildItem -Recurse | Unblock-File` in it first.
+
+**Nothing syncs yet.** The sync task is registered but every tick exits
+immediately until you arm it.
+
+Then, in a **new** PowerShell 7 window (so the PATH change applies), in order:
+
+1. `avd-photos-config` - check the config; set `ICLOUD_USERNAME`, and
+   `STAGING` if you want it somewhere other than
+   `%USERPROFILE%\Pictures\icloud-photos-staging`. The file is
+   `%APPDATA%\avd-photos\config`; on Windows it is read, not executed, so a
+   path with spaces needs no quotes (see the contract below).
+2. `icloudpd --username <your apple id> --directory "<staging>" --recent 1` -
+   the one-time interactive Apple login, including two-factor. It also stores
+   the password in Windows Credential Manager, which is what lets a later
+   unattended run re-authenticate when the session expires.
+3. `avd-photos-setup` - builds the whole rooted stack, exactly as on macOS
+   (long, several GB, resumable; the "done" marker is written only after the
+   last phase succeeds).
+4. `avd-signin` - boots the emulator in software GL. Open Google Photos, sign
+   in, and register the device id the setup printed at
+   <https://www.google.com/android/uncertified/> as that same account. Turn
+   Backup ON and confirm the backup screen says `Quality: Original`.
+5. `avd-photos-check` - reports Magisk, Zygisk, the spoof module, Google
+   Photos and the Play Store, and changes nothing.
+6. `avd-photos-offload -DryRun` - which photos the reclaim would match in your
+   library, without deleting anything.
+7. `avd-photos-arm` - prints exactly what arming switches on, then stops.
+   `avd-photos-arm -Yes` **arms it**. `avd-photos-arm -Off` disarms.
+
+### The one-time human steps (Windows)
+
+The macOS four, minus the file-provider grant (Windows has no per-app gate on
+a cloud folder), plus the hypervisor:
+
+- **The Windows Hypervisor Platform feature**, once per machine, as
+  administrator, with a reboot (Requirements above).
+- **The Apple ID session for icloudpd** (step 2). Two-factor, interactive.
+- **The Google sign-in inside the emulator** (step 4), in software GL.
+- **The uncertified-device registration**, once per Google account, with the
+  device id from GMS' `Checkin.xml` (the setup prints it; `avd-photos-check`
+  reports it while the emulator runs). If sign-in still fails afterwards,
+  force a check-in with `adb -s <serial> shell am broadcast -a android.server.checkin.CHECKIN`,
+  where `<serial>` is the `device:` line of `avd-photos-check`, and try again.
+
+### Monitoring (Windows)
+
+**The tray** shows the same ring as the menu bar, in the same colours for the
+same states (a neutral spin while iCloud downloads, yellow on the device, blue
+while Google Photos confirms, purple while iCloud space is reclaimed, a green
+check when everything is confirmed, orange or red with an exclamation when
+the pipeline has stopped tracking reality, dim when not armed). A tray icon
+cannot draw a count beside itself, so the count the Mac shows next to the ring
+is in the icon's tooltip. Its menu carries the same ledger, the live phase,
+"Check iCloud now" and "Offload from iCloud" (offered only once a batch has
+been confirmed). "Quit Photo Sync" stays quit until the next logon, or until
+you open "Photo Sync" from the Start Menu.
+
+**The command line** (PowerShell 7):
+
+```powershell
+avd-photos-status | ConvertFrom-Json | Select-Object -ExpandProperty backup
+Get-Content -Wait "$env:LOCALAPPDATA\avd-photos\logs\sync.log"
+avd-photos-check
+avd-photos-arm -Status
+Get-ScheduledTask -TaskName 'com.ayushsharma.icloud-to-google-photos.*' |
+    Get-ScheduledTaskInfo | Format-Table TaskName, LastRunTime, LastTaskResult, NextRunTime
+```
+
+**Actions:**
+
+```powershell
+avd-photos-offload             # reclaim iCloud space now (still gated on a confirmed batch)
+avd-photos-offload -DryRun     # what WOULD leave iCloud; deletes nothing
+avd-start; avd-stop            # the emulator, with the right flags
+avd-signin                     # the emulator in software GL, for sign-in
+avd-photos-app -Open           # what the "Google Photos (AVD)" shortcut runs
+```
+
+The same redaction note applies before you paste a log anywhere: `sync.log`
+names your Apple ID and `reclaim.log` carries photo filenames and dates.
+
+### Uninstall (Windows)
+
+```powershell
+.\windows\install.ps1 -Uninstall
+```
+
+Removes the four scheduled tasks, stops the tray, takes the commands off your
+PATH (only the entry the installer added), removes a `-Copy` install and the
+two Start Menu shortcuts. It deliberately leaves your config, the ledgers, the
+logs, the staging tree, the emulator and the SDK root in place, and prints
+where each of them is.
+
+### Troubleshooting (Windows)
+
+**The setup stops at "no hardware acceleration".** The Windows Hypervisor
+Platform feature is off, or virtualisation is off in the firmware. Check with
+`& "$env:LOCALAPPDATA\android-avd-sdk\emulator\emulator.exe" -accel-check`.
+
+**The setup refuses a path with non-ASCII characters in it.** Usually the
+user name. Move both the AVD directory and the SDK root to ASCII paths: set
+`ANDROID_AVD_HOME` for your user (`[Environment]::SetEnvironmentVariable('ANDROID_AVD_HOME', 'C:\avd', 'User')`),
+put `AVD_SDK_ROOT=C:\android-avd-sdk` in the config, and open a new window.
+
+**`java` is not found, or `sdkmanager` fails at once.** Install the JDK
+(Requirements) and open a new window.
+
+**The log says `icloudpd has NO SAVED SESSION`**, or icloudpd's own output
+says `None of providers gave password`. Run the interactive login from step 2.
+On Windows the unattended run asks icloudpd for the keyring password only,
+never the console: Windows' `getpass()` reads the keyboard rather than stdin,
+so a console prompt in a scheduled task would wait forever while holding the
+sync lock.
+
+**A console window flashes every 15 minutes, or the tasks never start.** The
+background tasks run under `conhost.exe --headless`, which is undocumented.
+If `LastTaskResult` above is not 0 or the tasks never run, reinstall with
+`.\windows\install.ps1 -VisibleConsole`, which runs them as a hidden `pwsh`
+(a brief flash per run, but nothing undocumented).
+
+**"Sign in" does nothing.** GPU mode, as on macOS: use `avd-signin`, not
+`avd-start`.
+
+**Pushes fail for some files, and the log mentions a long path.** `adb.exe`
+cannot read a path longer than 260 characters. Use a shorter `STAGING`, or
+enable long paths (as administrator:
+`Set-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem LongPathsEnabled 1`).
+
+**The log counts files as "evicted-skipped".** They are cloud placeholders
+(Google Drive streaming, OneDrive files on demand): reading one would make
+Windows download it first, possibly for a long time, so they are skipped until
+their bytes are local, as dataless files are on macOS.
+
+**The emulator will not boot after rooting.** The original ramdisk is kept as
+`ramdisk.img.backup` beside the patched one, under
+`%LOCALAPPDATA%\android-avd-sdk\system-images\android-<API>\google_apis\x86_64\`;
+restore it and re-run. The x86_64 ramdisk is the part of the Magisk patch no
+Windows machine has run yet -- see "First run on Windows".
+
+**`avd-photos-check` says `zygiskd not running`.** The spoof cannot inject
+without it. To rule SELinux in or out, boot once by hand with it permissive
+(`avd-stop`, then
+`& "$env:LOCALAPPDATA\android-avd-sdk\emulator\emulator.exe" -avd gphotos-tablet -no-snapshot -selinux permissive`,
+then `avd-photos-check`). If Zygisk runs permissive and not enforcing, the
+one sepolicy rule the setup appends did not take: stop the emulator and re-run
+`avd-photos-setup`. Do not leave it permissive -- the pipeline is built and
+tested enforcing, on both platforms.
+
+**Everything is slow.** Real-time antivirus scanning of the SDK and the AVD
+directory costs the emulator dearly; excluding those two directories in
+Windows Security is optional and needs administrator rights.
+
+### What differs on Windows, and why
+
+- **x86_64 images.** An x86 host runs x86_64 guests; the Magisk APK carries
+  `lib/x86_64`, and the ramdisk is patched on the device exactly as on macOS
+  (`magiskboot` has no Windows build, and the macOS setup never ran it on the
+  host either). The on-device patch script is a byte-for-byte copy, and a test
+  fails if the two ever differ.
+- **No `-selinux permissive`, no `-writable-system`.** The macOS setup uses
+  neither: SELinux stays enforcing with one sepolicy rule, and modules reach
+  `/system` through Magisk's magic mount. Windows keeps that measured setup.
+- **No app-bundle indirection.** The macOS sync runs as a child of Photo
+  Sync.app because macOS gates a cloud folder per app. Windows has no such
+  gate, so the task runs the script directly.
+- **icloudpd runs with `--password-provider keyring`** (the getpass trap in
+  Troubleshooting), and every Python child with `PYTHONUTF8=1`, so a filename
+  outside the ANSI code page survives the ledgers and the reclaim's lists.
+- **The Photos database is read with Python**, and the query travels in a
+  file: a 1,000-file `IN (...)` list is about 55,000 characters, and a Windows
+  command line stops at 32,767.
+- **The config file is read, not sourced** (rules in the contract below).
+- **Locks record the owner's start time as well as its pid**, because Windows
+  reuses pids quickly enough to keep a stale lock alive.
+- **The bootstrap task is not started at install** (launchd's RunAtLoad
+  starts it at once on macOS): step 3 runs the same setup in front of you, and
+  a background copy would only hold the lock against it.
+- **Quit means quit** for the tray until the next logon; launchd's KeepAlive
+  would relaunch it at once. A crash is still restarted a minute later.
+
+### First run on Windows
+
+What has been proven, and where:
+
+| Proven | Where |
+| --- | --- |
+| Every PowerShell file parses; PSScriptAnalyzer is clean; the Pester suites pass | CI, `windows-latest` (and on macOS) |
+| The four scheduled tasks as Task Scheduler reads them back: triggers, 15-minute repetition, battery, time limit, instances, logon type, priority | CI, `windows-latest` |
+| The user PATH keeps its registry type; the config ACL is owner-only; `.bat` arguments survive `cmd.exe`; a timed-out process tree dies; the emulator launch is detached and logged | CI, `windows-latest` |
+| `uv tool install icloudpd`, the version pin, and `bin/avd-photos-reclaim.py`'s imports under uv's Python 3.13 with `PYTHONUTF8=1` | CI, `windows-latest`, `ubuntu-latest`, `macos-latest` |
+| A whole sync against a fake device and a real SQLite copy of the Photos tables, the reclaim gates, the status JSON, the tray's states and menu | Pester, on macOS and on `windows-latest` |
+
+What a Windows user runs first, and what to paste back if it fails (redact
+your Apple ID and filenames):
+
+| Step | If it fails, paste back |
+| --- | --- |
+| Emulator boot (`avd-photos-setup`) | its console output; `& "$env:LOCALAPPDATA\android-avd-sdk\emulator\emulator.exe" -accel-check`; `Get-Content "$env:LOCALAPPDATA\avd-photos\logs\emulator.log" -Tail 60` |
+| The Magisk patch on the x86_64 ramdisk | `Get-Content "$env:LOCALAPPDATA\avd-photos\logs\setup.log" -Tail 80`; `avd-photos-check` |
+| NeoZygisk, the spoof, the Play Store | `avd-photos-check` |
+| Google sign-in | whether the page renders under `avd-signin`; the device id from `avd-photos-check` |
+| icloudpd's unattended re-authentication | `icloudpd --username <id> --directory "<staging>" --recent 1 --password-provider keyring --only-print-filenames` |
+| The scheduled tasks actually running | `Get-ScheduledTask -TaskName 'com.ayushsharma.icloud-to-google-photos.*' \| Get-ScheduledTaskInfo \| Format-List` |
+| A real upload confirmed and reclaimed | `avd-photos-status`; `Get-Content "$env:LOCALAPPDATA\avd-photos\logs\sync.log" -Tail 80`; `avd-photos-offload -DryRun`, then `reclaim.log` |
+
+---
+
 ## Config and state contract
 
 Everything a configuration manager needs in order to drive this without editing
@@ -475,6 +753,16 @@ value in the config file exactly as an empty value in the config file beats the
 default. `AVD_PHOTOS_CONFIG_DIR`, `AVD_PHOTOS_STATE_DIR` and `AVD_PHOTOS_LOG_DIR`
 are environment-only, since they decide where the config is read from in the
 first place.
+
+**On Windows** the file is `%APPDATA%\avd-photos\config`, with the same keys
+and the same precedence, but it is **read, not sourced**: `KEY=value` per line,
+the value is the rest of the line (so `STAGING=C:\Users\John Smith\Pictures`
+needs no quotes), backslashes are literal, `'...'` is taken as written, and
+`$NAME`, `${NAME}` and `%NAME%` expand anywhere else. A line the parser cannot
+use is reported by `avd-photos-config` and in the logs rather than dropped.
+cmd cannot create an empty environment variable (`set KEY=` deletes it), so
+there the way to say "no floor for this run" is `KEEP_ICLOUD_DAYS=0`. The file
+is readable by its owner and SYSTEM only, the Windows form of 0600.
 
 | Key | Default | What it is |
 | --- | --- | --- |
@@ -502,6 +790,21 @@ first place.
 | `STOP_EMULATOR_WHEN_IDLE` | `1` | Stop the VM once drained and confirmed. |
 | `GITHUB_TOKEN` | (unset) | Raises the release-lookup rate limit. Optional. |
 
+The Windows defaults that differ, each for a platform reason
+(`windows/DESIGN.md` has them):
+
+| Key | Windows default | Why |
+| --- | --- | --- |
+| `STAGING` | `%USERPROFILE%\Pictures\icloud-photos-staging` | The Windows Pictures folder. |
+| `ICLOUD_DIR` | `%USERPROFILE%\iCloudDrive` | Where iCloud for Windows mounts iCloud Drive. |
+| `AVD_SDK_ROOT` | `%LOCALAPPDATA%\android-avd-sdk` | Machine-local, writable, never roamed. |
+| `AVD_ABI` | `x86_64` | An x86 host runs x86_64 guests; arm64 images do not boot on it. |
+| `AVD_CORES` | `4` | The macOS 8 is an M2 Pro's performance cores; a laptop guest with as many vCPUs as the host has cores starves it. |
+
+The emulator's AVD directory is `%USERPROFILE%\.android\avd` unless
+`ANDROID_AVD_HOME` (or `ANDROID_USER_HOME`) says otherwise; the Windows port
+honours those, as the emulator does.
+
 Also read from the environment, never from the config: `AVD_RECREATE=1` (recreate
 the emulator onto a newer API), `AVD_REROOT=1` (re-patch the ramdisk),
 `PLAYSTORE_DONOR_API`, `DEV_TIMEOUT`, `BOOT_WAIT`, `AVD_APP_NAME`, `AVD_APP_DIR`,
@@ -512,7 +815,7 @@ signed bundle's own Info.plist (below).
 
 ### Arming
 
-`~/.config/avd-photos/ENABLED` - an empty file. Present means armed. Absent means
+`~/.config/avd-photos/ENABLED` (Windows: `%APPDATA%\avd-photos\ENABLED`) - an empty file. Present means armed. Absent means
 every sync tick exits immediately. `avd-photos-arm --yes` and `avd-photos-arm
 --off` create and remove it; a configuration manager can do the same by touching
 the file, which is deliberately the whole mechanism.
@@ -528,7 +831,10 @@ device. The Play Store donor VM is found by its own name the same way.
 
 ### State and ledgers
 
-All under `~/.cache/avd-photos` (`AVD_PHOTOS_STATE_DIR`):
+All under `~/.cache/avd-photos` (`AVD_PHOTOS_STATE_DIR`; on Windows
+`%LOCALAPPDATA%\avd-photos`), with the same names and the same line formats on
+both, so a ledger is portable: paths are staging-relative with `/` separators
+on Windows too, which is also what the reclaim script compares against.
 
 | File | What it holds |
 | --- | --- |
@@ -540,7 +846,7 @@ All under `~/.cache/avd-photos` (`AVD_PHOTOS_STATE_DIR`):
 | `device.id` | The emulator's `android_id`; a change resets the ledger. |
 | `device-busy` | A batch is on the device between push and confirmation. |
 | `phase` | The running step, or `failed: <why>` from the last run. Removed on a clean exit. |
-| `sync.lock/pid`, `setup.lock/pid` | Single-flight locks (mkdir is the atomic test-and-set; macOS has no `flock`). |
+| `sync.lock/pid`, `setup.lock/pid` | Single-flight locks (mkdir is the atomic test-and-set; macOS has no `flock`). Windows adds `started` beside `pid`: the owner's start time, since Windows reuses pids quickly. |
 | `setup-complete` | Written only after the LAST setup phase succeeds. The login bootstrap keys on this. |
 | `stamps/` | Release tags of the flashed modules (so a re-run re-flashes only when upstream moves) and `sha-<asset>-<tag>`, the sha256 that tag must keep producing. |
 | `phonesky/` | The extracted Play Store APK. |
@@ -568,9 +874,28 @@ Labels are `com.ayushsharma.icloud-to-google-photos.<suffix>`:
 Templates are in `launchd/`, with `__LABEL__`, `__BIN_DIR__`, `__APP_BIN__` and
 `__LOG_DIR__` substituted by `install.sh`.
 
+### Scheduled tasks (Windows)
+
+`windows\install.ps1` registers four tasks in the root of Task Scheduler's
+library, named with the same labels:
+
+| Suffix | When | What |
+| --- | --- | --- |
+| `.sync` | every 15 minutes + at logon | `avd-photos-sync.ps1` under `conhost --headless`. Below-normal priority. |
+| `.setup` | Saturday 05:30 | `avd-photos-setup.ps1 -Headless` - the update. |
+| `.bootstrap` | at logon | `avd-photos-setup.ps1 -Bootstrap` - builds or resumes; a no-op once complete. |
+| `.tray` | at logon, restarted on failure | `avd-photos-tray.ps1`, Photo Sync. Normal priority. |
+
+All of them run as you, with the Interactive logon type (a task that runs
+"whether logged on or not" runs in session 0, where your Drive and iCloud
+mounts and the Credential Manager entry are not visible), start and keep
+running on battery, have no time limit, and never run twice at once. The
+`.app` agent has no Windows twin: it rebuilt a Dock icon for the light/dark
+appearance, and a Start Menu shortcut needs no rebuilding.
+
 ### The app's CLI
 
-`Photo Sync.app/Contents/MacOS/PhotoSync` handles exactly one argument before any
+macOS only. `Photo Sync.app/Contents/MacOS/PhotoSync` handles exactly one argument before any
 UI exists: **`--sync [args...]`**, which runs `avd-photos-sync` as its child and
 waits, passing the arguments through and forwarding SIGTERM so the script's exit
 trap runs. It spawns and waits, never `exec`s (`exec` would swap the image and
@@ -619,6 +944,13 @@ Sources/ main.swift (the menu-bar app)  icon.swift (its artwork, drawn at build 
 build.sh          builds Photo Sync.app with swiftc; no Xcode project
 install.sh        commands, app, agents; --uninstall
 launchd/          the five agent templates
+windows/          the Windows port (PowerShell 7; see windows/DESIGN.md)
+  install.ps1     commands on PATH, config, scheduled tasks, shortcuts; -Uninstall
+  bin/            the same commands as bin/, as .ps1, plus avd-photos-tray.ps1
+  lib/            the AvdPhotos module (Core, Setup, Sync, Status, Tray, Install)
+                  and sqlite_query.py
+  device/         patch-ramdisk.sh, byte-identical to the macOS setup's heredoc
+  tests/          Pester and Python suites; Invoke-Checks.ps1 runs them all
 ```
 
 The ring in the menu bar started life inside a personal menu-bar app called

@@ -122,10 +122,11 @@ Non-goals:
     caller SET a variable). `KEY=value` per line; the value is the rest of the
     line, quotes optional; backslashes are literal (`C:\Users\me` must not lose
     its separators the way an unquoted shell word would); `$NAME`, `${NAME}`
-    and `%NAME%` expand except inside single quotes. One Windows limit is
-    documented rather than worked around: cmd and PowerShell cannot easily
-    create an empty environment variable, so "no floor for this run" is
-    `KEEP_ICLOUD_DAYS=0`.
+    and `%NAME%` expand except inside single quotes. An empty environment
+    variable still counts as set when it exists (on pwsh 7.6.5 `$env:KEY = ''`
+    keeps one, measured 2026-09-13), but cmd cannot make one (`set KEY=`
+    deletes it), so the documented way to say "no floor for this run" is
+    `KEEP_ICLOUD_DAYS=0`, which means the same thing everywhere.
 
 11. **Tasks run interactively, as the user, through a headless console.** The
     tasks use the Interactive logon type -- the launchd `gui/<uid>` domain's
