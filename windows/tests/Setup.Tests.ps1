@@ -691,3 +691,40 @@ Describe 'the end of a full run: config seed, done marker, epilogue' {
         Test-Path $T.State.SetupDone | Should -BeFalse
     }
 }
+
+Describe 'the command scripts' {
+    BeforeAll {
+        $script:Bin = Join-Path $Root 'windows' 'bin'
+        # A child pwsh that could do no harm even if an argument set were
+        # wrongly accepted: no PATH (no sdkmanager, adb or java to find),
+        # config, state and SDK under $TestDrive, and a proxy that refuses
+        # every connection. Only argument sets refused BEFORE the module loads
+        # are passed. Note pwsh -File binds `--check` to -Check (and `-che`
+        # by prefix), so the macOS spellings are valid calls, not errors.
+        function Invoke-BinScript([string]$Name, [string]$ArgText) {
+            $d = Join-Path $TestDrive ('bin-' + [guid]::NewGuid().ToString('N'))
+            $cmd = "`$env:PATH = ''; `$env:HOME = '$d'; `$env:USERPROFILE = '$d'; " +
+                "`$env:AVD_PHOTOS_CONFIG_DIR = '$d/config'; `$env:AVD_PHOTOS_STATE_DIR = '$d/state'; " +
+                "`$env:AVD_SDK_ROOT = '$d/sdk'; `$env:ANDROID_AVD_HOME = '$d/avd'; " +
+                "`$env:HTTPS_PROXY = 'http://127.0.0.1:9'; `$env:HTTP_PROXY = 'http://127.0.0.1:9'; " +
+                "& '$(Join-Path $Bin $Name)' $ArgText; exit `$LASTEXITCODE"
+            $r = Invoke-AvdProcess -FilePath $Pwsh -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', $cmd) -TimeoutSec 60
+            $r | Add-Member -NotePropertyName StateDir -NotePropertyValue (Join-Path $d 'state') -PassThru
+        }
+    }
+    It 'rejects conflicting modes and unknown arguments with the usage line and exit 2, before doing anything' {
+        foreach ($argText in @('-Start -Stop', '-Check -Bootstrap', '-Check -Start -Headless', '-Bogus', '-Start extra')) {
+            $r = Invoke-BinScript 'avd-photos-setup.ps1' $argText
+            $r.ExitCode | Should -Be 2 -Because $argText
+            $r.StdErr | Should -Match 'usage: avd-photos-setup \[-Check\] \[-Headless\] \[-Start\|-Stop\] \[-Bootstrap\]'
+            Test-Path $r.StateDir | Should -BeFalse -Because "$argText must be refused before the config is even read"
+        }
+    }
+    It 'passes a bad argument through each wrapper to the same refusal' {
+        foreach ($w in 'avd-start.ps1', 'avd-stop.ps1', 'avd-photos-check.ps1', 'avd-signin.ps1') {
+            $r = Invoke-BinScript $w '-Bootstrap'
+            $r.ExitCode | Should -Be 2 -Because $w
+            Test-Path $r.StateDir | Should -BeFalse
+        }
+    }
+}
