@@ -77,6 +77,24 @@ no scheduled job could undo them: recreating the emulator onto a newer API level
 ramdisk for a newer Magisk (can leave it unbootable - `AVD_REROOT=1`). Both are
 reported instead.
 
+**Everything it flashes is an unsigned artefact from someone's GitHub release.**
+Magisk, NeoZygisk and the spoof module are fetched at run time from their
+upstream releases, over TLS, and TLS only says the bytes came from GitHub -- not
+that the release is the one anybody reviewed. They are then given root on the
+emulator. Nothing here is version-pinned, by design (a re-run is the update), so
+hashes committed to this repository would be wrong by the next release and are
+not on offer. What is on offer is that **a release tag cannot change under you**:
+the first time a tag is seen its sha256 is recorded in `stamps/`, and a later
+download of that same tag must match or nothing is flashed. That catches a
+re-uploaded asset and a truncated download. It does not catch a malicious NEW
+release, and neither does anything else here -- if one of those projects is
+compromised, this pipeline installs the compromise at its next weekly run. The
+mitigations that actually apply are the ones you already have: the emulator is
+disposable and holds nothing but photographs on their way out, and it is the only
+thing being rooted. Pin `AVD_REROOT`/`AVD_RECREATE` off (they are), read the
+release notes if that is not enough, and remember that the Play Store here comes
+out of Google's own certified image rather than any third-party mirror.
+
 **It fails quietly unless you make it noisy.** Every interesting bug in this
 pipeline's history reported success while doing nothing:
 
@@ -181,8 +199,9 @@ three are in the SQL now:
 
 When every file on the device is confirmed with zero permanent failures, the run
 writes `last-upload-confirmed`. **A run that cannot confirm DELETES that stamp**,
-and the iCloud reclaim is gated on it, so a pipeline that breaks stops reclaiming
-on the very next run rather than quietly eating a photo library.
+and the reclaim step checks for it before it deletes anything -- including a run
+that inherits a pending list from a healthier one -- so a pipeline that breaks
+stops reclaiming on the very next run rather than quietly eating a photo library.
 
 ### How the iCloud deletion is done
 
@@ -197,7 +216,13 @@ the installed tool's version and sharing its `~/.pyicloud` session. It:
   in local time under `{:%Y/%m}`, the cleaned filename, the `-<size>` dedup
   suffix as a second candidate);
 - holds a Live Photo until both of its staged files are confirmed;
-- skips anything newer than `KEEP_ICLOUD_DAYS`;
+- skips anything newer than `KEEP_ICLOUD_DAYS`, **which defaults to 7** -- a net
+  for the first armed runs, since that is when a mis-set staging path or a
+  half-finished sign-in shows up. Set it to 0 to reclaim a photo as soon as it is
+  confirmed;
+- refuses to map a device file back to a staged path when the basename matches
+  more than one ledger entry (iCloud basenames repeat across months), so an
+  ambiguous file simply stays in iCloud;
 - **reads the server's answer.** icloudpd's own `delete_photo` posts and logs
   "Deleted" without checking the response; one deletion in fourteen came back
   with the asset still in the library. This sends the identical request and
@@ -208,6 +233,15 @@ the installed tool's version and sharing its `~/.pyicloud` session. It:
 
 iCloud keeps a deleted asset in Recently Deleted for 30 days, where it still
 counts against the quota until it expires or the album is emptied by hand.
+
+**Try it before you arm it.** `avd-photos-offload --dry-run` (equivalently
+`avd-photos-sync --reclaim-dry-run`) runs exactly this step against your library
+in dry-run mode: it needs no emulator and no arming, deletes nothing, changes no
+ledger, and writes a per-file decision -- deleted / held / kept / not found -- to
+`~/.cache/avd-photos/logs/reclaim.log`. It is the honest answer to "will it find
+the right photos", and a lot of `NOT FOUND` lines mean the staged-path rebuild
+does not match your library, which is worth understanding before anything is
+deleted for real.
 
 ### Staging
 
@@ -262,9 +296,12 @@ cd icloud-to-google-photos
 ```
 
 `install.sh` symlinks `bin/` into `~/.local/bin`, builds `Photo Sync.app` into
-`/Applications`, writes the default config if there is none, and loads the five
-launchd agents. Options: `--prefix`, `--app-dir`, `--copy`, `--no-agents`,
-`--no-app`, `--uninstall`.
+`/Applications`, writes the default config if there is none (0600, and it
+tightens an existing one), and loads the five launchd agents. Options:
+`--prefix`, `--app-dir`, `--copy` (a self-contained copy under `libexec`, so the
+checkout can be deleted), `--no-agents`, `--no-app` (which also skips the two
+agents that ARE the app), `--uninstall` (which removes only symlinks that resolve
+back into this checkout).
 
 **Nothing syncs yet.** The sync agent is loaded but every tick exits immediately
 until you arm it.
@@ -287,7 +324,13 @@ Then, in order:
    Backup ON and confirm the backup screen says `Quality: Original`.
 5. `avd-photos-check` - reports Magisk, Zygisk, the spoof module, Google Photos
    and the Play Store, and changes nothing.
-6. `avd-photos-arm` - **arms it.** From here the pipeline runs on its own.
+6. `avd-photos-offload --dry-run` - see which photos the reclaim would match in
+   your library, without deleting anything.
+7. `avd-photos-arm` - prints exactly what arming switches on (the Apple ID, the
+   staging directory, whether iCloud deletion is on and what it keeps) and then
+   stops. `avd-photos-arm --yes` **arms it**: from here the pipeline runs on its
+   own, deletions included. (With `DELETE_FROM_ICLOUD=0` the plain command arms
+   it, since nothing can be deleted.) `avd-photos-arm --off` disarms.
 
 ### The one-time human steps
 
@@ -339,10 +382,15 @@ avd-photos-arm --status
 ```sh
 avd-photos-offload                # reclaim iCloud space now (still gated on
                                   # a confirmed batch; a no-op otherwise)
+avd-photos-offload --dry-run      # what WOULD leave iCloud; deletes nothing
 avd-start / avd-stop              # the emulator, with the right flags
 avd-signin                        # the emulator in software GL, for sign-in
 avd-photos-app                    # rebuild the Dock launcher and its icon
 ```
+
+**Before you paste a log into an issue**, note that `sync.log` names your Apple
+ID: every run starts `start (user <apple id>)`, and icloudpd's own lines can
+carry it too. `reclaim.log` carries photo filenames and dates. Redact both.
 
 ---
 
@@ -416,10 +464,12 @@ the scripts.
 
 ### Config file
 
-`~/.config/avd-photos/config`, shell syntax, sourced by every script. Precedence
-is **environment > config file > default**. `AVD_PHOTOS_CONFIG_DIR`,
-`AVD_PHOTOS_STATE_DIR` and `AVD_PHOTOS_LOG_DIR` are environment-only, since they
-decide where the config is read from in the first place.
+`~/.config/avd-photos/config`, shell syntax, sourced by every script, **0600**
+(it holds an Apple ID and may hold a `GITHUB_TOKEN`; the installer tightens an
+existing one). Precedence is **environment > config file > default**.
+`AVD_PHOTOS_CONFIG_DIR`, `AVD_PHOTOS_STATE_DIR` and `AVD_PHOTOS_LOG_DIR` are
+environment-only, since they decide where the config is read from in the first
+place.
 
 | Key | Default | What it is |
 | --- | --- | --- |
@@ -442,7 +492,7 @@ decide where the config is read from in the first place.
 | `UPLOAD_WAIT` | `900` | Floor on the wait for Google Photos, plus 2 s per file on the device. |
 | `ADB_TIMEOUT` / `RECLAIM_TIMEOUT` | `120` / `1800` | Wall-clock bounds. |
 | `DELETE_FROM_ICLOUD` | `1` | 0 makes this a one-way copier. |
-| `KEEP_ICLOUD_DAYS` | (unset) | Never delete anything newer than N days. |
+| `KEEP_ICLOUD_DAYS` | `7` | Never delete anything newer than N days. 0 (or empty) reclaims as soon as a photo is confirmed. |
 | `PRUNE_DEVICE_AFTER_UPLOAD` | `1` | Drop confirmed copies from the emulator. |
 | `STOP_EMULATOR_WHEN_IDLE` | `1` | Stop the VM once drained and confirmed. |
 | `GITHUB_TOKEN` | (unset) | Raises the release-lookup rate limit. Optional. |
@@ -456,8 +506,18 @@ looks for the scripts; the agents set it).
 ### Arming
 
 `~/.config/avd-photos/ENABLED` - an empty file. Present means armed. Absent means
-every sync tick exits immediately. `avd-photos-arm` and `avd-photos-arm --off`
-create and remove it; a configuration manager can do the same.
+every sync tick exits immediately. `avd-photos-arm --yes` and `avd-photos-arm
+--off` create and remove it; a configuration manager can do the same by touching
+the file, which is deliberately the whole mechanism.
+
+### Which emulator is ours
+
+Every device call resolves the serial by asking each attached emulator its AVD
+name (`adb -s <serial> emu avd name`) and matching `AVD_NAME`, then asserts it
+again once the guest has booted. `emulator-5554` is only the first free console
+port, so another emulator on the Mac owns it whenever it started first, and the
+pushes, queries, prunes and `emu kill`s here would have gone to a stranger's
+device. The Play Store donor VM is found by its own name the same way.
 
 ### State and ledgers
 
@@ -475,7 +535,7 @@ All under `~/.cache/avd-photos` (`AVD_PHOTOS_STATE_DIR`):
 | `phase` | The running step, or `failed: <why>` from the last run. Removed on a clean exit. |
 | `sync.lock/pid`, `setup.lock/pid` | Single-flight locks (mkdir is the atomic test-and-set; macOS has no `flock`). |
 | `setup-complete` | Written only after the LAST setup phase succeeds. The login bootstrap keys on this. |
-| `stamps/` | Release tags of the flashed modules, so a re-run re-flashes only when upstream moves. |
+| `stamps/` | Release tags of the flashed modules (so a re-run re-flashes only when upstream moves) and `sha-<asset>-<tag>`, the sha256 that tag must keep producing. |
 | `phonesky/` | The extracted Play Store APK. |
 
 Logs are `~/.cache/avd-photos/logs/{sync,setup,reclaim,emulator,launcher}.log`,
@@ -508,7 +568,11 @@ exists:
 
 - `--sync [args...]` runs `avd-photos-sync` as its child and waits, passing the
   arguments through and forwarding SIGTERM so the script's exit trap runs.
-- `--run <program> [args...]` does the same for anything else.
+- `--run <command> [args...]` does the same for one of this pipeline's own
+  commands, named bare or by its installed path. **Anything else is refused**,
+  because a child of this app inherits the app's privacy grants -- that is the
+  whole point of `--sync` -- and a general "run anything as me" hatch would lend
+  those grants to any program on the Mac.
 
 Both spawn and wait, never `exec`: `exec` would swap the image and the identity
 with it. They are handled before the first line that touches AppKit, because
