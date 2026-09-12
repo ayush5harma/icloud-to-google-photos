@@ -39,13 +39,13 @@ $pending = Join-Path $WorkDir 'pending'
 [System.IO.File]::WriteAllText($pending, '')
 $out = Join-Path $WorkDir 'out'
 $env:PYTHONUTF8 = '1'
+# Through the sync's own runner, so what this proves is the invocation a real
+# run makes, not a copy of it that could drift.
 $reclaimArgs = @(
-    'run', '-q', '--no-project', '--python', '3.13', '--with', (Get-AvdIcloudpdSpec -Version $version),
-    (Get-AvdReclaimScript),
     '--username', 'nobody@example.invalid', '--staging', $WorkDir,
     '--pending', $pending, '--out', $out, '--cookie-dir', (Join-Path $WorkDir 'cookies')
 )
-$r = Invoke-AvdProcess -FilePath $uv -ArgumentList $reclaimArgs -TimeoutSec 1200
+$r = Invoke-AvdReclaimProcess -Spec (Get-AvdIcloudpdSpec -Version $version) -Script (Get-AvdReclaimScript) -ArgumentList $reclaimArgs -TimeoutSec 1200
 Write-Host "reclaim exit $($r.ExitCode); stdout: $($r.StdOut.Trim())"
 if ($r.StdErr) { Write-Host "stderr (tail):"; ($r.StdErr -split "`n" | Select-Object -Last 20) | ForEach-Object { Write-Host "  $_" } }
 if ($r.ExitCode -ne 0) { throw "the reclaim script failed on its empty-list path ($($r.ExitCode))" }
