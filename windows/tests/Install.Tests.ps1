@@ -78,6 +78,30 @@ Describe 'the user PATH edit' {
     }
 }
 
+Describe 'the pwsh the tasks name' {
+    BeforeAll {
+        $script:Store = 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.5.4.0_x64__8wekyb3d8bbwe\pwsh.exe'
+    }
+    It 'keeps an MSI or zip install as it is' {
+        $r = Resolve-AvdTaskPwsh -Path 'C:\Program Files\PowerShell\7\pwsh.exe' -ProgramFiles 'C:\Program Files'
+        $r.Path | Should -Be 'C:\Program Files\PowerShell\7\pwsh.exe'
+        $r.Problem | Should -BeNullOrEmpty
+    }
+    It 'swaps a Store install for the MSI install when there is one' {
+        $pf = Join-Path $TestDrive 'pf'
+        $msi = Join-Path $pf 'PowerShell' '7' 'pwsh.exe'
+        $null = New-Item -ItemType File -Force -Path $msi
+        $r = Resolve-AvdTaskPwsh -Path $Store -ProgramFiles $pf
+        $r.Path | Should -Be $msi
+        $r.Problem | Should -BeNullOrEmpty
+    }
+    It 'refuses a Store install alone, naming the fix' {
+        $r = Resolve-AvdTaskPwsh -Path $Store -ProgramFiles (Join-Path $TestDrive 'empty')
+        $r.Path | Should -BeNullOrEmpty
+        $r.Problem | Should -Match ([regex]::Escape('winget install --id Microsoft.PowerShell --source winget'))
+    }
+}
+
 Describe 'the install layout' {
     It 'points at the checkout, or at a copy under LOCALAPPDATA that keeps its layout' {
         $l = Get-AvdInstallLayout -RepoRoot 'D:\src\repo' -LocalAppData 'C:\Users\me\AppData\Local'

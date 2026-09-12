@@ -495,8 +495,12 @@ watch and what to paste back if a step fails.
   `Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All`,
   then reboot. The alternative accelerator, AEHD, works only with Hyper-V and
   virtualisation-based security off. Windows on Arm is untested.
-- **PowerShell 7.4 or newer**: `winget install Microsoft.PowerShell`. Every
-  command below runs in `pwsh`, not in Windows PowerShell 5.1 or cmd.
+- **PowerShell 7.4 or newer**, the MSI build:
+  `winget install --id Microsoft.PowerShell --source winget`. Every command
+  below runs in `pwsh`, not in Windows PowerShell 5.1 or cmd. Not the
+  Microsoft Store build: it runs from a folder that changes with every Store
+  update, which would leave the scheduled tasks pointing at nothing, so the
+  installer uses the MSI build when both are present and stops otherwise.
 - **A JDK 17 or newer** for the Android SDK tools: `winget install Microsoft.OpenJDK.21`.
 - **Git** (`winget install Git.Git`): for the clone, and because the reclaim
   runs against icloudpd's source at the installed version, which uv fetches

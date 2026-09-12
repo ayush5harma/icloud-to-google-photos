@@ -122,6 +122,27 @@ function Get-AvdSystemToolPath {
     $root.TrimEnd('\') + '\System32\' + $Name
 }
 
+# The pwsh the tasks and shortcuts name. A Microsoft Store (MSIX) install runs
+# from a versioned folder under WindowsApps that the next Store update
+# replaces, so a task naming it stops starting after that update: the whole
+# pipeline off, with nothing on screen. The MSI install (winget's default
+# source) keeps one path across updates, so it is used when it is there;
+# otherwise the install stops and says how to get it. The Store's app
+# execution alias would be the other way out, but whether Task Scheduler
+# starts an alias has not been tested here, so it is not relied on.
+function Resolve-AvdTaskPwsh {
+    param([Parameter(Mandatory)][string]$Path, [string]$ProgramFiles)
+    if ($Path -notmatch '[\\/]WindowsApps[\\/]') { return [pscustomobject]@{ Path = $Path; Problem = $null } }
+    if ($ProgramFiles) {
+        $msi = Join-Path $ProgramFiles 'PowerShell' '7' 'pwsh.exe'
+        if (Test-Path -LiteralPath $msi -PathType Leaf) { return [pscustomobject]@{ Path = $msi; Problem = $null } }
+    }
+    [pscustomobject]@{
+        Path    = $null
+        Problem = "this is the Microsoft Store PowerShell ($Path); its folder changes with every Store update, which would leave the scheduled tasks pointing at nothing. Install the MSI build (winget install --id Microsoft.PowerShell --source winget) and run install.ps1 again"
+    }
+}
+
 # The current user as Task Scheduler names a principal.
 function Get-AvdTaskUser {
     $domain = if ($env:USERDOMAIN) { $env:USERDOMAIN } else { $env:COMPUTERNAME }

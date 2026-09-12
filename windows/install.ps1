@@ -47,7 +47,8 @@ if (-not $IsWindows) {
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Import-Module (Join-Path $PSScriptRoot 'lib' 'AvdPhotos.psm1') -Force
 $cfg = Get-AvdConfig
-$pwsh = (Get-Process -Id $PID).Path
+$taskPwsh = Resolve-AvdTaskPwsh -Path (Get-Process -Id $PID).Path -ProgramFiles $env:ProgramFiles
+$pwsh = $taskPwsh.Path
 $layoutLink = Get-AvdInstallLayout -RepoRoot $repoRoot -LocalAppData $env:LOCALAPPDATA
 $layoutCopy = Get-AvdInstallLayout -RepoRoot $repoRoot -LocalAppData $env:LOCALAPPDATA -Copy
 $layout = if ($Copy) { $layoutCopy } else { $layoutLink }
@@ -97,6 +98,11 @@ Left in place, deliberately -- remove them by hand if you mean to:
 
 # -- Install --------------------------------------------------------------------
 Write-Head 'Requirements'
+if ($taskPwsh.Problem) {
+    Write-Say "STOPPED: $($taskPwsh.Problem)"
+    exit 1
+}
+if ($pwsh -ne (Get-Process -Id $PID).Path) { Write-Say "the tasks and shortcuts will run $pwsh (not the Microsoft Store PowerShell running this)" }
 Add-AvdToolPath -Directory @((Join-Path $cfg.AVD_SDK_ROOT 'platform-tools'))
 $missing = [System.Collections.Generic.List[string]]::new()
 $hints = @{
