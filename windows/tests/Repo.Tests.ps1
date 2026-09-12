@@ -7,8 +7,10 @@ BeforeAll {
     Import-Module (Join-Path $PSScriptRoot '..' 'lib' 'AvdPhotos.psm1') -Force
     $script:Root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
     $script:ConfigSh = [System.IO.File]::ReadAllText((Join-Path $Root 'lib' 'config.sh'))
+    # The files this repository ships under windows\: text only, never the
+    # scratch tree or a Python or pytest cache a local run leaves behind.
     $script:WindowsFiles = @(Get-ChildItem -LiteralPath (Join-Path $Root 'windows') -Recurse -File |
-            Where-Object { $_.FullName -notmatch '[\\/]\.scratch[\\/]' })
+            Where-Object { $_.FullName -notmatch '[\\/](\.scratch|__pycache__|\.pytest_cache)[\\/]' })
 }
 
 Describe 'the config contract matches lib/config.sh' {

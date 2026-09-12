@@ -1,0 +1,85 @@
+# The Windows port, checked on real Windows. What this proves and what it
+# cannot (no hosted runner can boot an Android emulator) is listed in
+# windows/DESIGN.md and the README's Windows section.
+name: windows
+
+on:
+  push:
+    paths:
+      - 'windows/**'
+      - 'bin/avd-photos-reclaim.py'
+      - 'bin/avd-photos-setup'
+      - 'lib/config.sh'
+      - '.gitattributes'
+      - '.github/workflows/windows.yml'
+  pull_request:
+    paths:
+      - 'windows/**'
+      - 'bin/avd-photos-reclaim.py'
+      - 'bin/avd-photos-setup'
+      - 'lib/config.sh'
+      - '.gitattributes'
+      - '.github/workflows/windows.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  windows:
+    name: Windows (Pester, PSScriptAnalyzer, Python, reclaim path)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      # The device scripts must be LF even though Git for Windows checks text
+      # out CRLF by default; Repo.Tests.ps1 asserts it, this shows the setting
+      # it was asserted under.
+      - name: Line-ending settings of this checkout
+        run: |
+          "core.autocrlf = $(git config --get core.autocrlf)"
+          git ls-files --eol -- windows/device .gitattributes
+
+      - name: Install Pester 5 and PSScriptAnalyzer
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Name Pester -RequiredVersion 5.9.1 -Scope CurrentUser -Force -SkipPublisherCheck
+          Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force
+
+      - uses: astral-sh/setup-uv@v10
+
+      - name: Parse, PSScriptAnalyzer and Pester (WindowsOnly suites included)
+        run: ./windows/tests/Invoke-Checks.ps1
+
+      - name: Python tests
+        env:
+          PYTHONUTF8: '1'
+        run: uv run --no-project --python 3.13 --with pytest pytest windows/tests/python -q
+
+      - name: Reclaim invocation path (uv tool icloudpd, pinned library, empty list)
+        run: ./windows/tests/Test-ReclaimImport.ps1
+
+  python:
+    name: Python and reclaim path (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+      - name: Python tests
+        run: uv run --no-project --python 3.13 --with pytest pytest windows/tests/python -q
+      - name: Reclaim invocation path (uv tool icloudpd, pinned library, empty list)
+        run: ./windows/tests/Test-ReclaimImport.ps1

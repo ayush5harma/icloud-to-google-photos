@@ -55,7 +55,9 @@ if (-not $NoAnalyzer) {
 
 if (-not $NoPester) {
     Write-Host '== Pester'
-    Import-Module Pester -MinimumVersion 5.5 -ErrorAction Stop
+    # 5.x only: the suites are written for Pester 5, and a runner image with
+    # Pester 6 installed beside it must not pick that one up silently.
+    Import-Module Pester -MinimumVersion 5.5 -MaximumVersion 5.99 -ErrorAction Stop
     $cfg = New-PesterConfiguration
     $paths = @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.Tests.ps1' | Where-Object { -not $Filter -or $_.Name -match $Filter } | ForEach-Object FullName)
     $cfg.Run.Path = $paths

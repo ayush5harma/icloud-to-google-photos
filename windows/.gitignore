@@ -1,3 +1,6 @@
 # Local test scratch (a throwaway HOME, TMPDIR and module path for running
 # the Windows checks on a Mac); never committed.
 .scratch/
+# What a local pytest run leaves beside the tests.
+.pytest_cache/
+__pycache__/
