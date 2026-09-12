@@ -6,6 +6,7 @@
 
 BeforeAll {
     Import-Module (Join-Path $PSScriptRoot '..' 'lib' 'AvdPhotos.psm1') -Force
+    $script:HostPath = Join-Path $PSScriptRoot '..' 'bin' 'avd-photos-tray.ps1'
     function New-S { param([hashtable]$P = @{}) New-AvdTrayStatus -Property $P }
     # An armed pipeline with a confirmed, drained ledger: the green state, which
     # each case below then disturbs one field at a time.
@@ -580,5 +581,273 @@ Describe 'the colours (muted)' {
     It 'has a text colour for every note colour but secondary' {
         $c = Get-AvdTrayTextColor
         foreach ($k in 'red', 'orange', 'blue', 'green') { $c.Contains($k) | Should -BeTrue }
+    }
+}
+
+Describe 'the host script (static)' {
+    BeforeAll {
+        $tokens = $null; $errors = $null
+        $script:HostAst = [System.Management.Automation.Language.Parser]::ParseFile($HostPath, [ref]$tokens, [ref]$errors)
+        $script:HostErrors = @($errors)
+        $script:HostFunctions = @($HostAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object Name)
+        # The code without its comments, which are free to name what the code
+        # must not use and why.
+        $script:HostText = @($tokens | Where-Object { $_.Kind -ne [System.Management.Automation.Language.TokenKind]::Comment } | ForEach-Object Text) -join ' '
+    }
+    It 'parses' {
+        $HostErrors.Count | Should -Be 0
+    }
+    It 'defines the drawing, menu, icon cache and host entry points' {
+        foreach ($f in 'Start-AvdTrayHost', 'New-AvdTrayRingBitmap', 'ConvertTo-AvdTrayPngByte', 'Get-AvdTrayIcon', 'Clear-AvdTrayIconCache',
+            'New-AvdTrayMenuItem', 'Update-AvdTrayMenu', 'Start-AvdTrayCollection', 'Update-AvdTrayCollection', 'Update-AvdTrayView',
+            'Invoke-AvdTrayAction') {
+            $HostFunctions | Should -Contain $f
+        }
+    }
+    It 'does not shadow a module function when dot-sourced' {
+        $module = @((Get-Module AvdPhotos).ExportedFunctions.Keys)
+        foreach ($f in $HostFunctions) { $module | Should -Not -Contain $f }
+    }
+    It 'never makes an icon with GetHicon (a leaked GDI handle per frame)' {
+        $HostText | Should -Not -Match 'GetHicon'
+    }
+    It 'uses no timer or event raised off the UI thread' {
+        $HostText | Should -Not -Match 'System\.Timers\.Timer|Register-ObjectEvent|add_Exited|SystemEvents|OutputDataReceived'
+    }
+    It 'starts every child through Start-AvdDetachedProcess' {
+        $HostText | Should -Not -Match 'Start-Process|Diagnostics\.Process\]::Start|Invoke-AvdProcess'
+        $HostText | Should -Match 'Start-AvdDetachedProcess'
+    }
+    It 'reads nothing from the environment to decide what it runs' {
+        $vars = @($HostAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.DriveName -eq 'env' }, $true))
+        $vars.Count | Should -Be 0
+        $HostText | Should -Not -Match 'GetEnvironmentVariable'
+    }
+    It 'returns before the message loop when dot-sourced' {
+        $HostText | Should -Match "InvocationName -eq '\.'"
+    }
+}
+
+# The host's own logic -- the collection's failStreak, lastError and watchdog,
+# the one-at-a-time rule, the offload flag, the heartbeat -- is plain
+# PowerShell over the tray state, so it runs here against fake processes and
+# timers. The host loads WinForms only on Windows and stops before its message
+# loop when dot-sourced.
+Describe 'the host logic (dot-sourced, fake processes and timers)' {
+    BeforeAll {
+        . $HostPath
+        function New-FakeProcess {
+            param([bool]$Exited = $true)
+            $p = [pscustomobject]@{ HasExited = $Exited; Killed = $false; KilledTree = $null; WaitedMs = $null; Disposed = $false }
+            $p | Add-Member -MemberType ScriptMethod -Name Kill -Value { param($tree) $this.Killed = $true; $this.KilledTree = $tree; $this.HasExited = $true }
+            $p | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) $this.WaitedMs = $ms; $true }
+            $p | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $this.Disposed = $true }
+            $p
+        }
+        function New-FakeTimer {
+            $x = [pscustomobject]@{ Enabled = $false; Starts = 0 }
+            $x | Add-Member -MemberType ScriptMethod -Name Start -Value { $this.Enabled = $true; $this.Starts = $this.Starts + 1 }
+            $x | Add-Member -MemberType ScriptMethod -Name Stop -Value { $this.Enabled = $false }
+            $x
+        }
+        function Set-TrayState {
+            param([hashtable]$P = @{})
+            $quit = [pscustomobject]@{ Signalled = $false; WaitedMs = $null }
+            $quit | Add-Member -MemberType ScriptMethod -Name WaitOne -Value { param($ms) $this.WaitedMs = $ms; $this.Signalled }
+            $s = @{
+                Pwsh = 'pwsh'; StatusScript = 'C:\t\avd-photos-status.ps1'; SyncScript = 'C:\t\avd-photos-sync.ps1'; AppScript = ''
+                AvdShortcut = (Join-Path $TestDrive 'Google Photos (AVD).lnk'); LogFile = (Join-Path $TestDrive 'tray.log')
+                Stats = $null; LastError = $null; LastGoodTick = $null; FailStreak = 0; Collector = $null
+                Offloading = $false; OffloadProcess = $null; SpinAngle = 90.0; LastBeatTick = [System.Environment]::TickCount64
+                Icons = @{}; Timers = @{ Poll = (New-FakeTimer); Spin = (New-FakeTimer) }; QuitEvent = $quit
+                Notify = [pscustomobject]@{ Icon = $null; Text = '' }
+            }
+            foreach ($k in $P.Keys) { $s[$k] = $P[$k] }
+            $script:AvdTray = $s
+            $s
+        }
+        function New-Collector {
+            param([AllowNull()][string]$Json, [bool]$Exited = $true, [long]$AgeMs = 0)
+            $f = Join-Path $TestDrive ('out-' + [guid]::NewGuid().ToString('N') + '.json')
+            if ($null -ne $Json) { [System.IO.File]::WriteAllText($f, $Json) }
+            @{ Process = (New-FakeProcess -Exited $Exited); OutFile = $f; StartedTick = [System.Environment]::TickCount64 - $AgeMs }
+        }
+    }
+
+    Context 'collecting (refresh)' {
+        BeforeEach { Mock Update-AvdTrayView {} }
+        It 'counts a missing status script as a failed collection, as the Swift does' {
+            Mock Start-AvdDetachedProcess { New-FakeProcess }
+            $t = Set-TrayState @{ StatusScript = '' }
+            Start-AvdTrayCollection
+            $t.LastError | Should -Be 'avd-photos-status not found'
+            $t.FailStreak | Should -Be 1
+            Should -Invoke Start-AvdDetachedProcess -Times 0 -Exactly
+            Should -Invoke Update-AvdTrayView -Times 1 -Exactly
+        }
+        It 'starts one windowless pwsh at a time, writing to a temp file' {
+            Mock Start-AvdDetachedProcess { New-FakeProcess -Exited $false }
+            $t = Set-TrayState
+            Start-AvdTrayCollection
+            Start-AvdTrayCollection
+            Should -Invoke Start-AvdDetachedProcess -Times 1 -Exactly -ParameterFilter {
+                $FilePath -eq 'pwsh' -and $ArgumentList[0] -eq '-NoProfile' -and $ArgumentList -contains '-NonInteractive' -and
+                $ArgumentList[3] -eq 'C:\t\avd-photos-status.ps1' -and $ArgumentList[4] -eq '-OutFile' -and $ArgumentList[5] -like '*.json'
+            }
+            $t.Collector | Should -Not -BeNullOrEmpty
+            $t.Timers.Poll.Enabled | Should -BeTrue
+        }
+        It 'reports a collector that cannot start' {
+            Mock Start-AvdDetachedProcess { throw 'no pwsh' }
+            $t = Set-TrayState
+            Start-AvdTrayCollection
+            $t.LastError | Should -Be 'collector failed to start'
+            $t.FailStreak | Should -Be 1
+            $t.Collector | Should -BeNullOrEmpty
+        }
+        It 'takes a good result: stats, no error, lastGood now, the streak reset' {
+            $c = New-Collector -Json $RealJson
+            $t = Set-TrayState @{ Collector = $c; FailStreak = 2; LastError = 'x' }
+            $t.Timers.Poll.Start()
+            Update-AvdTrayCollection
+            $t.Stats.Staged | Should -Be 2831
+            $t.LastError | Should -BeNullOrEmpty
+            $t.FailStreak | Should -Be 0
+            $t.LastGoodTick | Should -Not -BeNullOrEmpty
+            $t.Collector | Should -BeNullOrEmpty
+            $t.Timers.Poll.Enabled | Should -BeFalse
+            $c.Process.Disposed | Should -BeTrue
+            Test-Path -LiteralPath $c.OutFile | Should -BeFalse
+            Should -Invoke Update-AvdTrayView -Times 1 -Exactly
+        }
+        It 'names an empty result a timeout and a bad one unparseable, keeping the last stats' {
+            $old = New-Healthy
+            $t = Set-TrayState @{ Collector = (New-Collector -Json $null); Stats = $old }
+            Update-AvdTrayCollection
+            $t.LastError | Should -Be 'collector timed out'
+            $t.FailStreak | Should -Be 1
+            [object]::ReferenceEquals($t.Stats, $old) | Should -BeTrue
+            $t.Collector = New-Collector -Json 'garbage'
+            Update-AvdTrayCollection
+            $t.LastError | Should -Be 'collector output unparseable'
+            $t.FailStreak | Should -Be 2
+        }
+        It 'leaves a collection alone for 25 s, then kills its tree' {
+            $c = New-Collector -Json $null -Exited $false -AgeMs 1000
+            $t = Set-TrayState @{ Collector = $c }
+            Update-AvdTrayCollection
+            $c.Process.Killed | Should -BeFalse
+            $t.Collector | Should -Not -BeNullOrEmpty
+            $c.StartedTick = [System.Environment]::TickCount64 - 26000
+            Update-AvdTrayCollection
+            $c.Process.Killed | Should -BeTrue
+            $c.Process.KilledTree | Should -BeTrue
+            $t.Collector | Should -BeNullOrEmpty
+            $t.LastError | Should -Be 'collector timed out'
+        }
+    }
+
+    Context 'rendering' {
+        It 'paints the icon and tooltip from the model and spins only while a spinning state shows' {
+            Mock Get-AvdTrayIcon { "icon:$($State.Tint)" }
+            $t = Set-TrayState @{ Stats = (New-Healthy @{ Running = $true; Remaining = 2500; Phase = 'booting the emulator' }); LastGoodTick = [System.Environment]::TickCount64 }
+            Update-AvdTrayView
+            $t.Notify.Icon | Should -Be 'icon:dim'
+            $t.Notify.Text | Should -Be 'Photo Sync 2.5k - Running -- booting the emulator'
+            $t.Timers.Spin.Enabled | Should -BeTrue
+            $t.Stats = New-Healthy
+            Update-AvdTrayView
+            $t.Notify.Icon | Should -Be 'icon:green'
+            $t.Notify.Text | Should -Be 'Photo Sync - All backed up - verified 1.0h ago'
+            $t.Timers.Spin.Enabled | Should -BeFalse
+        }
+        It 'turns red once good data is older than 150 s' {
+            Mock Get-AvdTrayIcon { "icon:$($State.Tint)|$($State.Mark)" }
+            $t = Set-TrayState @{ Stats = (New-Healthy); LastGoodTick = [System.Environment]::TickCount64 - 151000 }
+            Update-AvdTrayView
+            $t.Notify.Icon | Should -Be 'icon:red|exclaim'
+            $t.Notify.Text | Should -Be 'Photo Sync - Meter not refreshing -- collector silent'
+        }
+        It 'advances the spinner and repaints' {
+            Mock Update-AvdTrayView {}
+            $t = Set-TrayState
+            Invoke-AvdTraySpinner
+            $t.SpinAngle | Should -Be 70
+            Should -Invoke Update-AvdTrayView -Times 1 -Exactly
+        }
+        It 'builds the menu model from the tray state and the shortcut on disk' {
+            $t = Set-TrayState @{ Stats = (New-Healthy) }
+            $m = Get-AvdTrayMenuModel
+            @($m | Where-Object Action -EQ 'openAvd').Count | Should -Be 0
+            @($m | Where-Object Action -EQ 'offload').Count | Should -Be 1
+            [System.IO.File]::WriteAllText($t.AvdShortcut, '')
+            $t.SyncScript = ''
+            $m = Get-AvdTrayMenuModel
+            @($m | Where-Object Action -EQ 'openAvd').Count | Should -Be 1
+            @($m | Where-Object Action -EQ 'offload').Count | Should -Be 0
+        }
+    }
+
+    Context 'actions and the heartbeat' {
+        BeforeEach { Mock Start-AvdTrayCollection {} }
+        It 'starts one offload run at a time, the sync with -Offload' {
+            Mock Start-AvdDetachedProcess { New-FakeProcess -Exited $false }
+            $t = Set-TrayState
+            Invoke-AvdTrayAction -Action offload
+            Invoke-AvdTrayAction -Action offload
+            Should -Invoke Start-AvdDetachedProcess -Times 1 -Exactly -ParameterFilter {
+                $FilePath -eq 'pwsh' -and $ArgumentList[3] -eq 'C:\t\avd-photos-sync.ps1' -and $ArgumentList[4] -eq '-Offload'
+            }
+            $t.Offloading | Should -BeTrue
+            Invoke-AvdTrayHeartbeat
+            $t.Offloading | Should -BeTrue
+            $t.OffloadProcess.HasExited = $true
+            Invoke-AvdTrayHeartbeat
+            $t.Offloading | Should -BeFalse
+            $t.OffloadProcess | Should -BeNullOrEmpty
+            Should -Invoke Start-AvdTrayCollection -Times 1 -Exactly
+        }
+        It 'clears the offload flag and refreshes when the run cannot start' {
+            Mock Start-AvdDetachedProcess { throw 'no pwsh' }
+            $t = Set-TrayState
+            Invoke-AvdTrayOffload
+            $t.Offloading | Should -BeFalse
+            Should -Invoke Start-AvdTrayCollection -Times 1 -Exactly
+        }
+        It 'refreshes on a heartbeat more than 10 s late (a wake from sleep), not on a punctual one' {
+            $t = Set-TrayState
+            Invoke-AvdTrayHeartbeat
+            Should -Invoke Start-AvdTrayCollection -Times 0 -Exactly
+            $t.LastBeatTick = [System.Environment]::TickCount64 - 11000
+            Invoke-AvdTrayHeartbeat
+            Should -Invoke Start-AvdTrayCollection -Times 1 -Exactly
+        }
+        It 'quits when a newer copy signals, and says so in the log' {
+            Mock Stop-AvdTrayHost {}
+            $t = Set-TrayState
+            $t.QuitEvent.Signalled = $true
+            Invoke-AvdTrayHeartbeat
+            # Polled, never waited on: the UI thread must not block.
+            $t.QuitEvent.WaitedMs | Should -Be 0
+            Should -Invoke Stop-AvdTrayHost -Times 1 -Exactly
+            Get-Content -LiteralPath $t.LogFile -Raw | Should -Match 'newer copy asked this one to quit'
+        }
+        It 'routes each menu action id, and refuses one it does not know' {
+            Mock Invoke-AvdTrayCheck {}
+            Mock Invoke-AvdTrayOpenAvd {}
+            $null = Set-TrayState
+            Invoke-AvdTrayAction -Action refresh
+            Invoke-AvdTrayAction -Action check
+            Invoke-AvdTrayAction -Action openAvd
+            Should -Invoke Start-AvdTrayCollection -Times 1 -Exactly
+            Should -Invoke Invoke-AvdTrayCheck -Times 1 -Exactly
+            Should -Invoke Invoke-AvdTrayOpenAvd -Times 1 -Exactly
+            { Invoke-AvdTrayAction -Action nope } | Should -Throw '*nope*'
+        }
+        It 'logs a handler error instead of throwing, and passes the handler its argument' {
+            $t = Set-TrayState
+            { Invoke-AvdTrayGuarded { param($x) throw "boom $x" } -ArgumentList 7 } | Should -Not -Throw
+            Get-Content -LiteralPath $t.LogFile -Raw | Should -Match 'tray: boom 7'
+        }
     }
 }
