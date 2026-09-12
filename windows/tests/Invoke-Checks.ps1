@@ -78,10 +78,23 @@ if (-not $NoPester) {
 # readable through the public API, job logs are not, and the pull request
 # cites these numbers as the evidence of what ran on Windows.
 if ($env:GITHUB_ACTIONS -eq 'true') {
+    # Workflow-command escaping: % first, then the line breaks.
+    $esc = { param([string]$t) $t.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A') }
     $parts = @("parsed $($files.Count) files")
     if (-not $NoAnalyzer) { $parts += "PSScriptAnalyzer findings $($results.Count)" }
     if (-not $NoPester) { $parts += $pesterLine }
-    Write-Host "::notice title=Invoke-Checks::$($parts -join '; ')"
+    Write-Host "::notice title=Invoke-Checks::$(& $esc ($parts -join '; '))"
+    # Each failure with its message, so a failing Windows-only test can be
+    # read without the job log.
+    if (-not $NoPester) {
+        foreach ($t in @($r.Failed) + @($r.FailedBlocks) + @($r.FailedContainers)) {
+            if ($null -eq $t) { continue }
+            $name = if ($t.PSObject.Properties['ExpandedPath']) { $t.ExpandedPath } elseif ($t.PSObject.Properties['Name']) { $t.Name } else { [string]$t }
+            $msg = @($t.ErrorRecord | ForEach-Object { $_.Exception.Message }) -join ' | '
+            if ($msg.Length -gt 900) { $msg = $msg.Substring(0, 900) + '...' }
+            Write-Host "::error title=Pester failure::$(& $esc "$name -- $msg")"
+        }
+    }
 }
 
 if ($failed -gt 0) {
