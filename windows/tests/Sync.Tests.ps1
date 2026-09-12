@@ -690,3 +690,52 @@ Describe 'the iCloud reclaim' {
         Get-Line $q 'reclaimed.list' | Should -Be @('2026/05/A.HEIC')
     }
 }
+
+Describe 'the commands' {
+    BeforeAll {
+        $script:Pwsh = (Get-Process -Id $PID).Path
+        # Run a command in a child pwsh whose environment points everything at a
+        # scratch tree, set INSIDE the child so this process's environment is
+        # never touched. The AVD and icloudpd names exist nowhere, so no path
+        # through the command can reach a real emulator, adb or Apple account.
+        function Invoke-ScratchCommand {
+            param([string]$Command, [string[]]$Switch = @())
+            $root = Join-Path $TestDrive ([guid]::NewGuid().ToString('N').Substring(0, 10))
+            $vars = [ordered]@{
+                HOME = (Join-Path $root 'home'); USERPROFILE = (Join-Path $root 'home')
+                APPDATA = (Join-Path $root 'appdata'); LOCALAPPDATA = (Join-Path $root 'localappdata')
+                AVD_PHOTOS_CONFIG_DIR = (Join-Path $root 'config'); AVD_PHOTOS_STATE_DIR = (Join-Path $root 'state')
+                AVD_PHOTOS_LOG_DIR = (Join-Path $root 'logs'); STAGING = (Join-Path $root 'staging')
+                AVD_SDK_ROOT = (Join-Path $root 'sdk'); ANDROID_AVD_HOME = (Join-Path $root 'avd')
+                AVD_NAME = 'avd-test-no-such-avd'; ICLOUDPD = 'avd-test-no-such-icloudpd'
+            }
+            $sets = ($vars.GetEnumerator() | ForEach-Object { "`$env:$($_.Key) = '$($_.Value)'" }) -join '; '
+            $script = Join-Path $RepoRoot 'windows' 'bin' $Command
+            $line = "$sets; & '$script' $($Switch -join ' '); exit `$LASTEXITCODE"
+            $r = Invoke-AvdProcess -FilePath $Pwsh -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', $line) -TimeoutSec 120
+            $log = Join-Path $root 'logs' 'sync.log'
+            [pscustomobject]@{
+                ExitCode = $r.ExitCode; StdOut = $r.StdOut; StdErr = $r.StdErr
+                Log      = if (Test-Path -LiteralPath $log) { [System.IO.File]::ReadAllText($log) } else { '' }
+                Phase    = Join-Path $root 'state' 'phase'
+            }
+        }
+    }
+    It 'avd-photos-sync.ps1 runs the sync and exits with its code' {
+        $r = Invoke-ScratchCommand 'avd-photos-sync.ps1'
+        $r.ExitCode | Should -Be 0 -Because $r.StdErr
+        $r.Log | Should -Match 'not armed \(no .*ENABLED\) - skipping'
+    }
+    It 'avd-photos-offload.ps1 forces the reclaim on' {
+        $r = Invoke-ScratchCommand 'avd-photos-offload.ps1'
+        $r.ExitCode | Should -Be 0 -Because $r.StdErr
+        $r.Log | Should -Match (ConvertTo-LogPattern 'manual offload requested (--offload)')
+    }
+    It 'avd-photos-offload.ps1 -DryRun runs the reclaim dry run, which needs no arming and fails loudly without icloudpd' {
+        $r = Invoke-ScratchCommand 'avd-photos-offload.ps1' -Switch @('-DryRun')
+        $r.ExitCode | Should -Be 1
+        $r.Log | Should -Match (ConvertTo-LogPattern 'FAILED: icloudpd (avd-test-no-such-icloudpd) missing from PATH')
+        $r.Log | Should -Not -Match 'not armed'
+        [System.IO.File]::ReadAllText($r.Phase) | Should -BeExactly "failed: icloudpd (avd-test-no-such-icloudpd) missing from PATH`n"
+    }
+}
