@@ -1260,6 +1260,12 @@ function Invoke-AvdSyncRun {
         Write-AvdSyncLog $c "not armed (no $($cfg.SENTINEL)) - skipping"
         return
     }
+    # The config file is read, not sourced (DESIGN decision 10), and a line it
+    # could not use is reported rather than dropped: in the log of every armed
+    # run, beside whatever failure a lost value causes.
+    if ($cfg.PSObject.Properties['WARNINGS']) {
+        foreach ($w in @($cfg.WARNINGS)) { Write-AvdSyncLog $c "WARNING: config: $w" }
+    }
     if (-not (Test-Path -LiteralPath (Join-Path $cfg.AVD_HOME "$($c.AvdName).avd") -PathType Container)) {
         Stop-AvdSyncRun $c "no $($c.AvdName) emulator - run avd-photos-setup"
     }
