@@ -877,7 +877,7 @@ function Assert-AvdSetupAcceleration {
     Write-AvdSetupWarning '    sdkmanager "extras;google;Android_Emulator_Hypervisor_Driver", then run its'
     Write-AvdSetupWarning '    silent_install.bat as administrator'
     if ($s.Check) { $s.AccelChecked = $true; return }
-    Stop-AvdSetup "the emulator cannot use hardware acceleration ($what)"
+    Stop-AvdSetup "no hardware acceleration for the emulator ($what)"
 }
 
 function Assert-AvdSetupAdb {
@@ -1722,6 +1722,14 @@ function Write-AvdSetupSummary {
     }
     if (Test-AvdSetupPackage -Package $script:SetupGphotosPkg) { Write-AvdSetupStep 'Google Photos: installed' }
     else { Write-AvdSetupWarning 'Google Photos: NOT installed' }
+    # The README sends people to avd-photos-check for the device id to
+    # register; the macOS --check never printed it (only the full run's
+    # epilogue does). Reading it changes nothing, so -Check reports it here.
+    if ($s.Check -and $s.Serial) {
+        $id = Get-AvdSetupGsfDeviceId
+        if ($id) { Write-AvdSetupStep "device id: $id  (register once at https://www.google.com/android/uncertified/)" }
+        else { Write-AvdSetupWarning 'device id: not readable yet (GMS has not checked in)' }
+    }
 }
 
 function Complete-AvdSetupRun {
