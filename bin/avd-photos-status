@@ -24,7 +24,7 @@ ap_seed_path "$AVD_SDK_ROOT/platform-tools"
 armed=false
 [ -f "$SENTINEL" ] && armed=true
 emu=false
-pgrep -f "qemu-system.*$AVD_NAME" >/dev/null 2>&1 && emu=true
+ap_emu_running "$AVD_NAME" && emu=true
 
 # Dotfiles excluded: a .DS_Store in the staging tree must not inflate the library
 # count the sync ledger is compared against.
@@ -72,7 +72,7 @@ fi
 # line parsed below.
 if [ -r "$STATE_DIR/upload-status" ]; then
   read -r u t f ts _ < "$STATE_DIR/upload-status" 2>/dev/null || true
-  led_m="$(stat -f %m "$STATE_DIR/pushed.list" 2>/dev/null || echo 0)"
+  led_m="$(ap_mtime "$STATE_DIR/pushed.list")"
   if [ "${ts:-0}" -ge "${led_m:-0}" ]; then
     uploaded="${u:-0}"; failed="${f:-0}"; queued="$(( ${t:-0} - ${u:-0} ))"
     [ "$queued" -lt 0 ] && queued=0
@@ -105,8 +105,8 @@ SYNC_LOG="$LOG_DIR/sync.log"
 if [ -f "$SYNC_LOG" ]; then
   done_ts="$(grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} done \(' "$SYNC_LOG" 2>/dev/null | tail -1 | cut -c1-19)"
   lm=""
-  [ -n "$done_ts" ] && lm="$(date -j -f '%Y-%m-%d %H:%M:%S' "$done_ts" +%s 2>/dev/null || echo)"
-  [ -n "$lm" ] || lm="$(stat -f %m "$SYNC_LOG" 2>/dev/null || echo)"
+  [ -n "$done_ts" ] && lm="$(ap_epoch_of "$done_ts")"
+  [ -n "$lm" ] || lm="$(ap_mtime "$SYNC_LOG")"
   [ -n "$lm" ] && last_run_age=$(( $(date +%s) - lm ))
   [ "$last_run_age" -lt 0 ] && last_run_age=0
 fi
@@ -126,11 +126,7 @@ reclaimed="${reclaimed:-0}"; reclaim_pending="${reclaim_pending:-0}"
 # "failed: <why>" it leaves behind. Read, never computed: a run is alive only
 # while its pid is, so a crashed job cannot look busy.
 running=false; phase=""
-lp="$STATE_DIR/sync.lock/pid"
-if [ -r "$lp" ]; then
-  lpid="$(tr -dc '0-9' < "$lp")"
-  [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null && running=true
-fi
+[ -r "$STATE_DIR/sync.lock/pid" ] && ap_lock_alive "$STATE_DIR/sync.lock" && running=true
 [ -r "$STATE_DIR/phase" ] && phase="$(head -1 "$STATE_DIR/phase" | tr -d '"\\' | cut -c1-160)"
 # A verify pass in flight publishes "verifying uploads: N of M confirmed" as its
 # phase; while the run is alive that is the live count for the batch on the

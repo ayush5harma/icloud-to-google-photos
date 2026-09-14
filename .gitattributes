@@ -1,0 +1,15 @@
+# LINE ENDINGS ARE LOAD-BEARING ON WINDOWS. Git for Windows installs with
+# core.autocrlf=true, which checks every text file out with CRLF -- and bash
+# then reads `set -uo pipefail\r` and dies on its first line ("$'\r': command
+# not found"). Everything bash, launchd or an emulator reads is LF on every
+# platform; only the Windows-native files are CRLF.
+* text=auto eol=lf
+
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.sln text eol=crlf
+*.csproj text eol=crlf
+
+*.png binary
+*.ico binary

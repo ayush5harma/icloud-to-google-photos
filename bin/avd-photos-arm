@@ -68,7 +68,15 @@ mkdir -p "$CONFIG_DIR"
 touch "$SENTINEL"
 # Kick the agent so the first run is now rather than up to 15 minutes away. The
 # run is then launchd's child, which is what gives it the app bundle's identity;
-# a failure here is not an error (the agent may not be installed).
-launchctl kickstart -k "gui/$(id -u)/$AP_LABEL_PREFIX.sync" >/dev/null 2>&1 \
-  && echo "armed, and the sync agent was kicked — watch $LOG_DIR/sync.log" \
-  || echo "armed — the sync agent is not loaded, so nothing is scheduled (run install.sh)"
+# a failure here is not an error (the agent may not be installed). On Windows the
+# agent is the Task Scheduler task install.ps1 registered, and running it is the
+# same kick: the run is the scheduler's, not this terminal's.
+if [ "$AP_OS" = windows ]; then
+  schtasks.exe //Run //TN "\\$AP_TASK_FOLDER\\sync" >/dev/null 2>&1 \
+    && echo "armed, and the sync task was started — watch $LOG_DIR/sync.log" \
+    || echo "armed — the sync task is not registered, so nothing is scheduled (run install.ps1)"
+else
+  launchctl kickstart -k "gui/$(id -u)/$AP_LABEL_PREFIX.sync" >/dev/null 2>&1 \
+    && echo "armed, and the sync agent was kicked — watch $LOG_DIR/sync.log" \
+    || echo "armed — the sync agent is not loaded, so nothing is scheduled (run install.sh)"
+fi

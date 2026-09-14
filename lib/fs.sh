@@ -16,10 +16,10 @@
 #   - otherwise, allocated blocks (%b) decide: >0 is present, 0 is a stub the
 #     flag check alone can miss.
 #
-# NOTE the absolute /usr/bin/stat: with GNU coreutils ahead of /usr/bin on PATH,
-# GNU stat's `-f` means `--file-system`, so %z/%b/%Sf there print a filesystem
-# report instead of size/blocks/flags and every numeric test below would silently
-# no-op. BSD stat is the one with %z/%b/%Sf.
+# The three fields come from ap_stat_fsb (lib/os.sh), which knows which stat
+# this OS has -- on macOS the absolute BSD /usr/bin/stat, never a GNU one ahead
+# of it on PATH. Windows has no `dataless` flag, and a cloud placeholder there
+# (OneDrive, Google Drive streaming) is caught by the same zero-blocks rule.
 
 # has_local_bytes_fields <flags> <size> <blocks>: the pure decision, no I/O --
 # split out so a caller that already has these three fields from a BATCHED stat
@@ -34,10 +34,8 @@ has_local_bytes_fields() {
 
 # has_local_bytes <path>: metadata only, never a read.
 has_local_bytes() {
-  local f=$1
+  local f=$1 flags size blocks
   [ -f "$f" ] || return 1
-  has_local_bytes_fields \
-    "$(/usr/bin/stat -f %Sf "$f" 2>/dev/null || echo "")" \
-    "$(/usr/bin/stat -f %z "$f" 2>/dev/null || echo 0)" \
-    "$(/usr/bin/stat -f %b "$f" 2>/dev/null || echo 0)"
+  read -r flags size blocks <<<"$(ap_stat_fsb "$f")"
+  has_local_bytes_fields "${flags:-}" "${size:-0}" "${blocks:-0}"
 }

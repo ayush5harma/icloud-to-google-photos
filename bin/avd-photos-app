@@ -15,6 +15,17 @@
 #   avd-photos-app             build/refresh and pin it to the Dock
 #   avd-photos-app --no-dock   build/refresh only
 #   avd-photos-app --open      build/refresh, pin, and launch it
+#
+# WINDOWS has no bundles and no Dock, so there it is a Start-menu shortcut with
+# the same generated icon, pointing at the tray app's `PhotoSync.exe
+# --open-photos` (a windowless exe, so a click never flashes a console), which in
+# turn runs `avd-photos-app --launch` -- the same boot-open-focus steps the
+# macOS launcher runs.
+#
+#   avd-photos-app             (Windows) write/refresh the Start-menu shortcut
+#   avd-photos-app --no-dock   (Windows) the icon only, no shortcut
+#   avd-photos-app --open      (Windows) refresh, then launch
+#   avd-photos-app --launch    (Windows) boot if needed, open Photos, focus it
 
 set -uo pipefail
 
@@ -22,7 +33,165 @@ SELF_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BA
 LIB_DIR="$SELF_DIR/../lib"
 # shellcheck disable=SC1091
 . "$LIB_DIR/config.sh"
+# shellcheck disable=SC1091
+. "$LIB_DIR/proc.sh"
 ap_load_config
+
+if [ "$AP_OS" = windows ]; then
+  ap_seed_path "$AVD_SDK_ROOT/platform-tools"
+  say() { printf '  %s\n' "$*"; }
+  PKG="com.google.android.apps.photos"
+  LNK_NAME="${AVD_APP_NAME:-Google Photos (AVD)}"
+  START_MENU="$(ap_mixed "${APPDATA:-$HOME/AppData/Roaming}")/Microsoft/Windows/Start Menu/Programs"
+  # Where install.ps1 put the tray app; PHOTO_SYNC_APP_DIR moves it, as on a Mac.
+  TRAY_EXE="$(ap_mixed "${PHOTO_SYNC_APP_DIR:-${LOCALAPPDATA:-$HOME/AppData/Local}/Programs/Photo Sync}")/PhotoSync.exe"
+  ICO="$STATE_DIR/appicon.ico"
+
+  # ── --launch: what a click on the shortcut does ──────────────────────────
+  if [ "${1:-}" = "--launch" ]; then
+    LOG="$LOG_DIR/launcher.log"
+    mkdir -p "$LOG_DIR"
+    lg() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+    # THE FIRST CLICK IS FOR SIGNING IN, and the fast GPU mode cannot render
+    # Google's sign-in page (see avd-signin): it stalls on "Checking info..."
+    # with no error, which is exactly what a first-time user met by clicking this
+    # shortcut. So until Photos has been SEEN signed in on this machine (the
+    # stamp below, written further down), the emulator starts in sign-in mode.
+    SIGNED_IN="$STATE_DIR/photos-signed-in"
+    if ! ap_emu_running "$AVD_NAME"; then
+      if [ -f "$SIGNED_IN" ]; then
+        lg "emulator not running — starting it"
+        "$SELF_DIR/avd-photos-setup" --start >>"$LOG" 2>&1 || { lg "the emulator failed to start"; exit 1; }
+      else
+        lg "Google Photos not seen signed in yet — starting the emulator in sign-in mode (avd-signin)"
+        "$SELF_DIR/avd-signin" >>"$LOG" 2>&1 || { lg "the emulator failed to start"; exit 1; }
+      fi
+    fi
+    # Which attached emulator IS ours (ap_emulator_serial): emulator-5554 is
+    # only the first free console port, and a stranger's emulator would get
+    # Photos launched inside it.
+    SER=""
+    for _ in $(seq 1 60); do
+      SER="$(ap_emulator_serial "$AVD_NAME")" && [ -n "$SER" ] \
+        && [ "$(dev_capture "$SER" 10 '' '' getprop sys.boot_completed | tr -d '\r')" = "1" ] && break
+      SER=""; sleep 2
+    done
+    [ -n "$SER" ] || { lg "no attached emulator answers to the name $AVD_NAME"; exit 1; }
+    # LET THE POST-BOOT STORM PASS FIRST. For the first minutes after a boot
+    # Android is dex-optimising and updating Play services, and on a laptop's
+    # spinning disk that is a load average near 30 (measured): anything opened
+    # then answers "isn't responding" to every tap. Photos waits, bounded, for
+    # the 1-minute load to fall under 6.
+    lend=$((SECONDS + 300))
+    while [ "$SECONDS" -lt "$lend" ]; do
+      l="$(dev_capture "$SER" 10 '' '' 'cat /proc/loadavg' | awk '{print int($1)}')"
+      [ -n "$l" ] && [ "$l" -lt 6 ] && break
+      sleep 10
+    done
+    run_bounded 60 adb -s "$SER" shell "monkey -p $PKG -c android.intent.category.LAUNCHER 1" \
+      && lg "launched $PKG on $SER" || lg "could not launch $PKG"
+    # Signed in = Photos' own signed-in database exists (the one the sync
+    # verifies against). Readable when adbd is root, which avd-photos-setup's
+    # boot makes it; an emulator the sync booted keeps adbd unprivileged, and
+    # then this learns nothing and changes nothing.
+    in="$(dev_capture "$SER" 10 '' '' "ls /data/data/$PKG/databases/gphotos0.db 2>&1")"
+    case "$in" in
+      *"No such file"*)
+        rm -f "$SIGNED_IN"
+        # OUR VM's command line (emulator.exe quotes its arguments, QEMU not).
+        gpu=""
+        for p in $(ap_emu_pids "$AVD_NAME"); do
+          gpu="$gpu $(AP_PID="$p" ap_ps '(Get-CimInstance Win32_Process -Filter ("ProcessId=" + $env:AP_PID)).CommandLine')"
+        done
+        if printf '%s' "$gpu" | grep -qE -- '-gpu"? "?host'; then
+          lg "Google Photos is NOT signed in, and this emulator runs the fast GPU mode, which cannot render the sign-in page: stop it (avd-stop) and click again, or run avd-signin"
+        else
+          lg "Google Photos is not signed in yet — sign in inside the emulator"
+        fi ;;
+      *gphotos0.db*) [ -f "$SIGNED_IN" ] || { date +%s > "$SIGNED_IN"; lg "Google Photos is signed in — later launches use the fast GPU mode"; } ;;
+    esac
+    # Bring the emulator's window forward: it belongs to the qemu process.
+    for p in $(ap_emu_pids "$AVD_NAME"); do
+      AP_PID="$p" ap_ps '[void](New-Object -ComObject WScript.Shell).AppActivate([int]$env:AP_PID)' >/dev/null
+    done
+    exit 0
+  fi
+
+  # ── the icon: the same pinwheel, as a multi-size .ico ─────────────────────
+  # Drawn from the Python stdlib alone, like the macOS one, but with no plate:
+  # Windows icons are free-form, and a squircle reads as a Mac app. Rendered once
+  # at 512 (2x the largest entry) and box-filtered down to each size, then
+  # stored as PNG entries -- an .ico may carry PNGs since Vista, so no image
+  # library is needed at all.
+  build_ico() {
+    python3 - "$ICO" <<'PYICO' || return 1
+import math, struct, sys, zlib
+out = sys.argv[1]
+S = 512; cx = cy = S / 2.0
+r = S * 0.235                                   # blade radius: extent 2r = 0.94 S
+cols = [(251,188,4), (234,67,53), (66,133,244), (52,168,83)]
+rot = [(round(math.cos(math.radians(-90 * k))), round(math.sin(math.radians(-90 * k)))) for k in range(4)]
+def blade(x, y, k):
+    c, s = rot[k]; dx, dy = x - cx, y - cy
+    u = cx + dx*c - dy*s
+    v = cy + dx*s + dy*c
+    return (u-cx)**2 + (v-(cy-r))**2 <= r*r and u <= cx + 0.5
+big = []
+for y in range(S):
+    row = []
+    for x in range(S):
+        c = None
+        for k in range(4):
+            if blade(x + 0.5, y + 0.5, k): c = cols[k]; break
+        row.append(c)
+    big.append(row)
+def png(n):
+    raw = bytearray()
+    for j in range(n):
+        raw.append(0)
+        y0, y1 = j * S // n, (j + 1) * S // n
+        for i in range(n):
+            x0, x1 = i * S // n, (i + 1) * S // n
+            rs = gs = bs = a = 0; cnt = (y1 - y0) * (x1 - x0)
+            for yy in range(y0, y1):
+                for c in big[yy][x0:x1]:
+                    if c: rs += c[0]; gs += c[1]; bs += c[2]; a += 1
+            raw += bytes((rs // a, gs // a, bs // a, 255 * a // cnt) if a else (0, 0, 0, 0))
+    def ch(t, d): return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    return (b"\x89PNG\r\n\x1a\n" + ch(b"IHDR", struct.pack(">IIBBBBB", n, n, 8, 6, 0, 0, 0))
+            + ch(b"IDAT", zlib.compress(bytes(raw), 9)) + ch(b"IEND", b""))
+sizes = [16, 24, 32, 48, 64, 128, 256]
+imgs = [png(n) for n in sizes]
+hdr = struct.pack("<HHH", 0, 1, len(sizes)); off = 6 + 16 * len(sizes); ents = b""
+for n, d in zip(sizes, imgs):
+    ents += struct.pack("<BBBBHHII", n % 256, n % 256, 0, 0, 1, 32, len(d), off); off += len(d)
+open(out, "wb").write(hdr + ents + b"".join(imgs))
+PYICO
+    [ -s "$ICO" ]
+  }
+  mkdir -p "$STATE_DIR"
+  if [ ! -s "$ICO" ] || [ "$SELF_DIR/avd-photos-app" -nt "$ICO" ]; then
+    build_ico && say "icon generated" || say "icon generation failed — the shortcut still works"
+  fi
+
+  case "${1:-}" in
+    --no-dock) say "skipping the Start-menu shortcut (--no-dock)"; exit 0 ;;
+  esac
+  [ -f "$TRAY_EXE" ] || { say "the tray app is not installed at $TRAY_EXE — run install.ps1"; exit 1; }
+  mkdir -p "$START_MENU"
+  AP_LNK="$(cygpath -w "$START_MENU/$LNK_NAME.lnk")" AP_EXE="$(cygpath -w "$TRAY_EXE")" \
+  AP_ICO="$(cygpath -w "$ICO")" ap_ps '
+$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:AP_LNK)
+$s.TargetPath = $env:AP_EXE
+$s.Arguments = "--open-photos"
+$s.WorkingDirectory = Split-Path $env:AP_EXE
+if (Test-Path $env:AP_ICO) { $s.IconLocation = $env:AP_ICO + ",0" }
+$s.Description = "Boot the rooted emulator if needed and open Google Photos in it"
+$s.Save()' >/dev/null
+  [ -f "$START_MENU/$LNK_NAME.lnk" ] && say "Start menu: $LNK_NAME" || { say "could not write the shortcut"; exit 1; }
+  [ "${1:-}" = "--open" ] && "$TRAY_EXE" --open-photos &
+  exit 0
+fi
 
 APP_NAME="${AVD_APP_NAME:-Google Photos (AVD)}"
 APP_DIR="${AVD_APP_DIR:-/Applications}/${APP_NAME}.app"

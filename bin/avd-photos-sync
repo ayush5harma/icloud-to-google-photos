@@ -22,6 +22,8 @@ LIB_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BAS
 . "$LIB_DIR/log.sh"
 # shellcheck disable=SC1091
 . "$LIB_DIR/proc.sh"
+# shellcheck disable=SC1091
+. "$LIB_DIR/fs.sh"
 
 ap_load_config
 
@@ -42,6 +44,8 @@ DEVICE_ID_FILE="$STATE_DIR/device.id"
 DEVICE_BUSY="$STATE_DIR/device-busy"
 GPHOTOS_PKG="com.google.android.apps.photos"
 AVD_EMU="$AVD_SDK_ROOT/emulator/emulator"
+[ "$AP_OS" = windows ] && AVD_EMU="$AVD_EMU.exe"
+emu_running() { ap_emu_running "$AVD_NAME"; }
 # Resolved by NAME in step 3 (ap_emulator_serial), never assumed: emulator-5554
 # is just the first free console port, and any emulator started before this one
 # owns it instead. Empty until then, and nothing before step 3 talks to a device.
@@ -233,7 +237,8 @@ reclaim_icloud() {
   # looked at again -- so it is worth two independent reasons to refuse.
   local said_dry; said_dry="$(jq -r '.dry_run // false' "$stats" 2>/dev/null)"
   if [ "$dry" -eq 1 ] || [ "$said_dry" = "true" ]; then
-    log "iCloud reclaim (DRY RUN) rc=$rc: $(tr -d '\n' < "$stats")"
+    log "iCloud reclaim (DRY RUN) rc=$rc: $(tr -d '\r\n' < "$stats")"
+    [ "$rc" -eq 2 ] && log "WARNING: the dry run could not authenticate — icloudpd needs its one-time interactive login; nothing was checked"
     log "  nothing was deleted and no ledger changed — see $rlog for the per-file decisions"
     [ "$dry" -eq 0 ] && log "WARNING: that run reported dry_run without being asked to — nothing was recorded"
     rm -f "$pend" "$out" "$stats"
@@ -244,7 +249,7 @@ reclaim_icloud() {
       cat "$out" >> "$RECLAIMED"; sort -u "$RECLAIMED" -o "$RECLAIMED"
       # Resolved paths leave the pending list; held and kept ones stay for next time.
       sort -u "$RECLAIM_PENDING" | comm -23 - <(sort -u "$RECLAIMED") > "$pend"; mv -f "$pend" "$RECLAIM_PENDING"
-      log "iCloud reclaim: $(tr -d '\n' < "$stats"); $(count_lines "$RECLAIM_PENDING") still pending"
+      log "iCloud reclaim: $(tr -d '\r\n' < "$stats"); $(count_lines "$RECLAIM_PENDING") still pending"
       if [ "$(jq -r '.deleted // 0' "$stats" 2>/dev/null)" = "0" ] && [ "$(jq -r '.not_found // 0' "$stats" 2>/dev/null)" != "0" ]; then
         log "WARNING: none of the pending file(s) was found in iCloud — already gone, or the staged-path rebuild no longer matches (see $rlog)"
       fi
@@ -288,7 +293,7 @@ fi
 
 # ── Dormancy + prerequisites ─────────────────────────────────────────────────
 [ -f "$SENTINEL" ] || { log "not armed (no $SENTINEL) — skipping"; exit 0; }
-[ -d "$HOME/.android/avd/${AVD_NAME}.avd" ] || fail "no $AVD_NAME emulator — run avd-photos-setup"
+[ -d "$AVD_HOME/${AVD_NAME}.avd" ] || fail "no $AVD_NAME emulator — run avd-photos-setup"
 command -v adb >/dev/null 2>&1 || fail "adb missing from PATH"
 command -v "$ICLOUDPD" >/dev/null 2>&1 || fail "icloudpd ($ICLOUDPD) missing from PATH"
 [ -n "$ICLOUD_USERNAME" ] || fail "ICLOUD_USERNAME unset in $CONFIG_FILE"
@@ -305,6 +310,14 @@ mkdir -p "$STAGING" 2>/dev/null || fail "cannot mkdir staging $STAGING"
 icp_args=( --username "$ICLOUD_USERNAME" --directory "$STAGING"
            --until-found "$UNTIL_FOUND" --recent "$RECENT"
            --folder-structure '{:%Y/%m}' --no-progress-bar --log-level info )
+# WINDOWS: stdin at /dev/null does NOT stop the password prompt. icloudpd's
+# default password providers end in `console`, whose hidden prompt is Python's
+# getpass -- which on Windows reads the CONSOLE through msvcrt, not stdin
+# (measured: getpass with stdin at /dev/null waited until killed). In a hidden
+# console nobody can answer, that is the "blocks forever" trap above, holding the
+# sync lock for good. So the console provider is left out there, and a missing
+# session fails at once, in the authenticator.
+[ "$AP_OS" = windows ] && icp_args+=( --password-provider parameter --password-provider keyring )
 # NEVER --delete-after-download: it removed each item from iCloud the moment its
 # bytes landed in staging, hours before Google Photos had it, gated only on SOME
 # earlier run having confirmed uploads. Step 6 offloads per file, after
@@ -344,7 +357,9 @@ elif [ "$rc" -ge 128 ]; then
 elif [ "$rc" -eq 127 ]; then
   fail "icloudpd not executable (127)"
 elif grep -qiE "EOFError|ask_password_in_console|Failed to execute script" "$LOG" 2>/dev/null \
-     && [ "$(tail -40 "$LOG" | grep -ciE "EOFError|ask_password_in_console")" -gt 0 ]; then
+     && [ "$(tail -40 "$LOG" | grep -ciE "EOFError|ask_password_in_console|in authenticator|requires_2fa")" -gt 0 ]; then
+  # (EOFError is the Mac's console prompt meeting /dev/null; a traceback
+  # through the authenticator is the Windows form, with no console provider.)
   log "icloudpd has NO SAVED SESSION — it needs a one-time interactive login:"
   log "    icloudpd --username $ICLOUD_USERNAME --directory \"$STAGING\" --recent 1"
   log "  continuing with whatever is already staged"
@@ -358,7 +373,7 @@ fi
 # least as large as the ledger; anything else falls through to step 4, which
 # lists twice and names a refused directory. The ledger's device check needs adb,
 # so a recreated emulator is noticed by the first run that boots.
-if ! pgrep -f "qemu-system.*$AVD_NAME" >/dev/null 2>&1 && [ -f "$STATE_DIR/last-upload-confirmed" ] \
+if ! emu_running && [ -f "$STATE_DIR/last-upload-confirmed" ] \
    && [ ! -f "$DEVICE_BUSY" ]; then
   [ -f "$LEDGER" ] || : > "$LEDGER"
   quick="$(mktemp)"; n_quick=-1
@@ -379,14 +394,13 @@ if ! pgrep -f "qemu-system.*$AVD_NAME" >/dev/null 2>&1 && [ -f "$STATE_DIR/last-
 fi
 
 # ── 3. Bring the emulator up, headless ───────────────────────────────────────
-if ! pgrep -f "qemu-system.*$AVD_NAME" >/dev/null 2>&1; then
+if ! emu_running; then
   [ -x "$AVD_EMU" ] || fail "emulator binary missing at $AVD_EMU"
   log "starting $AVD_NAME (headless)"
   phase "booting the emulator"
-  ANDROID_HOME="$AVD_SDK_ROOT" ANDROID_SDK_ROOT="$AVD_SDK_ROOT" \
-    nohup "$AVD_EMU" -avd "$AVD_NAME" -no-snapshot -no-boot-anim -no-window \
-      -gpu "$AVD_GPU" \
-      >>"$LOG_DIR/emulator.log" 2>&1 &
+  # ANDROID_HOME / ANDROID_AVD_HOME are exported by ap_load_config.
+  ap_spawn_detached "$LOG_DIR/emulator.log" "$AVD_EMU" -avd "$AVD_NAME" -no-snapshot \
+    -no-boot-anim -no-window -gpu "$AVD_GPU"
   sleep 8
 fi
 run_bounded 60 adb start-server
@@ -475,15 +489,21 @@ while IFS= read -r rel; do
   [ -n "$rel" ] || continue
   [ "$pushed" -ge "$PUSH_CAP" ] && break
   # An online-only stub can BLOCK FOREVER when read, so test METADATA only and
-  # skip; it mirrors on a later run. Same rule as lib/fs.sh, kept inline here
-  # because it is one stat in the hot loop.
-  if /usr/bin/stat -f %Sf "$STAGING/$rel" 2>/dev/null | grep -q dataless; then
-    evicted=$((evicted+1)); continue
+  # skip; it mirrors on a later run. Same rule as lib/fs.sh (flag, then blocks),
+  # from the ONE stat in this hot loop; a Windows placeholder has no flag and is
+  # caught by its zero allocation.
+  read -r st_flags src_sz st_blocks <<<"$(ap_stat_fsb "$STAGING/$rel")"
+  if ! has_local_bytes_fields "${st_flags:-}" "${src_sz:-0}" "${st_blocks:-0}"; then
+    evicted=$((evicted+1))
+    # Named once per run: a count alone cannot tell a cloud stub from a file
+    # system that under-reports its allocation.
+    [ "$evicted" -eq 1 ] && log "  online-only (no local bytes), skipped until it is local: $rel (size ${src_sz:-?}, blocks ${st_blocks:-?})"
+    continue
   fi
   # A 0-byte staged file (a download left truncated) is never pushed: a 0-byte
   # push would pass the size check below and loop through the empty-device sweep
   # every run. Delete it from staging to fetch it again.
-  if [ "$(/usr/bin/stat -f %z "$STAGING/$rel" 2>/dev/null || echo 0)" -eq 0 ]; then
+  if [ "${src_sz:-0}" -eq 0 ]; then
     empty=$((empty+1)); log "  empty staged file skipped (delete it to let icloudpd fetch it again): $rel"; continue
   fi
   # ONE DEVICE NAME PER STAGED PATH: DCIM/Camera is flat and iCloud names repeat
@@ -498,7 +518,7 @@ while IFS= read -r rel; do
     # full UPLOAD_WAIT on "0 of 3 confirmed" and the device-busy marker never
     # cleared. A mismatch is a failed push: drop the device copy and leave the
     # path OUT of the ledger so the next run sends it again.
-    src_sz="$(/usr/bin/stat -f %z "$STAGING/$rel" 2>/dev/null || echo 0)"
+    src_sz="$(ap_fsize "$STAGING/$rel")"
     dev_sz="$(dev_out "stat -c %s $(shq "$DEST_DCIM/$devname") 2>/dev/null" | tr -dc '0-9')"
     if [ "${src_sz:-0}" -gt 0 ] && [ -n "$dev_sz" ] && [ "$dev_sz" = "$src_sz" ]; then
       printf '%s\n' "$rel" >> "$LEDGER"; pushed=$((pushed+1))
@@ -574,6 +594,18 @@ PHOTOS_DB=/data/data/com.google.android.apps.photos/databases/gphotos0.db
 # pulled to the host.
 PHOTOS_SQL_MODE=""
 HOST_DB=""
+# The HOST's sqlite, for the pulled copy. macOS ships sqlite3; a fresh Windows
+# does not, and Python's own sqlite3 module (uv's managed Python there, see
+# lib/config.sh) runs the identical query against the identical file.
+host_sqlite() {
+  if command -v sqlite3 >/dev/null 2>&1; then sqlite3 "$1" "$2"; return; fi
+  python3 -c '
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+for row in con.execute(sys.argv[2]):
+    print("|".join("" if v is None else str(v) for v in row))
+' "$1" "$2"
+}
 photos_sql_probe() {
   if dev_out "command -v sqlite3" | grep -q sqlite3; then PHOTOS_SQL_MODE=device
   else
@@ -602,7 +634,7 @@ photos_sql_refresh() {
     # the file is ~230 MB (a 233 MB orphan sat on the emulator disk for a day).
     run_bounded "$ADB_TIMEOUT" adb -s "$SER" shell rm -f /sdcard/gphotos0.db /sdcard/gphotos0.db-wal /sdcard/gphotos0.db-shm >/dev/null 2>&1
     # A trivial query proves the snapshot is coherent before we trust its counts.
-    if [ -s "$HOST_DB" ] && sqlite3 "$HOST_DB" 'select count(*) from local_media;' >/dev/null 2>&1; then
+    if [ -s "$HOST_DB" ] && host_sqlite "$HOST_DB" 'select count(*) from local_media;' >/dev/null 2>&1; then
       return 0
     fi
     i=$((i+1)); sleep 3
@@ -619,7 +651,7 @@ photos_sql() {
     dev_out "su -c 'sqlite3 $PHOTOS_DB < /data/local/tmp/avd-query.sql' 2>/dev/null"
   else
     [ -s "$HOST_DB" ] || return 0
-    sqlite3 "$HOST_DB" "$1" 2>/dev/null
+    host_sqlite "$HOST_DB" "$1" 2>/dev/null
   fi
 }
 
@@ -787,12 +819,12 @@ fi
 # Same recipe as avd-photos-setup --stop: sync, then emu kill.
 # STOP_EMULATOR_WHEN_IDLE=0 in the config keeps it resident.
 if [ "$STOP_EMULATOR_WHEN_IDLE" = "1" ] && [ ! -f "$DEVICE_BUSY" ] && [ -f "$STATE_DIR/last-upload-confirmed" ] \
-   && pgrep -f "qemu-system.*$AVD_NAME" >/dev/null 2>&1; then
+   && emu_running; then
   phase "stopping the emulator"
   dev_out sync >/dev/null 2>&1
   run_bounded 30 adb -s "$SER" emu kill </dev/null
-  n=0; while [ "$n" -lt 30 ] && pgrep -f "qemu-system.*$AVD_NAME" >/dev/null 2>&1; do sleep 2; n=$((n+1)); done
-  if pgrep -f "qemu-system.*$AVD_NAME" >/dev/null 2>&1; then log "WARNING: the emulator did not stop within 60 s"; else log "emulator stopped: device drained, batch confirmed"; fi
+  n=0; while [ "$n" -lt 30 ] && emu_running; do sleep 2; n=$((n+1)); done
+  if emu_running; then log "WARNING: the emulator did not stop within 60 s"; else log "emulator stopped: device drained, batch confirmed"; fi
 fi
 
 rm -f "$pushedpaths"

@@ -10,5 +10,16 @@
 # single pixel is drawn) and stalls forever on the Play Services splash under
 # `-gpu host`. It reads exactly like Google refusing an uncertified device, which
 # sends you off chasing Play certification instead.
-AVD_GPU="${AVD_SIGNIN_GPU:-swiftshader_indirect}" \
+#
+# WINDOWS uses ANGLE (Direct3D) for this instead, measured on a 4-core laptop:
+# `-gpu host` stalls on the same "Checking info..." splash as on a Mac, and
+# software GL renders the login -- but draws the whole 2560x1440 tablet screen
+# on the CPU, and System UI and Photos then answered "isn't responding" to every
+# tap. `-gpu angle_indirect` renders Google's login page and leaves the CPU to
+# the guest. AVD_SIGNIN_GPU still overrides either default.
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*) _signin_gpu=angle_indirect ;;
+  *)                    _signin_gpu=swiftshader_indirect ;;
+esac
+AVD_GPU="${AVD_SIGNIN_GPU:-$_signin_gpu}" \
   exec "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/avd-photos-setup" --start "$@"

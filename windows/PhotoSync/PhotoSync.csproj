@@ -1,0 +1,52 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Photo Sync for Windows: the tray face of the iCloud -> Google Photos
+    pipeline, WinUI 3 on the Windows App SDK. Built by windows\build.ps1.
+
+    UNPACKAGED AND SELF-CONTAINED: no MSIX, no Store identity, and .NET plus the
+    Windows App SDK runtime ship inside the output folder, so the PC it runs on
+    needs neither installed. The one package reference is the Windows App SDK
+    itself; the notify icon is Shell_NotifyIcon through P/Invoke (TrayIcon.cs)
+    and the ring is drawn by Ring.cs, so there is no third-party tray library.
+
+    DISABLE_XAML_GENERATED_MAIN: Program.cs owns Main, because the sync and
+    setup command-line modes must run before anything starts WinUI.
+  -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>PhotoSync</RootNamespace>
+    <AssemblyName>PhotoSync</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Platforms>x64;ARM64</Platforms>
+    <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
+    <UseWinUI>true</UseWinUI>
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <SelfContained>true</SelfContained>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
+    <Version>1.0.0</Version>
+    <Product>Photo Sync</Product>
+    <Description>iCloud to Google Photos: the tray status and its actions</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.4.0" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2705" />
+  </ItemGroup>
+
+  <!--
+    THE APP'S OWN RESOURCE INDEX MUST SHIP. An unpackaged app resolves
+    ms-appx:///FlyoutWindow.xaml through PhotoSync.pri beside the exe; the build
+    writes it into the output folder, but a self-contained publish leaves it
+    behind, and the result starts, then dies on the first window with nothing
+    but "XAML parsing failed" (measured).
+  -->
+  <Target Name="PublishAppPri" AfterTargets="Publish">
+    <Copy SourceFiles="$(OutDir)$(TargetName).pri" DestinationFolder="$(PublishDir)" Condition="Exists('$(OutDir)$(TargetName).pri')" />
+  </Target>
+</Project>
