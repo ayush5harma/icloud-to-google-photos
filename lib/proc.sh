@@ -23,7 +23,8 @@ run_bounded() {
 # epoch, in effect) when it does not exist -- callers compare this against a
 # staleness threshold without a separate existence check.
 stamp_age() {
-  printf '%s\n' "$(( $(date +%s) - $(/usr/bin/stat -f %m "$1" 2>/dev/null || echo 0) ))"
+  local _m; _m="$(ap_mtime "$1")"
+  printf '%s\n' "$(( $(date +%s) - ${_m:-0} ))"
 }
 
 # dev_capture <serial> <timeout-secs> <poll-secs> <stderr-mode> <cmd> [args...]:
@@ -54,13 +55,22 @@ dev_capture() {
   while kill -0 "$_pid" 2>/dev/null; do
     if [ "$_n" -ge "$_max" ]; then
       kill -9 "$_pid" 2>/dev/null; wait "$_pid" 2>/dev/null
-      cat "$_out"; rm -f "$_out"; return 124
+      _dev_emit "$_out"; rm -f "$_out"; return 124
     fi
     sleep "$_poll"; _n=$((_n+1))
   done
   wait "$_pid"; _rc=$?
-  cat "$_out"; rm -f "$_out"
+  _dev_emit "$_out"; rm -f "$_out"
   return "$_rc"
+}
+
+# adb.exe writes the device's output in TEXT mode on Windows: `adb shell echo
+# ok` arrives as "ok\r\n" (measured), and every exact-match test on a device
+# answer -- `grep -q '^ok$'` for the preinit device, a module, the sepolicy rule
+# -- would silently read "no". So the one capture every device query goes
+# through hands back LF only, as a Mac's adb does.
+_dev_emit() {
+  if [ "$AP_OS" = windows ]; then tr -d '\r' < "$1"; else cat "$1"; fi
 }
 
 # ap_avd_name_of <serial> [secs]: the name of the AVD running on <serial>, via
@@ -98,6 +108,52 @@ ap_emulator_serial() {
   return 1
 }
 
+# ── The emulator PROCESS ─────────────────────────────────────────────────────
+# "Is our VM running" is asked of the process table, not of adb: a booting or
+# wedged emulator is not attached yet but is very much running, and starting a
+# second copy of the same AVD is what that question exists to prevent.
+#
+# macOS: the VM is `qemu-system-aarch64 ... -avd <name> ...`, and pgrep -f sees
+# the whole command line. Windows: the VM is qemu-system-x86_64[-headless].exe,
+# started by an emulator.exe that waits on it, and a command line is only
+# readable through CIM -- about half a second of PowerShell. So a tasklist pass
+# answers the common case ("no emulator at all", ~0.1 s) and CIM is asked only
+# when some emulator exists. The name is matched as the whole -avd argument, so
+# gphotos-tablet never matches a gphotos-tablet2 or the Play Store donor VM.
+
+# ap_emu_pids <avd-name>: the pid(s) of the emulator process(es) running
+# <avd-name>, one per line; nothing when it is not running.
+ap_emu_pids() {
+  local _n="$1"
+  if [ "$AP_OS" != windows ]; then pgrep -f "qemu-system.*$_n" 2>/dev/null; return 0; fi
+  tasklist.exe //NH //FO CSV //FI "IMAGENAME eq qemu-system*" 2>/dev/null | grep -qi 'qemu-system' \
+    || tasklist.exe //NH //FO CSV //FI "IMAGENAME eq emulator.exe" 2>/dev/null | grep -qi 'emulator.exe' \
+    || return 0
+  # The name travels in the environment and is escaped by PowerShell itself.
+  # emulator.exe's command line quotes every argument ("-avd" "name"), QEMU's
+  # does not (-avd name); both must match.
+  AP_EMU_NAME="$_n" ap_ps "$(cat <<'PS'
+$re = '(^|[\s"])-avd"?\s+"?' + [regex]::Escape($env:AP_EMU_NAME) + '"?(\s|$)'
+Get-CimInstance Win32_Process -Filter "Name LIKE 'qemu-system%' OR Name = 'emulator.exe'" |
+  Where-Object { $_.CommandLine -match $re } | ForEach-Object { $_.ProcessId }
+PS
+)"
+}
+
+ap_emu_running() { [ -n "$(ap_emu_pids "$1")" ]; }
+
+# ap_emu_kill <avd-name>: hard-stop that emulator's processes. The LAST resort,
+# after `adb emu kill` (which lets QEMU exit cleanly) has had its chance -- a hard
+# stop discards unflushed writes, which is why nothing calls this after a Magisk
+# module install (see reboot_wait in avd-photos-setup).
+ap_emu_kill() {
+  local _pids
+  if [ "$AP_OS" != windows ]; then pkill -f "qemu-system.*$1" 2>/dev/null; return 0; fi
+  _pids="$(ap_emu_pids "$1" | tr '\n' ',' | sed 's/,$//')"
+  [ -n "$_pids" ] && ap_ps "Stop-Process -Force -ErrorAction SilentlyContinue -Id $_pids" >/dev/null
+  return 0
+}
+
 # single_flight_lock <dir> [notice-fn]: take <dir> as a lock (mkdir is the
 # portable atomic test-and-set -- macOS has no flock) and record this pid in
 # <dir>/pid. A launchd job whose calendar firings missed during sleep all land on
@@ -109,12 +165,32 @@ ap_emulator_serial() {
 single_flight_lock() {
   local _dir="$1" _notice="${2:-}"
   SFL_PID=""
-  if mkdir "$_dir" 2>/dev/null; then printf '%s\n' "$$" > "$_dir/pid"; return 0; fi
+  if mkdir "$_dir" 2>/dev/null; then ap_lock_write "$_dir"; return 0; fi
   SFL_PID="$(cat "$_dir/pid" 2>/dev/null || true)"
-  if [ -n "$SFL_PID" ] && kill -0 "$SFL_PID" 2>/dev/null; then return 1; fi
+  if [ -n "$SFL_PID" ] && ap_lock_alive "$_dir"; then return 1; fi
   [ -n "$_notice" ] && "$_notice" "reclaiming a stale lock (pid ${SFL_PID:-?} is gone)"
   rm -rf "$_dir"
   mkdir "$_dir" 2>/dev/null || return 2
-  printf '%s\n' "$$" > "$_dir/pid"
+  ap_lock_write "$_dir"
   return 0
+}
+
+# ap_lock_write <dir> / ap_lock_alive <dir>: who holds a lock, and are they
+# still running. On Windows the Windows pid is recorded as well: an MSYS pid is
+# only visible to bashes from the SAME Git installation, and a run started from
+# the user's own Git Bash beside the tray's copy would otherwise read the other's
+# live lock as stale and reclaim it -- two setups racing on one ramdisk.img. The
+# image name is checked too, so a reused Windows pid does not hold a lock forever.
+ap_lock_write() {
+  printf '%s\n' "$$" > "$1/pid"
+  [ "$AP_OS" = windows ] && { tr -dc '0-9' < "/proc/$$/winpid" > "$1/winpid"; } 2>/dev/null
+  return 0
+}
+ap_lock_alive() {
+  local _p _w
+  _p="$(tr -dc '0-9' < "$1/pid" 2>/dev/null)"
+  [ -n "$_p" ] && kill -0 "$_p" 2>/dev/null && return 0
+  [ "$AP_OS" = windows ] || return 1
+  _w="$(tr -dc '0-9' < "$1/winpid" 2>/dev/null)"
+  [ -n "$_w" ] && ap_winpid_alive "$_w" bash.exe
 }

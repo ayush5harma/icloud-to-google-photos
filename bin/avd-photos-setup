@@ -140,11 +140,17 @@ step() { printf '  %s\n' "$*"; printf '   %s\n' "$*" >>"$LOG"; }
 warn() { printf '  \033[33m! %s\033[0m\n' "$*"; printf '   ! %s\n' "$*" >>"$LOG"; }
 die()  { printf '\033[31mERROR: %s\033[0m\n' "$*" >&2; printf '   ERROR %s\n' "$*" >>"$LOG"; exit 1; }
 
-for t in sdkmanager adb jq curl python3; do
+# adb is NOT on this list: it comes out of the SDK this script installs, so a
+# fresh machine has none until phase_sdk has run (need_adb checks it there).
+# python3 on Windows is a function over uv (lib/config.sh), hence uv.
+for t in jq curl python3; do
   command -v "$t" >/dev/null 2>&1 || die "$t not on PATH"
 done
+[ "$AP_OS" = windows ] && { command -v uv >/dev/null 2>&1 || die "uv not on PATH — run install.ps1"; }
+need_adb() { command -v adb >/dev/null 2>&1 || die "adb not found — run avd-photos-setup once to install the SDK"; }
 
 EMU="$SDK_ROOT/emulator/emulator"
+[ "$AP_OS" = windows ] && EMU="$EMU.exe"
 # Resolved by NAME in boot_emulator (ap_emulator_serial, lib/proc.sh), never
 # assumed: emulator-5554 is only the first free console port, so any emulator
 # started before this one owns it -- and this script flashes modules, patches a
@@ -155,13 +161,184 @@ SER=""
 # packaging (some wrappers PREPEND their own path to ANDROID_HOME and the tool
 # then answers "Package path is not valid ... : null"); sdkmanager escapes this
 # via --sdk_root. So the writable root gets its OWN cmdline-tools, bootstrapped
-# once by whatever sdkmanager is on PATH, and everything after uses those.
-BOOT_SDKM="$(command -v sdkmanager)"
+# once -- by whatever sdkmanager is on PATH on a Mac, or, where there is none,
+# straight from Google's repository index (bootstrap_cmdline_tools) -- and
+# everything after uses those.
+#
+# WINDOWS NEVER BORROWS A SDKMANAGER. The whole point there is that a fresh PC
+# reproduces this with nothing installed, so whatever Android Studio left on
+# PATH is ignored; the tools are .bat scripts (and `[ -x ]` does not see a .bat,
+# hence -f below).
+BOOT_SDKM=""
+[ "$AP_OS" = windows ] || BOOT_SDKM="$(command -v sdkmanager 2>/dev/null)"
 SDKM="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
 AVDM="$SDK_ROOT/cmdline-tools/latest/bin/avdmanager"
+[ "$AP_OS" = windows ] && { SDKM="$SDKM.bat"; AVDM="$AVDM.bat"; }
+#
+# SDKMANAGER IS NOW A SHIM. From cmdline-tools 23 it is a script that translates
+# its arguments for the new Android CLI (`android sdk ...`), which lists
+# packages as system-images/android-37.0/... rather than with `;` (latest_api
+# reads both). On Windows two more things are true, both measured: the shim is
+# a .bat, and cmd splits an unquoted argument at `;` BEFORE the shim sees it, so
+# `system-images;android-37.0;google_apis;x86_64` arrives as four "packages" --
+# hence the `/` form, which the CLI takes natively; and android.exe exits 127
+# after a successful install exactly as after a failed one, so its status says
+# nothing. There sdkm returns 0 and every caller checks the STATE it wanted (the
+# package directory exists, the listing lists images), which is the stronger
+# test anyway.
+#
+# AND IT CANNOT REPLACE ITSELF ON WINDOWS. The CLI updates a package by deleting
+# its directory file by file and unpacking the new one, and Windows refuses to
+# delete a running executable: updating cmdline-tools/latest from android.exe
+# INSIDE cmdline-tools/latest crashed with AccessDeniedException halfway through
+# the delete (measured), which leaves a half-deleted SDK tool. So on Windows the
+# shim runs from a private COPY of cmdline-tools (sdk_tool_copy), refreshed
+# whenever `latest` changes, and sdk_idle_windows makes sure nothing else is
+# running out of the SDK before anything is installed.
+SDK_TOOL_RUN="$STATE_DIR/cmdline-tools-run"
+sdk_tool_copy() {
+  local src="$SDK_ROOT/cmdline-tools/latest"
+  if [ ! -f "$SDK_TOOL_RUN/bin/sdkmanager.bat" ] || ! cmp -s "$src/source.properties" "$SDK_TOOL_RUN/source.properties"; then
+    rm -rf "$SDK_TOOL_RUN"
+    cp -R "$src" "$SDK_TOOL_RUN" || { rm -rf "$SDK_TOOL_RUN"; return 1; }
+  fi
+}
 sdkm() {
-  if [ -x "$SDKM" ]; then "$SDKM" --sdk_root="$SDK_ROOT" "$@"
-  else "$BOOT_SDKM" --sdk_root="$SDK_ROOT" "$@"; fi
+  if [ -f "$SDKM" ] && [ "$AP_OS" = windows ]; then
+    local a args=()
+    for a in "$@"; do case "$a" in -*) args+=("$a") ;; *) args+=("${a//;//}") ;; esac; done
+      # --check promises to change nothing: it lists from `latest` itself, which a
+    # listing cannot hurt, rather than refreshing the copy.
+    if [ "$CHECK_ONLY" -eq 1 ]; then "$SDKM" --sdk_root="$SDK_ROOT" "${args[@]}"; return 0; fi
+    sdk_tool_copy || { warn "could not copy cmdline-tools to $SDK_TOOL_RUN"; return 0; }
+    "$SDK_TOOL_RUN/bin/sdkmanager.bat" --sdk_root="$SDK_ROOT" "${args[@]}"
+    return 0
+  elif [ -f "$SDKM" ]; then "$SDKM" --sdk_root="$SDK_ROOT" "$@"
+  elif [ -n "$BOOT_SDKM" ]; then "$BOOT_SDKM" --sdk_root="$SDK_ROOT" "$@"
+  else return 127; fi
+}
+
+# sdk_idle_windows: 0 when nothing runs out of the SDK root, so the Android CLI
+# can replace packages (see sdkm); the pipeline's own adb server is stopped for
+# it (adb restarts on demand), anything else -- a running emulator -- makes it
+# say what and return 1.
+sdk_in_use() {
+  AP_SDK="$(cygpath -w "$SDK_ROOT")" ap_ps '$r = $env:AP_SDK.TrimEnd("\") + "\"
+Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($r, [StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { $_.Name } | Sort-Object -Unique'
+}
+sdk_idle_windows() {
+  local busy
+  busy="$(sdk_in_use)"
+  if printf '%s\n' "$busy" | grep -qix 'adb.exe'; then
+    run_bounded 20 "$SDK_ROOT/platform-tools/adb" kill-server
+    sleep 2
+    busy="$(sdk_in_use)"
+  fi
+  [ -z "$busy" ] && return 0
+  warn "running out of the SDK right now: $(printf '%s' "$busy" | tr '\n' ' ')"
+  return 1
+}
+
+# unzip_to <zip> <dir>: Info-ZIP where it exists (it keeps the exec bits a Mac
+# needs on bin/sdkmanager), else Python's zipfile.
+unzip_to() {
+  mkdir -p "$2" || return 1
+  if command -v unzip >/dev/null 2>&1; then unzip -q -o "$1" -d "$2"
+  else python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "$1" "$2"; fi
+}
+
+# ── A fresh machine: the SDK tools and the Java they run on ─────────────────
+# bootstrap_cmdline_tools: install cmdline-tools;latest into the writable root
+# with no sdkmanager anywhere, from the same repository index sdkmanager itself
+# reads. The archive is checked against the checksum in that index (the index
+# comes over TLS from dl.google.com; this catches a truncated download, which is
+# what a flaky connection actually produces).
+REPO_URL="https://dl.google.com/android/repository"
+bootstrap_cmdline_tools() {
+  local os xml meta url sum algo zip tmp
+  case "$AP_OS" in windows) os=windows ;; macos) os=macosx ;; *) os=linux ;; esac
+  xml="$STATE_DIR/repository2-3.xml"
+  curl -fsSL --retry 2 --connect-timeout 20 --max-time 120 -o "$xml" "$REPO_URL/repository2-3.xml" \
+    || { warn "could not read Google's SDK repository index"; return 1; }
+  meta="$(python3 - "$xml" "$os" <<'PY'
+import sys, xml.etree.ElementTree as ET
+root = ET.parse(sys.argv[1]).getroot()
+for p in root.iter():
+    if not p.tag.endswith("remotePackage") or p.get("path") != "cmdline-tools;latest":
+        continue
+    ch = p.find("channelRef")
+    if ch is not None and ch.get("ref") != "channel-0":
+        continue                                # stable only
+    for a in p.iter("archive"):
+        if a.findtext("host-os") == sys.argv[2]:
+            c = a.find("complete/checksum")
+            print(a.findtext("complete/url"), c.get("type", "sha1"), c.text)
+            sys.exit(0)
+sys.exit(1)
+PY
+)" || { warn "no cmdline-tools archive for $os in the repository index"; return 1; }
+  read -r url algo sum <<<"$meta"
+  zip="$STATE_DIR/$url"
+  step "downloading $url (the SDK's own tools, one time)"
+  fetch "$zip" "$REPO_URL/$url" || { warn "download failed: $url"; return 1; }
+  python3 -c 'import hashlib, sys; h = hashlib.new(sys.argv[2]); h.update(open(sys.argv[1], "rb").read()); sys.exit(h.hexdigest() != sys.argv[3])' \
+    "$zip" "$algo" "$sum" || { rm -f "$zip"; warn "$url does not match its $algo in the index — refusing it"; return 1; }
+  # The archive's top directory is cmdline-tools/; the SDK wants it as
+  # cmdline-tools/latest/. Unpack beside, then rename.
+  tmp="$SDK_ROOT/cmdline-tools/.bootstrap"
+  rm -rf "$tmp" "$SDK_ROOT/cmdline-tools/latest"
+  unzip_to "$zip" "$tmp" && mv "$tmp/cmdline-tools" "$SDK_ROOT/cmdline-tools/latest" \
+    || { rm -rf "$tmp"; warn "could not unpack $url"; return 1; }
+  rm -rf "$tmp" "$zip"
+  [ "$AP_OS" = windows ] || chmod +x "$SDK_ROOT/cmdline-tools/latest/bin/"* 2>/dev/null
+  step "cmdline-tools installed"
+}
+
+# ensure_jdk (Windows): sdkmanager and avdmanager are Java programs, and a fresh
+# PC has no Java. The pipeline keeps its OWN -- the Microsoft Build of OpenJDK,
+# a plain zip, no installer and no admin rights -- under the SDK root, and hands
+# it to the tools through JAVA_HOME. Any other Java on the machine is ignored, for
+# the same reason as any other sdkmanager: this must be reproducible from empty.
+# The zip is checked against the .sha256sum.txt Microsoft publishes beside it.
+JDK_DIR="$SDK_ROOT/jdk"
+ensure_jdk() {
+  [ "$AP_OS" = windows ] || return 0
+  if [ ! -x "$JDK_DIR/bin/java" ]; then
+    local arch=x64 base zip want have tmp
+    [ "$(ap_host_abi)" = arm64-v8a ] && arch=aarch64   # the HOST's, not the guest's
+    base="https://aka.ms/download-jdk/microsoft-jdk-21-windows-$arch.zip"
+    zip="$STATE_DIR/microsoft-jdk-21.zip"
+    step "downloading a JDK for the SDK tools (Microsoft Build of OpenJDK 21, one time)"
+    fetch "$zip" "$base" || { warn "could not download the JDK"; return 1; }
+    want="$(curl -fsSL --retry 2 --max-time 60 "$base.sha256sum.txt" 2>/dev/null | awk '{print tolower($1)}')"
+    have="$(ap_sha256 "$zip")"
+    if [ -z "$want" ] || [ "$want" != "$have" ]; then
+      rm -f "$zip"; warn "the JDK download does not match Microsoft's published sha256 — refusing it"; return 1
+    fi
+    tmp="$SDK_ROOT/.jdk-unpack"
+    rm -rf "$tmp" "$JDK_DIR"
+    unzip_to "$zip" "$tmp" || { rm -rf "$tmp"; warn "could not unpack the JDK"; return 1; }
+    # One top directory, jdk-21.0.x+y; its name moves with every update.
+    mv "$tmp"/jdk-* "$JDK_DIR" || { rm -rf "$tmp"; warn "unexpected JDK archive layout"; return 1; }
+    rm -rf "$tmp" "$zip"
+    step "JDK: $("$JDK_DIR/bin/java" -version 2>&1 | head -1 | tr -d '\r')"
+  fi
+  export JAVA_HOME="$JDK_DIR"
+  PATH="$(ap_posix "$JDK_DIR")/bin:$PATH"
+}
+
+# ensure_sdk_tools: a JDK where one is needed, then the writable root's own
+# cmdline-tools. Idempotent; the cost on every run after the first is two tests.
+ensure_sdk_tools() {
+  ensure_jdk || die "no JDK for the SDK tools"
+  [ -f "$SDKM" ] && [ -f "$AVDM" ] && return 0
+  step "bootstrapping cmdline-tools into the writable root"
+  if [ -n "$BOOT_SDKM" ]; then
+    sdkm --install "cmdline-tools;latest" >/dev/null 2>&1
+  else
+    bootstrap_cmdline_tools
+  fi
+  [ -f "$SDKM" ] && [ -f "$AVDM" ] || die "cmdline-tools missing under $SDK_ROOT (bootstrap failed)"
 }
 
 stamp_get() { cat "$STAMPS/$1" 2>/dev/null; }
@@ -240,7 +417,7 @@ fetch() {
 verify_asset() {
   local key="$1" tag="${2:-untagged}" f="$3" have want
   [ -s "$f" ] || { warn "empty download for $key"; return 1; }
-  have="$(/usr/bin/shasum -a 256 "$f" 2>/dev/null | awk '{print $1}')"
+  have="$(ap_sha256 "$f")"
   [ -n "$have" ] || { warn "could not hash $f"; return 1; }
   want="$(stamp_get "sha-$key-$tag")"
   if [ -n "$want" ] && [ "$want" != "$have" ]; then
@@ -272,7 +449,7 @@ verify_asset() {
 # `merge` keeps the device's stderr in the output callers print.
 dev() { dev_capture "$SER" "$DEV_TIMEOUT" 0.1 merge "$@"; }
 
-emu_running() { pgrep -f "qemu-system.*$AVD_NAME" >/dev/null 2>&1; }
+emu_running() { ap_emu_running "$AVD_NAME"; }
 # KEEP THE VERSION-SHAPED FILTER. The magisk binary lives in Magisk's tmpfs, not
 # on PATH, and `magisk -v` on an UNROOTED device prints "magisk: inaccessible or
 # not found" on STDOUT -- a bare -n test reads that error text as a version and
@@ -326,13 +503,21 @@ gsf_device_id() {
 # followed immediately by `;`, which with the exact `;${AVD_TAG};` match excludes
 # the -beta/-rc/CANARY builds and the 16 KB `_ps16k` variants -- those resist
 # ramdisk patching.
+#
+# The separator is `;` from the classic sdkmanager and `/` from the Android CLI
+# behind cmdline-tools 23 (see sdkm); the tag and ABI must END the path, so
+# google_apis never matches google_apis_ps16k. A listing is cached only when it
+# actually lists images: a tool that crashed printed nothing, and caching that
+# would hide every newer API for a day.
 latest_api() {
   local c="$STATE_DIR/sdk-images.list"
   if [ ! -s "$c" ] || [ -n "$(find "$c" -mmin +1440 2>/dev/null)" ]; then
-    sdkm --list 2>/dev/null >"$c.tmp" && mv "$c.tmp" "$c" || rm -f "$c.tmp"
+    sdkm --list 2>/dev/null </dev/null >"$c.tmp"
+    if grep -q 'system-images' "$c.tmp" 2>/dev/null; then mv -f "$c.tmp" "$c"; else rm -f "$c.tmp"; fi
   fi
-  grep -oE "system-images;android-[0-9]+(\.[0-9]+)?;${AVD_TAG};${AVD_ABI}" "$c" 2>/dev/null \
-    | sed -E 's/.*android-([0-9]+(\.[0-9]+)?);.*/\1/' | sort -Vr | head -1
+  tr -d '\r' < "$c" 2>/dev/null \
+    | grep -oE "system-images[;/]android-[0-9]+(\.[0-9]+)?[;/]${AVD_TAG}[;/]${AVD_ABI}([[:space:]]|\$)" \
+    | sed -E 's/.*android-([0-9]+(\.[0-9]+)?)[;/].*/\1/' | sort -Vr | head -1
 }
 installed_apis() {
   ls -1 "$SDK_ROOT/system-images" 2>/dev/null | sed -nE 's/^android-([0-9]+(\.[0-9]+)?)$/\1/p' | sort -Vr
@@ -359,9 +544,9 @@ boot_emulator() {
     [ "$HEADLESS" -eq 1 ] && extra+=(-no-window)
     step "launching $AVD_NAME$( [ "$HEADLESS" -eq 1 ] && printf ' (headless)')"
     EMU_STARTED_BY_US=1
-    ANDROID_HOME="$SDK_ROOT" ANDROID_SDK_ROOT="$SDK_ROOT" \
-      nohup "$EMU" -avd "$AVD_NAME" -no-snapshot \
-        -gpu "$AVD_GPU" -netdelay none -netspeed full "${extra[@]}" >>"$EMU_LOG" 2>&1 &
+    # ANDROID_HOME / ANDROID_AVD_HOME are exported by ap_load_config.
+    ap_spawn_detached "$EMU_LOG" "$EMU" -avd "$AVD_NAME" -no-snapshot \
+      -gpu "$AVD_GPU" -netdelay none -netspeed full "${extra[@]}"
     sleep 8
   fi
   run_bounded 60 adb start-server
@@ -403,7 +588,7 @@ restart_emulator() {
   run_bounded 30 adb -s "$SER" emu kill
   local end=$((SECONDS + 60))
   while [ "$SECONDS" -lt "$end" ] && emu_running; do sleep 2; done
-  if emu_running; then pkill -f "qemu-system.*$AVD_NAME" 2>/dev/null; sleep 3; fi
+  if emu_running; then ap_emu_kill "$AVD_NAME"; sleep 3; fi
   EMU_STARTED_BY_US=0          # boot_emulator sets it again for the new process
   boot_emulator
 }
@@ -435,6 +620,14 @@ reboot_wait() {
 API=""
 phase_sdk() {
   say "SDK ($SDK_ROOT)"
+  # The tools first: on a fresh machine there is no sdkmanager to ask what the
+  # newest image is. --check installs nothing, and says so.
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    [ -f "$SDKM" ] || [ -n "$BOOT_SDKM" ] || { warn "the SDK is not set up yet — run avd-photos-setup"; API=""; return 0; }
+    ensure_jdk >/dev/null 2>&1
+  else
+    ensure_sdk_tools
+  fi
   local newest; newest="$(latest_api)"
   local have; have="$(installed_apis | head -1)"
   [ -n "$newest" ] || newest="$have"
@@ -451,43 +644,74 @@ phase_sdk() {
 
   step "updating SDK tools"
   yes | sdkm --licenses >/dev/null 2>&1
-  [ -x "$AVDM" ] || { step "bootstrapping cmdline-tools into the writable root"
-                      sdkm --install "cmdline-tools;latest" >/dev/null 2>&1; }
-  sdkm --update >/dev/null 2>&1 && step "cmdline-tools/emulator/platform-tools current" \
-    || warn "sdkmanager --update failed (offline?)"
+  # Windows: an update replaces the emulator and adb in place, which must not
+  # happen under a running VM (see sdk_idle_windows); it waits for a run that
+  # finds the SDK idle -- the weekly one, typically.
+  if [ "$AP_OS" = windows ] && ! sdk_idle_windows; then
+    warn "SDK update skipped this run (stop the emulator to let it update)"
+  else
+    sdkm --update >/dev/null 2>&1 && step "cmdline-tools/emulator/platform-tools current" \
+      || warn "sdkmanager --update failed (offline?)"
+  fi
 
   if [ ! -d "$SDK_ROOT/system-images/android-${newest}/${AVD_TAG}/${AVD_ABI}" ]; then
     step "downloading system-images;android-${newest};${AVD_TAG};${AVD_ABI} (multi-GB, one time)"
-    run_bounded 5400 sdkm --install \
-      "emulator" "platform-tools" "cmdline-tools;latest" "system-images;android-${newest};${AVD_TAG};${AVD_ABI}" \
+    local pkgs=("emulator" "platform-tools" "cmdline-tools;latest")
+    # A new image only ADDS a directory; the tools beside it are replaced in
+    # place, which on Windows must wait for an idle SDK (see sdkm).
+    if [ "$AP_OS" = windows ] && ! sdk_idle_windows; then
+      warn "installing the image alone; the SDK tools update once nothing runs out of the SDK"
+      pkgs=()
+    fi
+    run_bounded 5400 sdkm --install "${pkgs[@]}" "system-images;android-${newest};${AVD_TAG};${AVD_ABI}" \
       || warn "system image install failed or timed out"
   fi
   [ -x "$EMU" ] || die "emulator binary missing under $SDK_ROOT"
+  # Judged by what landed, not by an exit status (see sdkm). The image is only
+  # needed here when this run will create the emulator on it.
+  [ -f "$AVD_HOME/${AVD_NAME}.avd/config.ini" ] || [ -d "$SDK_ROOT/system-images/android-${newest}/${AVD_TAG}/${AVD_ABI}" ] \
+    || die "the system image system-images;android-${newest};${AVD_TAG};${AVD_ABI} did not install"
+  need_adb
+  # WINDOWS NEEDS A HYPERVISOR, and without one the failure is a boot that never
+  # finishes. The emulator answers the question itself. Turning one on needs an
+  # administrator and a reboot, so this script can only say so: the Windows
+  # Hypervisor Platform optional feature (WHPX) is the one to enable.
+  if [ "$AP_OS" = windows ]; then
+    local accel; accel="$("$EMU" -accel-check 2>&1 | tr -d '\r')"
+    if printf '%s\n' "$accel" | grep -qiE 'is installed and usable'; then
+      step "acceleration: $(printf '%s\n' "$accel" | grep -iE 'is installed and usable' | head -1)"
+    else
+      warn "the emulator reports no usable hypervisor:"
+      printf '%s\n' "$accel" | sed 's/^/      /' | head -6
+      die "enable the Windows Hypervisor Platform (an administrator PowerShell: Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All), reboot, and run this again"
+    fi
+  fi
 
   # An existing emulator stays on its own API: userdata cannot migrate across API
   # levels, so silently recreating it would wipe a signed-in Photos instance.
-  local ini="$HOME/.android/avd/${AVD_NAME}.avd/config.ini"
+  local ini="$AVD_HOME/${AVD_NAME}.avd/config.ini"
   if [ -f "$ini" ]; then
-    # Anchor on the trailing `/`, not a greedy `.*`: `image.sysdir.1=
+    # Anchor on the trailing separator, not a greedy `.*`: `image.sysdir.1=
     # system-images/android-37.0/...` read with a bare `([0-9]+)` yields "37",
     # which never equals the resolved "37.0" (so it warns about a newer API
     # forever) and builds a system-images/android-37 ramdisk path that does not
-    # exist (so phase_root dies).
-    API="$(grep -m1 '^image.sysdir.1=' "$ini" 2>/dev/null | sed -E 's|.*android-([0-9]+(\.[0-9]+)?)/.*|\1|')"
+    # exist (so phase_root dies). The separator is `/` on a Mac and `\` in the
+    # config.ini avdmanager writes on Windows.
+    API="$(grep -m1 '^image.sysdir.1=' "$ini" 2>/dev/null | tr -d '\r' | sed -E 's|.*android-([0-9]+(\.[0-9]+)?)[/\\].*|\1|')"
     [ -n "$API" ] || API="$newest"
     if [ "$API" != "$newest" ]; then
       if [ "${AVD_RECREATE:-0}" = "1" ]; then
         # MOVE ASIDE, never rm -rf: a recreate steps onto an API level this
         # pipeline has not rooted before, where the patch can fail, and deleting
         # first would leave no working emulator and no way back. One backup kept.
-        local prev="$HOME/.android/avd/${AVD_NAME}.avd.api${API}.bak"
+        local prev="$AVD_HOME/${AVD_NAME}.avd.api${API}.bak"
         warn "recreating the emulator on API $newest (AVD_RECREATE=1) — userdata does NOT migrate"
         rm -rf "$prev" "$prev.ini"
-        mv "$HOME/.android/avd/${AVD_NAME}.avd" "$prev" 2>/dev/null
-        mv "$HOME/.android/avd/${AVD_NAME}.ini" "$prev.ini" 2>/dev/null
+        mv "$AVD_HOME/${AVD_NAME}.avd" "$prev" 2>/dev/null
+        mv "$AVD_HOME/${AVD_NAME}.ini" "$prev.ini" 2>/dev/null
         warn "previous API $API instance kept at $prev"
-        warn "restore with: rm -rf ~/.android/avd/${AVD_NAME}.avd ~/.android/avd/${AVD_NAME}.ini &&"
-        warn "  mv $prev ~/.android/avd/${AVD_NAME}.avd && mv $prev.ini ~/.android/avd/${AVD_NAME}.ini"
+        warn "restore with: rm -rf $AVD_HOME/${AVD_NAME}.avd $AVD_HOME/${AVD_NAME}.ini &&"
+        warn "  mv $prev $AVD_HOME/${AVD_NAME}.avd && mv $prev.ini $AVD_HOME/${AVD_NAME}.ini"
         API="$newest"
       else
         warn "the emulator is on API $API; API $newest is available. Recreating starts a"
@@ -502,15 +726,16 @@ phase_sdk() {
 # ── 2. the tablet emulator ───────────────────────────────────────────────────
 phase_avd() {
   say "Emulator ($AVD_NAME, device=$AVD_DEVICE, API $API)"
-  local ini="$HOME/.android/avd/${AVD_NAME}.avd/config.ini"
+  local ini="$AVD_HOME/${AVD_NAME}.avd/config.ini"
   if [ -f "$ini" ]; then step "exists"; [ "$CHECK_ONLY" -eq 1 ] && return 0
   else
     [ "$CHECK_ONLY" -eq 1 ] && { warn "not created yet"; return 0; }
-    [ -x "$AVDM" ] || die "cmdline-tools missing under $SDK_ROOT (bootstrap failed)"
+    [ -f "$AVDM" ] || die "cmdline-tools missing under $SDK_ROOT (bootstrap failed)"
+    mkdir -p "$AVD_HOME" || die "cannot create $AVD_HOME"
     echo no | "$AVDM" --silent create avd -n "$AVD_NAME" \
       -k "system-images;android-${API};${AVD_TAG};${AVD_ABI}" -d "$AVD_DEVICE" \
-      --abi "$AVD_ABI" -p "$HOME/.android/avd/${AVD_NAME}.avd" >/dev/null 2>&1 \
-      || die "avdmanager create failed"
+      --abi "$AVD_ABI" -p "$AVD_HOME/${AVD_NAME}.avd" >>"$LOG" 2>&1 \
+      || die "avdmanager create failed — see $LOG"
     step "created"
   fi
   local w="${AVD_RES%x*}" h="${AVD_RES#*x}"
@@ -589,20 +814,34 @@ PATCH_EOS
 # On this emulator Magisk's own staged copies under /data/adb/magisk land as
 # ZERO-BYTE files, surfacing as "Incomplete Magisk install" and then "Failed to
 # execute BusyBox shell". Refilling them from the APK is what the Magisk app's
-# "Additional Setup" would do with a tap.
+# "Additional Setup" would do with a tap. The libraries are the GUEST's ABI --
+# arm64-v8a on a Mac, x86_64 on an Intel/AMD PC.
+#
+# THE WHOLE SET, not just what the daemon runs. The Magisk app decides
+# "Requires Additional Setup" with env_check (assets/app_functions.sh), which
+# demands boot_patch.sh beside the binaries -- a file nothing here ever needed,
+# so the app offered the setup, and a reboot, on every open of it (measured on
+# Magisk 30.7, which then installed boot_patch.sh, addon.d.sh, init-ld and
+# chromeos/ itself). Copying those too makes env_check pass, so there is nothing
+# to accept and no reboot nobody asked for. Each copy is guarded: an older APK
+# without, say, libinit-ld.so must not leave an empty file behind.
 magisk_complete_env() {
   local W=/data/local/tmp/magiskpatch
   dev "
     mkdir -p /data/adb/magisk
     cd $W
-    cat lib/arm64-v8a/libmagisk.so       > /data/adb/magisk/magisk
-    cat lib/arm64-v8a/libmagiskboot.so   > /data/adb/magisk/magiskboot
-    cat lib/arm64-v8a/libmagiskinit.so   > /data/adb/magisk/magiskinit
-    cat lib/arm64-v8a/libmagiskpolicy.so > /data/adb/magisk/magiskpolicy
-    cat lib/arm64-v8a/libbusybox.so      > /data/adb/magisk/busybox
+    cat lib/${AVD_ABI}/libmagisk.so       > /data/adb/magisk/magisk
+    cat lib/${AVD_ABI}/libmagiskboot.so   > /data/adb/magisk/magiskboot
+    cat lib/${AVD_ABI}/libmagiskinit.so   > /data/adb/magisk/magiskinit
+    cat lib/${AVD_ABI}/libmagiskpolicy.so > /data/adb/magisk/magiskpolicy
+    cat lib/${AVD_ABI}/libbusybox.so      > /data/adb/magisk/busybox
     cat assets/stub.apk                  > /data/adb/magisk/stub.apk
     cat assets/module_installer.sh       > /data/adb/magisk/module_installer.sh
     cat assets/util_functions.sh         > /data/adb/magisk/util_functions.sh
+    [ -f assets/boot_patch.sh ]      && cat assets/boot_patch.sh      > /data/adb/magisk/boot_patch.sh
+    [ -f assets/addon.d.sh ]         && cat assets/addon.d.sh         > /data/adb/magisk/addon.d.sh
+    [ -f lib/${AVD_ABI}/libinit-ld.so ] && cat lib/${AVD_ABI}/libinit-ld.so > /data/adb/magisk/init-ld
+    [ -d assets/chromeos ] && { rm -rf /data/adb/magisk/chromeos; cp -r assets/chromeos /data/adb/magisk/chromeos; }
     chmod 755 /data/adb/magisk/*
     MT=\$($MAGISK --path 2>/dev/null)
     [ -n \"\$MT\" ] && { mkdir -p \$MT/.magisk/busybox
@@ -622,6 +861,7 @@ phase_root() {
     warn "emulator not running — on-device checks skipped (start it, or run without --check)"
     return 0
   fi
+  need_adb
   boot_emulator; step "adb $SER"
 
   say "Magisk"
@@ -633,8 +873,8 @@ phase_root() {
       warn "a newer Magisk ($latest) exists; re-patching can leave the emulator"
       warn "unbootable, so it is opt-in: AVD_REROOT=1 $0"
     fi
-    # magisk_complete_env rewrites eight files under /data/adb/magisk and runs
-    # restorecon, so --check must return BEFORE it.
+    # magisk_complete_env rewrites /data/adb/magisk and runs restorecon, so
+    # --check must return BEFORE it.
     [ "$CHECK_ONLY" -eq 1 ] && return 0
     [ "${AVD_REROOT:-0}" != "1" ] && { magisk_complete_env; return 0; }
   fi
@@ -684,12 +924,30 @@ phase_root() {
   # an interrupted pull straight onto $rd leaves an unbootable emulator.
   run_bounded 300 adb -s "$SER" pull "$W/ramdiskpatched.img" "$rd.new"
   [ -s "$rd.new" ] || { rm -f "$rd.new"; die "the ramdisk patch produced nothing"; }
-  mv -f "$rd.new" "$rd" || die "could not install the patched ramdisk"
-  adb -s "$SER" install -r "$apk" >/dev/null 2>&1
-  # FULL VM restart, not reboot_wait (see restart_emulator): no Magisk module
-  # exists yet, so emu kill has nothing to lose and its `dev sync` still flushes
-  # the APK install above.
-  restart_emulator
+  if mv -f "$rd.new" "$rd" 2>/dev/null; then
+    adb -s "$SER" install -r "$apk" >/dev/null 2>&1
+    # FULL VM restart, not reboot_wait (see restart_emulator): no Magisk module
+    # exists yet, so emu kill has nothing to lose and its `dev sync` still flushes
+    # the APK install above.
+    restart_emulator
+  elif [ "$AP_OS" = windows ]; then
+    # Windows refuses to replace a file another process holds open, and QEMU
+    # may still hold the ramdisk it booted from. Same end state, in the only
+    # order Windows allows: install, stop the VM, swap the file, boot. (Still a
+    # process restart, for the reason above.)
+    step "the running VM holds ramdisk.img — stopping it to swap the patched one in"
+    adb -s "$SER" install -r "$apk" >/dev/null 2>&1
+    dev sync >/dev/null 2>&1
+    run_bounded 30 adb -s "$SER" emu kill
+    local end=$((SECONDS + 60))
+    while [ "$SECONDS" -lt "$end" ] && emu_running; do sleep 2; done
+    emu_running && { ap_emu_kill "$AVD_NAME"; sleep 3; }
+    mv -f "$rd.new" "$rd" || die "could not install the patched ramdisk"
+    EMU_STARTED_BY_US=0
+    boot_emulator
+  else
+    die "could not install the patched ramdisk"
+  fi
   cur="$(magisk_ver)"
   if [ -n "$cur" ]; then step "Magisk active: $cur"; magisk_complete_env
   else warn "Magisk not detected after patching — check $EMU_LOG"; fi
@@ -821,26 +1079,40 @@ phonesky_fetch() {
     rm -f "$PHONESKY_CACHE"
   fi
   step "extracting Phonesky from Google's certified android-$donor_api image (one time, ~2.7 GB)"
+  # Windows: our VM is stopped BEFORE the download, not after -- the image can
+  # bring a newer emulator with it, and the Android CLI replaces the emulator in
+  # place, which must not happen under a running VM (see sdkm). It comes back
+  # below exactly as it does on a Mac.
+  local was_running=0
+  if [ "$AP_OS" = windows ] && emu_running; then
+    was_running=1
+    [ -n "$SER" ] && { dev sync >/dev/null 2>&1; run_bounded 60 adb -s "$SER" emu kill; }
+    local wend=$((SECONDS + 60))
+    while [ "$SECONDS" -lt "$wend" ] && emu_running; do sleep 2; done
+    emu_running && { ap_emu_kill "$AVD_NAME"; sleep 3; }
+    sdk_idle_windows || true
+  fi
   run_bounded 5400 sdkm --install "system-images;android-${donor_api};google_apis_playstore;${AVD_ABI}" \
     || { warn "could not download the certified image"; return 1; }
+  [ -d "$SDK_ROOT/system-images/android-${donor_api}/google_apis_playstore/${AVD_ABI}" ] \
+    || { warn "the certified image did not install"; return 1; }
   local donor="phonesky-donor"
-  rm -rf "$HOME/.android/avd/$donor.avd" "$HOME/.android/avd/$donor.ini"
+  rm -rf "$AVD_HOME/$donor.avd" "$AVD_HOME/$donor.ini"
   echo no | "$AVDM" --silent create avd -n "$donor" \
     -k "system-images;android-${donor_api};google_apis_playstore;${AVD_ABI}" -d "$AVD_DEVICE" \
-    --abi "$AVD_ABI" -p "$HOME/.android/avd/$donor.avd" >/dev/null 2>&1 \
+    --abi "$AVD_ABI" -p "$AVD_HOME/$donor.avd" >>"$LOG" 2>&1 \
     || { warn "could not create the donor emulator"; return 1; }
   # Free our own emulator's memory for the donor, and remember to bring it back.
   # It is killed by its RESOLVED serial, and the donor is then found by ITS name
   # rather than by assuming it inherited the port the other one just released.
-  local was_running=0
+  # (was_running is declared above; on Windows it may already be 1.)
   if emu_running; then
     was_running=1
     [ -n "$SER" ] && run_bounded 60 adb -s "$SER" emu kill
     sleep 6
   fi
-  ANDROID_HOME="$SDK_ROOT" ANDROID_SDK_ROOT="$SDK_ROOT" \
-    nohup "$EMU" -avd "$donor" -no-snapshot -no-boot-anim -no-window \
-      -gpu swiftshader_indirect >>"$EMU_LOG" 2>&1 &
+  ap_spawn_detached "$EMU_LOG" "$EMU" -avd "$donor" -no-snapshot -no-boot-anim -no-window \
+    -gpu swiftshader_indirect
   sleep 25
   run_bounded 60 adb start-server
   local dser="" ok=0 end=$((SECONDS+300))
@@ -864,12 +1136,17 @@ phonesky_fetch() {
   fi
   [ -n "$dser" ] && run_bounded 60 adb -s "$dser" emu kill
   sleep 6
-  pkill -f "qemu-system.*$donor" 2>/dev/null
-  rm -rf "$HOME/.android/avd/$donor.avd" "$HOME/.android/avd/$donor.ini"
+  ap_emu_kill "$donor"
+  # Gone BEFORE its files go: Windows will not delete an image a live QEMU
+  # still has open, and a half-deleted system-images directory makes the next
+  # sdkmanager run believe the donor image is installed.
+  local gend=$((SECONDS + 60))
+  while [ "$SECONDS" -lt "$gend" ] && ap_emu_running "$donor"; do sleep 2; done
+  rm -rf "$AVD_HOME/$donor.avd" "$AVD_HOME/$donor.ini"
   rm -rf "$SDK_ROOT/system-images/android-${donor_api}/google_apis_playstore"
   [ "$was_running" -eq 1 ] && boot_emulator
   if [ -s "$PHONESKY_CACHE" ]; then
-    step "extracted Phonesky ($(( $(/usr/bin/stat -f %z "$PHONESKY_CACHE") / 1048576 )) MB)"
+    step "extracted Phonesky ($(( $(ap_fsize "$PHONESKY_CACHE") / 1048576 )) MB)"
     # RECORD, never refuse, on a LOCAL extraction. These bytes came out of
     # Google's own certified image on this machine a moment ago, so they are the
     # most trustworthy copy available; a mismatch here means the recorded hash
@@ -1040,10 +1317,16 @@ phase_vector() {
 if [ "$STOP_ONLY" -eq 1 ]; then
   say "Stop"
   if emu_running; then
-    dev sync >/dev/null 2>&1
-    run_bounded 30 adb -s "$SER" emu kill
+    # Resolve OUR serial first: with $SER empty, `adb -s "" emu kill` addresses
+    # whichever single device happens to be attached -- or, with two, nothing.
+    need_adb
+    SER="$(ap_emulator_serial "$AVD_NAME")"
+    if [ -n "$SER" ]; then
+      dev sync >/dev/null 2>&1
+      run_bounded 30 adb -s "$SER" emu kill
+    fi
     n=0; while [ "$n" -lt 30 ] && emu_running; do sleep 2; n=$((n+1)); done
-    emu_running && { pkill -f "qemu-system.*$AVD_NAME" 2>/dev/null; sleep 2; }
+    emu_running && { ap_emu_kill "$AVD_NAME"; sleep 2; }
     emu_running && warn "still running" || step "stopped"
   else step "not running"; fi
   exit 0
@@ -1051,8 +1334,9 @@ fi
 
 if [ "$START_ONLY" -eq 1 ]; then
   say "Start"
-  [ -f "$HOME/.android/avd/${AVD_NAME}.avd/config.ini" ] \
+  [ -f "$AVD_HOME/${AVD_NAME}.avd/config.ini" ] \
     || die "no $AVD_NAME emulator yet — run avd-photos-setup first"
+  need_adb
   boot_emulator
   step "ready: $SER"
   [ "$AVD_SPOOF" = "vector" ] && rdev "$VCLI status" 2>/dev/null | sed 's/^/    /' | head -3
@@ -1062,6 +1346,14 @@ fi
 phase_sdk
 phase_avd
 phase_root
+# --check with no emulator running has nothing left it can honestly report:
+# every phase below asks the device, and an unanswered query reads as "Photos
+# is NOT present" or "Play Store not installed" -- findings, not absences.
+if [ "$CHECK_ONLY" -eq 1 ] && [ -z "$SER" ]; then
+  say "Summary"
+  warn "on-device checks skipped: the emulator is not running (avd-start, then run this again)"
+  exit 0
+fi
 phase_zygisk
 phase_modules
 phase_vector
@@ -1092,7 +1384,7 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
   # Store) succeeded, and the emulator is rooted with its spoof in place. A run
   # that died earlier leaves no marker, so the login bootstrap resumes it.
   if [ "$PLAYSTORE_OK" -eq 1 ] && [ -n "$(magisk_ver)" ] \
-     && [ -f "$HOME/.android/avd/${AVD_NAME}.avd/config.ini" ]; then
+     && [ -f "$AVD_HOME/${AVD_NAME}.avd/config.ini" ]; then
     date +%s > "$SETUP_DONE"
   else
     rm -f "$SETUP_DONE"

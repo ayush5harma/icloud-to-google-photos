@@ -13,14 +13,19 @@
 #
 # NOTHING HERE READS A MACHINE-SPECIFIC PATH. Every location a deployment could
 # want elsewhere is a key with a default, so the project runs from a clone on any
-# Mac and a configuration manager can write the config file instead.
+# Mac or Windows PC and a configuration manager can write the config file instead.
+#
+# THE OS DIFFERENCES LIVE IN lib/os.sh, sourced first: it normalises HOME on
+# Windows, and every default below is derived from HOME.
+# shellcheck disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/os.sh"
 
 # Where the config, the arming sentinel, the ledgers and the logs live. These
 # three are environment-only (a config file cannot move the file that defines
 # them), so an automated test can point the whole pipeline at a scratch HOME.
-CONFIG_DIR="${AVD_PHOTOS_CONFIG_DIR:-$HOME/.config/avd-photos}"
-STATE_DIR="${AVD_PHOTOS_STATE_DIR:-$HOME/.cache/avd-photos}"
-LOG_DIR="${AVD_PHOTOS_LOG_DIR:-$STATE_DIR/logs}"
+CONFIG_DIR="$(ap_mixed "${AVD_PHOTOS_CONFIG_DIR:-$HOME/.config/avd-photos}")"
+STATE_DIR="$(ap_mixed "${AVD_PHOTOS_STATE_DIR:-$HOME/.cache/avd-photos}")"
+LOG_DIR="$(ap_mixed "${AVD_PHOTOS_LOG_DIR:-$STATE_DIR/logs}")"
 CONFIG_FILE="$CONFIG_DIR/config"
 # The pipeline is DORMANT until this file exists (avd-photos-arm creates it).
 # Everything else can be installed, scheduled and running; nothing touches the
@@ -33,11 +38,16 @@ SENTINEL="$CONFIG_DIR/ENABLED"
 # Sources/main.swift too.
 # shellcheck disable=SC2034  # read by the scripts that source this file
 AP_LABEL_PREFIX="com.ayushsharma.icloud-to-google-photos"
+# The Windows twin: the Task Scheduler folder install.ps1 registers the tasks
+# in (\<folder>\sync, \setup, \bootstrap, \tray). The tray app runs
+# \<folder>\sync by name, so changing it means changing windows/PhotoSync too.
+# shellcheck disable=SC2034  # read by the scripts that source this file
+AP_TASK_FOLDER="icloud-to-google-photos"
 
 # Every key the config file may set. Used for the precedence restore above, and
 # it is the list the README documents.
 AP_KEYS="ICLOUD_USERNAME ICLOUDPD STAGING ICLOUD_DIR SHARED_CACHE_DIR
-         GOOGLE_ACCOUNT AVD_NAME AVD_SDK_ROOT AVD_ABI AVD_TAG AVD_DEVICE
+         GOOGLE_ACCOUNT AVD_NAME AVD_SDK_ROOT AVD_HOME AVD_ABI AVD_TAG AVD_DEVICE
          AVD_RES AVD_DPI AVD_RAM AVD_CORES AVD_DISK AVD_HEAP AVD_GPU AVD_SPOOF
          RECENT UNTIL_FOUND PUSH_CAP UPLOAD_WAIT ADB_TIMEOUT RECLAIM_TIMEOUT
          DELETE_FROM_ICLOUD KEEP_ICLOUD_DAYS PRUNE_DEVICE_AFTER_UPLOAD
@@ -63,9 +73,13 @@ ap_defaults() {
   # child of the app bundle.
   STAGING="${STAGING:-$HOME/Pictures/icloud-photos-staging}"
   # iCloud Drive's root, used for ONE thing: the default home of the shared
-  # cache below, so a second Mac with the same iCloud account skips the 2.7 GB
-  # Play Store extraction.
-  ICLOUD_DIR="${ICLOUD_DIR:-$HOME/Library/Mobile Documents/com~apple~CloudDocs}"
+  # cache below, so a second machine with the same iCloud account skips the
+  # 2.7 GB Play Store extraction. iCloud for Windows puts it at ~/iCloudDrive.
+  if [ "$AP_OS" = windows ]; then
+    ICLOUD_DIR="${ICLOUD_DIR:-$HOME/iCloudDrive}"
+  else
+    ICLOUD_DIR="${ICLOUD_DIR:-$HOME/Library/Mobile Documents/com~apple~CloudDocs}"
+  fi
   SHARED_CACHE_DIR="${SHARED_CACHE_DIR:-$ICLOUD_DIR/avd-photos}"
   # The Google account the emulator signs in as. Unset by default; it is only
   # printed, as a reminder of which account to register the device under.
@@ -78,7 +92,13 @@ ap_defaults() {
   # root is writable and owned by the pipeline (it is also what ANDROID_HOME is
   # set to when the emulator and avdmanager are invoked).
   AVD_SDK_ROOT="${AVD_SDK_ROOT:-$HOME/.local/share/android-avd-sdk}"
-  AVD_ABI="${AVD_ABI:-arm64-v8a}"
+  # Where the emulator's own directory lives (ANDROID_AVD_HOME). The default is
+  # the Android tools' own default; it is a key because the emulator's userdata
+  # image is AVD_DISK large, and a laptop's system drive is often the small one.
+  AVD_HOME="${AVD_HOME:-$HOME/.android/avd}"
+  # What this HOST runs accelerated (ap_host_abi, lib/os.sh): arm64-v8a on Apple
+  # silicon, x86_64 on an Intel or AMD PC.
+  AVD_ABI="${AVD_ABI:-$(ap_host_abi)}"
   # google_apis, never google_apis_playstore: the certified image is a `user`
   # build with adb root disabled and stronger verified boot, which resists
   # ramdisk patching and defeats device spoofing outright. google_apis is
@@ -93,8 +113,21 @@ ap_defaults() {
   # would flip it to the phone UI -- the opposite of the intuition.
   AVD_RES="${AVD_RES:-2560x1440}"
   AVD_DPI="${AVD_DPI:-210}"
-  AVD_RAM="${AVD_RAM:-6144}"        # guest RSS sits around 4 GB
-  AVD_CORES="${AVD_CORES:-8}"       # the performance-core count on an M2 Pro
+  # A Windows PC is anything from a 4-core, 8 GB laptop up, and a guest that
+  # asks for more than the host can spare boots slower than a smaller one, or not
+  # at all under WHPX. So there the defaults are a share of the host: a third of
+  # its memory (whole GB, 3-6 GB) and half its logical processors (2-8).
+  if [ "$AP_OS" = windows ]; then
+    local _mb _nc
+    _mb="$(ap_host_mem_mb)"; _nc="$(nproc 2>/dev/null || echo 4)"
+    _mb=$(( _mb / 3 / 1024 * 1024 )); [ "$_mb" -lt 3072 ] && _mb=3072; [ "$_mb" -gt 6144 ] && _mb=6144
+    _nc=$(( _nc / 2 )); [ "$_nc" -lt 2 ] && _nc=2; [ "$_nc" -gt 8 ] && _nc=8
+    AVD_RAM="${AVD_RAM:-$_mb}"
+    AVD_CORES="${AVD_CORES:-$_nc}"
+  else
+    AVD_RAM="${AVD_RAM:-6144}"        # guest RSS sits around 4 GB
+    AVD_CORES="${AVD_CORES:-8}"       # the performance-core count on an M2 Pro
+  fi
   AVD_DISK="${AVD_DISK:-16384M}"
   # Per-app Dalvik heap. The emulator default (192M) is phone-class and makes
   # Google Photos garbage-collect continuously on large originals.
@@ -177,8 +210,30 @@ ap_load_config() {
   # Deliberately NOT a second ap_defaults pass here: every key already has a
   # value, and a re-run would overwrite a key the config file set to an empty
   # string (KEEP_ICLOUD_DAYS= means "no floor", not "use the default").
+  #
+  # Windows: every path key in the one form bash, cygwin and native programs all
+  # read (lib/os.sh). A config written by hand says `STAGING="D:\Photos"` as
+  # often as `/d/Photos`, and the staging prefix is stripped off `find` output
+  # by exact string match, so the two must never be mixed.
+  if [ "$AP_OS" = windows ]; then
+    for k in STAGING ICLOUD_DIR SHARED_CACHE_DIR AVD_SDK_ROOT AVD_HOME; do
+      eval "v=\${$k}"
+      [ -n "$v" ] && eval "$k=\$(ap_mixed \"\$v\")"
+    done
+  fi
   mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$LOG_DIR" 2>/dev/null
+  ap_android_env
   return 0
+}
+
+# ap_android_env: point every Android tool at the pipeline's OWN SDK and
+# emulator directory, whatever the machine already had. The emulator, avdmanager
+# and adb all consult these, and a pre-existing ANDROID_HOME (an Android Studio
+# install, say) would otherwise have avdmanager resolve the system image against
+# a different SDK -- "Package path is not valid" -- or the emulator boot an image
+# this pipeline never rooted.
+ap_android_env() {
+  export ANDROID_HOME="$AVD_SDK_ROOT" ANDROID_SDK_ROOT="$AVD_SDK_ROOT" ANDROID_AVD_HOME="$AVD_HOME"
 }
 
 # ap_seed_path [extra-dir ...]: launchd hands a job a sparse PATH that has
@@ -189,9 +244,19 @@ ap_load_config() {
 # -- a pipeline that looked healthy and had done nothing (measured 2026-09-05).
 # The system tail is appended once, at the end, so /usr/bin, /bin, /usr/sbin and
 # /sbin are always reachable.
+#
+# Windows: ~/.local/bin is where uv puts icloudpd.exe and where install.ps1 puts
+# jq.exe, and Git's /usr/bin goes straight after it, ahead of the inherited
+# Windows PATH -- System32 has its own `find` and `sort`, which a job started by
+# Task Scheduler would otherwise reach first and which mean something else
+# entirely. Entries are converted to /c/... form (lib/os.sh).
 ap_seed_path() {
   local _extra="" _d
-  for _d in "$@"; do _extra="$_extra:$_d"; done
+  for _d in "$@"; do _extra="$_extra:$(ap_posix "$_d")"; done
+  if [ "$AP_OS" = windows ]; then
+    export PATH="$(ap_posix "$HOME")/.local/bin:/usr/bin:/mingw64/bin${_extra}:$PATH"
+    return 0
+  fi
   local _tail="/usr/bin:/bin:/usr/sbin:/sbin"
   case "$PATH" in
     *"$_tail") ;;                 # a second call in the same shell
@@ -199,6 +264,24 @@ ap_seed_path() {
   esac
   export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin${_extra}:$PATH"
 }
+
+# python3 on Windows is uv's managed interpreter, never whatever `python3`
+# resolves to: on a stock install that is the Microsoft Store's App Execution
+# Alias, which prints an advert and exits 9009, and on a used one it is any
+# Python at all. uv is already a requirement (the iCloud reclaim runs through it),
+# and the version is the one the reclaim pins.
+#
+# Native Windows programs write text-mode stdout, "\r\n" per line, and `$(...)`
+# strips the "\n" but keeps the "\r": a tag read as "v30.7\r" matches no stamp
+# and builds a download URL curl rejects. So both wrappers here hand back LF.
+# (jq's own switch for that is --binary; Python has none, hence the tr.)
+if [ "$AP_OS" = windows ]; then
+  # PYTHONUTF8: Windows' console default is cp1252, and a staged path outside it
+  # would otherwise raise UnicodeEncodeError on the way out.
+  # Python's status, not tr's, whether or not the caller set pipefail.
+  python3() { PYTHONUTF8=1 uv run -q --no-project --python 3.13 python "$@" | tr -d '\r'; return "${PIPESTATUS[0]}"; }
+  jq() { command jq --binary "$@"; }
+fi
 
 # ap_write_default_config [path]: the commented default config. Never overwrites
 # (the caller decides), and it is the ONE definition of that file -- both
@@ -217,6 +300,8 @@ ap_write_default_config() {
 #
 # QUOTE ANY PATH WITH A SPACE OR A BRACKET IN IT. Unquoted, `STAGING=/a/[05] b`
 # parses as an assignment plus a bogus command and the value is silently lost.
+# On Windows any spelling works -- "D:\Photos", "D:/Photos" or /d/Photos -- as
+# long as it is quoted.
 
 # ── Required ────────────────────────────────────────────────────────────────
 # The Apple ID icloudpd downloads with. The sync refuses to run without it.
@@ -236,10 +321,15 @@ ICLOUD_USERNAME=
 # The pipeline's own writable Android SDK (its ANDROID_HOME). It must be
 # writable: rooting rewrites the system image's ramdisk.img in place.
 #AVD_SDK_ROOT="$HOME/.local/share/android-avd-sdk"
-# host = Metal, fast, and CANNOT render Google's sign-in page. Use avd-signin
-# (software GL) for the one-time sign-in and leave this alone.
+# The emulator's own directory. Its data partition is AVD_DISK large, so on a PC
+# with a small system drive put both of these on a bigger one.
+#AVD_HOME="$HOME/.android/avd"
+# host = the host GPU (Metal on a Mac), fast, and on a Mac CANNOT render
+# Google's sign-in page. Use avd-signin (software GL) for the one-time sign-in
+# and leave this alone.
 #AVD_GPU=host
-# Guest tuning. Defaults are sized for an 8-performance-core, 16 GB Mac.
+# Guest tuning. Defaults are sized for an 8-performance-core, 16 GB Mac; on
+# Windows they are a third of the host's memory and half its processors.
 #AVD_RAM=6144
 #AVD_CORES=8
 #AVD_DISK=16384M
@@ -279,14 +369,34 @@ CFGEOF
   # nothing when the file was already there: chmod as well.
   chmod 600 "$out" 2>/dev/null
   umask "$old"
+  # chmod means nothing on NTFS; the ACL is the Windows equivalent.
+  [ "$AP_OS" = windows ] && ap_secure_config "$out"
   return "$rc"
 }
 
 # ap_secure_config [path]: make an existing config 0600. For an installer or a
 # configuration manager that wrote one itself.
+#
+# Windows has no mode bits (chmod is a no-op on NTFS); the equivalent is an ACL
+# with inheritance cut and one entry, for this user. A file under the profile is
+# already private to its owner by inheritance -- this makes that explicit, so
+# the file stays private when the config directory is moved somewhere shared.
 ap_secure_config() {
   local out="${1:-$CONFIG_FILE}"
   [ -f "$out" ] || return 0
+  if [ "$AP_OS" = windows ]; then
+    local w acl
+    w="$(cygpath -w "$out")"
+    acl="$(icacls.exe "$w" 2>/dev/null | tr -d '\r')"
+    # Tight = no inherited entry "(I)" and no principal but this user.
+    if ! printf '%s\n' "$acl" | grep -q '(I)' \
+       && [ "$(printf '%s\n' "$acl" | grep -c ':(')" -eq 1 ] \
+       && printf '%s\n' "$acl" | grep -qi "\\\\${USERNAME}:"; then
+      return 0
+    fi
+    icacls.exe "$w" //inheritance:r //grant:r "${USERNAME}:F" >/dev/null 2>&1 && return 10
+    return 0
+  fi
   case "$(/usr/bin/stat -f %Lp "$out" 2>/dev/null)" in
     600) return 0 ;;
     *) chmod 600 "$out" 2>/dev/null && return 10 ;;   # 10 = "it was looser, now fixed"

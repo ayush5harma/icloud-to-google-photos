@@ -4,6 +4,9 @@
 #   avd-photos-config --force    overwrite an existing one (the old one is kept
 #                                beside it as config.bak)
 #   avd-photos-config --paths    print the resolved locations and change nothing
+#   avd-photos-config --ensure   write it only if it does not exist and make it
+#                                private, one line each -- for an installer or a
+#                                configuration manager (install.ps1 uses it)
 
 set -uo pipefail
 
@@ -21,6 +24,16 @@ case "${1:-}" in
     printf 'staging    %s\n' "$STAGING"
     printf 'sdk root   %s\n' "$AVD_SDK_ROOT"
     printf 'emulator   %s\n' "$AVD_NAME"
+    printf 'avd home   %s\n' "$AVD_HOME"
+    exit 0 ;;
+  --ensure)
+    if [ -f "$CONFIG_FILE" ]; then printf 'keeping %s\n' "$CONFIG_FILE"
+    else ap_write_default_config || { echo "could not write $CONFIG_FILE" >&2; exit 1; }
+         printf 'wrote %s\n' "$CONFIG_FILE"; fi
+    # It holds an Apple ID and may hold a GITHUB_TOKEN, whoever wrote it.
+    ap_secure_config
+    [ $? -eq 10 ] && printf 'made %s private to you (it holds an Apple ID)\n' "$CONFIG_FILE"
+    [ -n "$ICLOUD_USERNAME" ] || printf 'SET ICLOUD_USERNAME in %s before arming.\n' "$CONFIG_FILE"
     exit 0 ;;
   --force)
     [ -f "$CONFIG_FILE" ] && cp -f "$CONFIG_FILE" "$CONFIG_FILE.bak" \
@@ -36,5 +49,5 @@ case "${1:-}" in
     fi
     cat "$CONFIG_FILE" ;;
   *)
-    echo "usage: ${0##*/} [--force|--paths]" >&2; exit 2 ;;
+    echo "usage: ${0##*/} [--force|--paths|--ensure]" >&2; exit 2 ;;
 esac

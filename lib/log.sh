@@ -19,7 +19,7 @@ log_init() {
   local _file="$1"
   local _max="${2:-5242880}"
   mkdir -p "$(dirname "$_file")" 2>/dev/null
-  if [ -f "$_file" ] && [ "$(/usr/bin/stat -f %z "$_file" 2>/dev/null || echo 0)" -gt "$_max" ]; then
+  if [ -f "$_file" ] && [ "$(ap_fsize "$_file")" -gt "$_max" ]; then
     mv -f "$_file" "$_file.1"
   fi
 }
