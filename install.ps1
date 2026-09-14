@@ -396,7 +396,7 @@ Next, in a NEW terminal (so PATH has the commands), in order:
   2. icloudpd --username <your apple id> --directory "$staging" --recent 1
                                 the one-time Apple login (two-factor, interactive)
   3. avd-photos-setup           build the rooted emulator (long, downloads GBs)
-  4. avd-signin                 boot it in software GL and sign in to Google;
+  4. avd-signin                 boot it in sign-in mode and sign in to Google;
                                 register the device id the setup printed at
                                 https://www.google.com/android/uncertified/
   5. avd-photos-check           confirm Magisk, Zygisk, the spoof and Photos
