@@ -4,6 +4,11 @@
 *.icon/
 *.iconset/
 
+# The Windows tray app's build output; windows\build.ps1 publishes into
+# %LOCALAPPDATA%\Programs\Photo Sync, never into the checkout.
+windows/PhotoSync/bin/
+windows/PhotoSync/obj/
+
 # macOS
 .DS_Store
 
