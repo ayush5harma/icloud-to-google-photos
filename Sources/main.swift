@@ -110,11 +110,16 @@ if cliArgs.first == "--run" {
 // "Check iCloud now" kickstarts <prefix>.sync so the run is launchd's child and
 // a restart of this app cannot kill it mid-push.
 let labelPrefix = "com.ayushsharma.icloud-to-google-photos"
+// Where gphotos-mac-setup installs Google Photos for iPhone/iPad (GPHOTOS_APP
+// in lib/config.sh; the environment override is honoured here too).
+let gphotosApp = ProcessInfo.processInfo.environment["GPHOTOS_APP"] ?? "/Applications/GooglePhotos.app"
 
 // MARK: - Model
 
 struct Stats {
     var armed = false, emulator = false
+    var backend = "avd"      // "mac": Google Photos for iPhone/iPad on this Mac; "avd": the emulator
+    var app = false, appOnline = false, signedIn = false   // the Mac backend's app, from the bridge heartbeat
     var staged = 0, remaining = 0, onDevice = 0, uploaded = 0, queued = 0, failed = 0
     var uploadAge = -1
     var confirmed = false    // last-upload-confirmed stamp present
@@ -383,6 +388,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var s = Stats()
         s.armed = b["armed"] as? Bool ?? false
         s.emulator = b["emulator"] as? Bool ?? false
+        s.backend = b["backend"] as? String ?? "avd"
+        s.app = b["app"] as? Bool ?? false
+        s.appOnline = b["app_online"] as? Bool ?? false
+        s.signedIn = b["signed_in"] as? Bool ?? false
         s.staged = b["staged"] as? Int ?? 0
         s.remaining = b["remaining"] as? Int ?? 0
         s.onDevice = b["on_device"] as? Int ?? 0
@@ -585,7 +594,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         m.addItem(.separator())
         mono(m, "Staged", "\(stats.staged)")
         mono(m, "Backlog", stats.remaining == 0 ? "caught up" : "\(stats.remaining)")
-        if stats.emulator || stats.onDevice > 0 {
+        if stats.backend == "mac" {
+            if stats.onDevice > 0 { mono(m, "Uploading", "\(stats.onDevice) waiting on Google") }
+        } else if stats.emulator || stats.onDevice > 0 {
             mono(m, "On device", "\(stats.onDevice)\(stats.queued > 0 ? " (\(stats.queued) queued)" : "")")
         }
         // The count belongs to the batch the status was written for: once a newer
@@ -599,10 +610,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         mono(m, "Verified", verified)
         mono(m, "iCloud", "\(stats.reclaimed) freed\(stats.reclaimPending > 0 ? " · \(stats.reclaimPending) confirmed, pending" : "")")
         mono(m, "Last run", stats.running ? "running now" : relAge(stats.lastRunAge))
-        mono(m, "Emulator", stats.emulator ? "running" : "stopped")
+        if stats.backend == "mac" {
+            // The app uploads only while it has a visible window and a network
+            // (the engine's own rule), so a hidden window is worth a line: the
+            // sync launches it in the background and never brings it forward.
+            let state: String
+            if !stats.app { state = "not running" }
+            else if !stats.signedIn { state = "running · not signed in" }
+            else if stats.appOnline { state = "running" }
+            else { state = stats.onDevice > 0 ? "running · window hidden, uploads paused" : "running · window hidden" }
+            mono(m, "Google Photos", state)
+        } else {
+            mono(m, "Emulator", stats.emulator ? "running" : "stopped")
+        }
 
         m.addItem(.separator())
-        if FileManager.default.fileExists(atPath: "/Applications/Google Photos (AVD).app") {
+        if stats.backend == "mac" {
+            if FileManager.default.fileExists(atPath: gphotosApp) {
+                action(m, "Open Google Photos", #selector(openGPhotos))
+            }
+        } else if FileManager.default.fileExists(atPath: "/Applications/Google Photos (AVD).app") {
             action(m, "Open Google Photos (AVD)", #selector(openAVD))
         }
         // Manual iCloud reclaim. Offered ONLY once Google Photos' own database
@@ -682,6 +709,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     @objc private func quit() { NSApp.terminate(nil) }
     @objc private func openAVD() { NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/Google Photos (AVD).app")) }
+    @objc private func openGPhotos() { NSWorkspace.shared.open(URL(fileURLWithPath: gphotosApp)) }
 }
 
 let app = NSApplication.shared

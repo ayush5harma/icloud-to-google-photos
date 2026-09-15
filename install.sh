@@ -137,7 +137,7 @@ SOURCE_BIN="$SRC_DIR/bin"
 if [ "$LINK" -eq 0 ]; then
   rm -rf "$LIBEXEC"
   mkdir -p "$LIBEXEC" || exit 1
-  cp -R "$SRC_DIR/bin" "$SRC_DIR/lib" "$LIBEXEC/" || exit 1
+  cp -R "$SRC_DIR/bin" "$SRC_DIR/lib" "$SRC_DIR/ios" "$LIBEXEC/" || exit 1
   SOURCE_BIN="$LIBEXEC/bin"
   say "copied bin/ and lib/ to $LIBEXEC"
 fi

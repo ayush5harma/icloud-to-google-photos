@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
-# The sync job: pull new iCloud photos and hand them to Google Photos in the
-# (Pixel-spoofed) rooted tablet emulator, which backs them up. Run every 15
-# minutes and at login by the sync launchd agent, and from the menu bar's
-# "Check iCloud now". Dormant until the arming sentinel exists (avd-photos-arm).
+# The sync job: pull new iCloud photos and hand them to Google Photos, which
+# backs them up. Run every 15 minutes and at login by the sync launchd agent,
+# and from the menu bar's "Check iCloud now". Dormant until the arming sentinel
+# exists (avd-photos-arm).
 #
-# Flow: icloudpd -> staging -> push into DCIM/Camera -> media rescan -> Photos
-# backup -> each dedup_key appears in Photos' own remote_media -> the emulator
-# copy is pruned -> the CONFIRMED items leave iCloud.
+# Two backends (PHOTOS_BACKEND, lib/config.sh), one pipeline around them:
+#   mac (Apple silicon)  icloudpd -> staging -> copied into the folder the
+#       Google Photos for iPhone/iPad app watches (ios/gp-bridge.m) -> its
+#       GoToHP engine uploads -> Google's media key comes back per file ->
+#       the CONFIRMED items leave iCloud. lib/mac.sh.
+#   avd (Intel)  icloudpd -> staging -> push into the (Pixel-spoofed) rooted
+#       emulator's DCIM/Camera -> media rescan -> Photos backup -> each
+#       dedup_key appears in Photos' own remote_media -> the emulator copy is
+#       pruned -> the CONFIRMED items leave iCloud. Steps 2-5 below.
 #
 # WHY A LEDGER AND NOT `find -mtime`: icloudpd stamps each file with the PHOTO's
 # creation date, not the download time, so "what changed in the last two days"
@@ -24,6 +30,9 @@ LIB_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BAS
 . "$LIB_DIR/proc.sh"
 
 ap_load_config
+# After the config: the Mac backend's paths are config keys.
+# shellcheck disable=SC1091
+. "$LIB_DIR/mac.sh"
 
 LEDGER="$STATE_DIR/pushed.list"
 # Staged paths Google Photos has confirmed (fed ONLY by the prune step), and the
@@ -288,12 +297,17 @@ fi
 
 # ── Dormancy + prerequisites ─────────────────────────────────────────────────
 [ -f "$SENTINEL" ] || { log "not armed (no $SENTINEL) — skipping"; exit 0; }
-[ -d "$HOME/.android/avd/${AVD_NAME}.avd" ] || fail "no $AVD_NAME emulator — run avd-photos-setup"
-command -v adb >/dev/null 2>&1 || fail "adb missing from PATH"
+case "$PHOTOS_BACKEND" in
+  mac) [ -d "$GPHOTOS_APP" ] || fail "Google Photos is not installed at $GPHOTOS_APP — run gphotos-mac-setup" ;;
+  avd)
+    [ -d "$HOME/.android/avd/${AVD_NAME}.avd" ] || fail "no $AVD_NAME emulator — run avd-photos-setup"
+    command -v adb >/dev/null 2>&1 || fail "adb missing from PATH" ;;
+  *) fail "PHOTOS_BACKEND must be mac or avd, not '$PHOTOS_BACKEND'" ;;
+esac
 command -v "$ICLOUDPD" >/dev/null 2>&1 || fail "icloudpd ($ICLOUDPD) missing from PATH"
 [ -n "$ICLOUD_USERNAME" ] || fail "ICLOUD_USERNAME unset in $CONFIG_FILE"
 
-log "start (user $ICLOUD_USERNAME)"
+log "start (user $ICLOUD_USERNAME, backend $PHOTOS_BACKEND)"
 phase "starting"
 
 # ── 1. icloudpd: download NEW originals into staging ─────────────────────────
@@ -350,6 +364,16 @@ elif grep -qiE "EOFError|ask_password_in_console|Failed to execute script" "$LOG
   log "  continuing with whatever is already staged"
 else
   log "icloudpd rc=$rc (often just 'no new items' or needs re-auth) — continuing"
+fi
+
+# ── 2-5 on Apple silicon: Google Photos for Mac ──────────────────────────────
+# No virtual machine to keep off, so no quiet-tick gate: a tick with nothing new
+# is one listing and a read of the bridge's ledger.
+if [ "$PHOTOS_BACKEND" = mac ]; then
+  mac_sync
+  if [ "$DELETE_FROM_ICLOUD" = "1" ] && [ -s "$RECLAIM_PENDING" ]; then reclaim_icloud; fi
+  log "done ($MAC_HANDED handed to Google Photos this run)"
+  exit 0
 fi
 
 # ── 2. Anything for the emulator? ────────────────────────────────────────────
