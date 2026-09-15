@@ -5,20 +5,31 @@ then reclaims the iCloud space, on a Mac, with no taps.
 
 Every fifteen minutes it downloads new originals from iCloud with
 [icloudpd](https://github.com/icloud-photos-downloader/icloud_photos_downloader),
-pushes them into a rooted Android emulator whose device fingerprint is spoofed to
-a Pixel, waits for Google Photos to actually upload them, checks each upload
-against Google Photos' own database, and only then deletes those exact photos
+hands them to a Google Photos that uploads them as a 2016 Pixel would, waits for
+Google to actually confirm each one, and only then deletes those exact photos
 from iCloud. A menu-bar ring shows which stage the current batch is in.
 
-The reason for the emulator is the only interesting part: Google Photos gives
-original-quality backup, with no counting against Google One storage, to a 2016
-Pixel. A rooted Android emulator running a Magisk module that spoofs those device
-fields is treated as one. Everything else here exists to make that reliable and
-to make sure nothing leaves iCloud before it is provably somewhere else.
+The Pixel is the only interesting part: Google Photos gives original-quality
+backup, with no counting against Google One storage, to a 2016 Pixel. There are
+two ways to be one, and the Mac's CPU picks:
 
-**Read "What this actually is" before installing.** This is a spoof of a device
-Google no longer sells, running on a rooted emulator, backing up photographs you
-probably cannot re-take. It is built to fail safe, but it is not a product.
+- **Apple silicon: Google Photos for iPhone and iPad, running natively on the
+  Mac.** The App Store IPA, converted to a Mac app by
+  [ipa-install-on-mac](https://github.com/ayush5harma/ipa-install-on-mac), with
+  the [Gunshot](https://github.com/tqmane/gunshot) tweak inside it: Gunshot's
+  GoToHP engine uploads through Google's own API with a Pixel XL profile, and
+  this project's `ios/gp-bridge.m` feeds that engine from a folder. No
+  emulator, no root, no device registration, a 30-second run for a small batch.
+- **Intel: a rooted Android emulator** whose device fingerprint is spoofed to a
+  Pixel by a Magisk module, with Google Photos for Android backing up from its
+  camera folder. An Intel Mac cannot run an iOS app, so this is its only path.
+
+Everything else here exists to make that reliable and to make sure nothing
+leaves iCloud before it is provably somewhere else.
+
+**Read "What this actually is" before installing.** Either way this is a spoof
+of a device Google no longer sells, backing up photographs you probably cannot
+re-take. It is built to fail safe, but it is not a product.
 
 ---
 
@@ -133,6 +144,64 @@ pipeline becomes a one-way copier.
 ---
 
 ## How it works
+
+### On Apple silicon: Google Photos for Mac
+
+```
+  iCloud ──icloudpd──> staging dir ──cp──> ~/Pictures/Google Photos Upload/
+                                                        │
+                                       gp-bridge (inside Google Photos):
+                                       begin / append / seal into GoToHP
+                                                        │
+                                          GoToHP uploads, Google replies
+                                          with a media key per item
+                                                        │
+                                   ledger.json: name -> state, media key
+                                                        │
+                                              delete from iCloud
+```
+
+1. **`icloudpd` first**, exactly as below.
+2. **Hand over** every staged file the Mac ledger has not seen, up to
+   `PUSH_CAP` and `MAC_INBOX_MAX` waiting at once: a copy (`cp -p`, so the
+   photo keeps its date, which becomes the item's timestamp) written under a
+   dot-name and renamed into place, named after the staged path
+   (`2026/05/IMG_2885.HEIC` -> `2026_05_IMG_2885.HEIC`) so the ledger maps every
+   name back exactly. The staging tree is never touched.
+3. **Google Photos is launched in the background** (`open -g`) if it is not
+   running. The bridge inside it scans the folder every 3 s, waits for a file's
+   inode to be quiet for 5 s, pairs a Live Photo's still and video by stem, and
+   imports each item into the engine, which uploads it with the Pixel XL
+   original-quality profile. The engine uploads only while the app has a
+   visible window and a network; the menu bar says so when it cannot.
+4. **Verify.** The engine's job state, read through `.bridge/ledger.json`. A
+   file is confirmed when its job **completed with a media key** - the reply
+   of Google's own commit call - and the bridge moves it to `Uploaded/`. The
+   sync records the confirmation, puts the staged path on the reclaim list, and
+   deletes the moved copy. A job the engine gave up on lands in `Failed/`; the
+   sync hands the file over again on a later run, three times, then leaves it.
+   `remote_live_photo_component_exists` - Google already holds one half of a
+   Live Photo pair, by hash - is neither: the pair goes on `mac-exists.list`
+   and stays in iCloud, because which half matched is not reported.
+5. **Reclaim iCloud space** for exactly the confirmed paths, the same step as
+   the emulator's.
+
+**Duplicates.** The engine fingerprints every import (sizes and content
+hashes): a second drop of the same bytes is cancelled and the first job's
+result is used. Google deduplicates by content on its side too: forcing bytes
+it already holds came back with the *same* media key, not a second item. A
+file the emulator path had already confirmed is not re-sent at all: the first
+Mac run marks everything on the reclaim lists as handled.
+
+**Install it with `gphotos-mac-setup`** (the login agent does; `--check`
+reports): it downloads the IPA named by `GPHOTOS_IPA_URL` - Google Photos
+7.92.0 with `GunshotJailed.dylib` injected, a release asset of this repo -
+verifies `GPHOTOS_IPA_SHA256`, and runs `ipa-install-on-mac <ipa> --dylib
+ios/gp-bridge.m`. A reinstall keeps the sign-in. The app is sandboxed: it
+reads and writes `~/Pictures` and its own container, nothing else of yours.
+Then open it once and sign in to Google; that is the whole human part.
+
+### On Intel: the rooted emulator
 
 ```
   iCloud ──icloudpd──> staging dir ──adb push──> emulator DCIM/Camera
@@ -267,20 +336,24 @@ ignore it.
 
 ## Requirements
 
-- **Apple silicon Mac, macOS 14 or newer.** The emulator is `arm64-v8a` and the
-  tuning defaults assume roughly 8 performance cores and 16 GB.
-- **Xcode Command Line Tools** (`xcode-select --install`) for `swiftc`. Full
-  Xcode is optional: with it, the app icon gets light and dark variants through
-  `actool`; without it, a light-only `.icns`.
-- **Android SDK command-line tools** - `sdkmanager` on PATH is enough to
+- **macOS 14 or newer.** Apple silicon runs Google Photos for Mac; Intel runs
+  the emulator (`x86_64` image; the tuning defaults assume roughly 8 cores and
+  16 GB).
+- **Apple silicon: Xcode** (the bridge is compiled for Mac Catalyst against the
+  macOS SDK, which the Command Line Tools alone do not carry), and about 600 MB
+  of disk for the app.
+- **Intel: Xcode Command Line Tools** (`xcode-select --install`) for `swiftc`.
+  Full Xcode is optional: with it, the app icon gets light and dark variants
+  through `actool`; without it, a light-only `.icns`.
+- **Intel: Android SDK command-line tools** - `sdkmanager` on PATH is enough to
   bootstrap. Everything else (the emulator, platform-tools, the system image) is
   downloaded by `avd-photos-setup` into its own writable SDK root. It must be
   writable: rooting rewrites `ramdisk.img` in place.
 - **`uv` and `icloudpd`**: `uv tool install icloudpd`.
 - **`jq`, `curl`, `python3`** (`python3` is macOS's own), and `sqlite3` (macOS
   ships it).
-- **A Google account** you are willing to sign in to on a rooted emulator, and an
-  **Apple ID** for icloudpd.
+- **A Google account** you are willing to sign in to on a modified Google
+  Photos, and an **Apple ID** for icloudpd.
 - **Google Drive for Desktop** only if you put the staging directory on Drive.
 - About **30 GB of disk** for the SDK, the system image and the emulator's data
   partition, plus whatever the staging tree holds at its peak.
@@ -313,17 +386,19 @@ Then, in order:
 2. `icloudpd --username <your apple id> --directory <staging> --recent 1` - the
    one-time interactive Apple login, including two-factor. Nothing unattended can
    do this, and without it every run says "no saved session".
-3. `avd-photos-setup` - builds the whole rooted stack. This is long (a multi-GB
-   system image, a rooted ramdisk, three reboots, and the Play Store extraction)
-   and it is resumable: the "done" marker is written only after the last phase
-   succeeds, so an interrupted build resumes at the next login rather than
-   declaring victory.
-4. `avd-signin` - boots the emulator in software GL. Open Google Photos, sign in,
-   and register the device id the setup printed at
+3. `avd-photos-setup` - on Apple silicon this is `gphotos-mac-setup`: it
+   downloads and installs Google Photos for Mac in about a minute. On Intel it
+   builds the whole rooted stack. That is long (a multi-GB system image, a
+   rooted ramdisk, three reboots, and the Play Store extraction) and resumable:
+   the "done" marker is written only after the last phase succeeds, so an
+   interrupted build resumes at the next login rather than declaring victory.
+4. Sign in. Apple silicon: `avd-start` opens Google Photos for Mac; sign in to
+   Google in it. Intel: `avd-signin` boots the emulator in software GL. Open
+   Google Photos, sign in, and register the device id the setup printed at
    <https://www.google.com/android/uncertified/> as that same account. Turn
    Backup ON and confirm the backup screen says `Quality: Original`.
-5. `avd-photos-check` - reports Magisk, Zygisk, the spoof module, Google Photos
-   and the Play Store, and changes nothing.
+5. `avd-photos-check` - reports what is installed (on Intel: Magisk, Zygisk,
+   the spoof module, Google Photos and the Play Store), and changes nothing.
 6. `avd-photos-offload --dry-run` - see which photos the reclaim would match in
    your library, without deleting anything.
 7. `avd-photos-arm` - prints exactly what arming switches on (the Apple ID, the
@@ -484,16 +559,22 @@ first place.
 | `ICLOUD_DIR` | `~/Library/Mobile Documents/com~apple~CloudDocs` | iCloud Drive root; only the default parent of `SHARED_CACHE_DIR`. |
 | `SHARED_CACHE_DIR` | `$ICLOUD_DIR/avd-photos` | Where the extracted Play Store APK is cached so a second Mac skips a 2.7 GB extraction. |
 | `GOOGLE_ACCOUNT` | (unset) | The account the emulator signs in as. Only ever printed. |
+| `PHOTOS_BACKEND` | `mac` on arm64, `avd` otherwise | `mac` = Google Photos for Mac (Apple silicon only); `avd` = the emulator. |
+| `GPHOTOS_APP` | `/Applications/GooglePhotos.app` | Where `gphotos-mac-setup` installs the app (named after the IPA's bundle by the converter). |
+| `GPHOTOS_UPLOAD_DIR` | `~/Pictures/Google Photos Upload` | The folder the bridge watches. Keep it under `~/Pictures`: that is all the app's sandbox reaches. |
+| `GPHOTOS_IPA_URL` / `GPHOTOS_IPA_SHA256` | this repo's release asset | The IPA to install and the hash it must have. |
+| `IPA_INSTALL` | `ipa-install-on-mac` | The converter; fetched at a pinned revision when not on PATH. |
+| `MAC_INBOX_MAX` | `300` | Files waiting in the upload folder at once (the engine keeps a second copy of each while it uploads). |
 | `AVD_NAME` | `gphotos-tablet` | The emulator's name. |
 | `AVD_SDK_ROOT` | `~/.local/share/android-avd-sdk` | The pipeline's own writable SDK root (its `ANDROID_HOME`). |
-| `AVD_ABI` / `AVD_TAG` / `AVD_DEVICE` | `arm64-v8a` / `google_apis` / `pixel_tablet` | Image selection. `google_apis_playstore` is deliberately unusable here. |
+| `AVD_ABI` / `AVD_TAG` / `AVD_DEVICE` | `arm64-v8a` on arm64, `x86_64` otherwise / `google_apis` / `pixel_tablet` | Image selection. `google_apis_playstore` is deliberately unusable here. |
 | `AVD_RES` / `AVD_DPI` | `2560x1440` / `210` | Density decides which Photos layout renders; above ~384dpi it flips to the phone UI. |
 | `AVD_RAM` / `AVD_CORES` / `AVD_DISK` / `AVD_HEAP` | `6144` / `8` / `16384M` / `512M` | Guest tuning. |
 | `AVD_GPU` | `host` | `host` for speed; `swiftshader_indirect` is the only mode that renders Google's sign-in. |
 | `AVD_SPOOF` | `module` | `module` = GPhotosUnlimited; `vector` = Vector + PixelifyPhotos. Never both. |
 | `DEST_DCIM` | `/sdcard/DCIM/Camera` | Where files are pushed. Any other folder is opt-in for backup and will silently never upload. |
 | `RECENT` / `UNTIL_FOUND` | `2000` / `50` | icloudpd's incremental walk. |
-| `PUSH_CAP` | `1000` | Files handed to the emulator per run. |
+| `PUSH_CAP` | `1000` | Files handed to Google Photos per run. |
 | `UPLOAD_WAIT` | `900` | Floor on the wait for Google Photos, plus 2 s per file on the device. |
 | `ADB_TIMEOUT` / `RECLAIM_TIMEOUT` | `120` / `1800` | Wall-clock bounds. |
 | `DELETE_FROM_ICLOUD` | `1` | 0 makes this a one-way copier. |
@@ -604,7 +685,9 @@ Bundle identifier: `local.ayushsharma.icloud-to-google-photos`.
 ## Layout
 
 ```
-bin/     avd-photos-setup      build and update the rooted emulator
+bin/     gphotos-mac-setup     install and update Google Photos for Mac (Apple silicon)
+         avd-photos-setup      build and update the rooted emulator (Intel; on
+                               Apple silicon it runs gphotos-mac-setup)
          avd-photos-sync       the sync job
          avd-photos-reclaim.py the iCloud deletion, run by the sync
          avd-photos-status     the JSON the menu bar reads
@@ -614,7 +697,8 @@ bin/     avd-photos-setup      build and update the rooted emulator
          avd-photos-offload    reclaim iCloud space now
          avd-photos-check      report every version, change nothing
          avd-start avd-stop avd-signin
-lib/     config.sh  log.sh  proc.sh  fs.sh
+lib/     config.sh  log.sh  proc.sh  fs.sh  mac.sh (the Mac backend of the sync)
+ios/     gp-bridge.m  the folder-to-GoToHP bridge linked into Google Photos for Mac
 Sources/ main.swift (the menu-bar app)  icon.swift (its artwork, drawn at build time)
 build.sh          builds Photo Sync.app with swiftc; no Xcode project
 install.sh        commands, app, agents; --uninstall
@@ -631,7 +715,14 @@ Claude Meter; this project ships its own, and nothing here depends on that one.
 MIT. See [LICENSE](LICENSE).
 
 The pieces this stands on are other people's: `icloudpd`, Magisk, NeoZygisk, the
-GPhotosUnlimited module, the Vector Xposed framework and PixelifyPhotos, and
-Google's own emulator and system images. Nothing here redistributes any of them -
-each is fetched from its own upstream at run time, and the Play Store comes out
-of Google's own certified image rather than any third-party mirror.
+GPhotosUnlimited module, the Vector Xposed framework and PixelifyPhotos, Google's
+own emulator and system images, and on Apple silicon the
+[Gunshot](https://github.com/tqmane/gunshot) tweak (GPL-3.0, itself built on
+[gotohp](https://github.com/xob0t/gotohp), MIT) and
+[ipa-install-on-mac](https://github.com/ayush5harma/ipa-install-on-mac).
+The emulator path redistributes none of them: each is fetched from its own
+upstream at run time, and the Play Store comes out of Google's own certified
+image rather than any third-party mirror. The Mac path's IPA is published as a
+release of this repo because `gphotos-mac-setup` needs one fixed, hash-checked
+file; it is Google's binary with Gunshot's dylib inside, and `GPHOTOS_IPA_URL`
+points anywhere else you would rather host it.

@@ -37,7 +37,8 @@ AP_LABEL_PREFIX="com.ayushsharma.icloud-to-google-photos"
 # Every key the config file may set. Used for the precedence restore above, and
 # it is the list the README documents.
 AP_KEYS="ICLOUD_USERNAME ICLOUDPD STAGING ICLOUD_DIR SHARED_CACHE_DIR
-         GOOGLE_ACCOUNT AVD_NAME AVD_SDK_ROOT AVD_ABI AVD_TAG AVD_DEVICE
+         GOOGLE_ACCOUNT PHOTOS_BACKEND GPHOTOS_APP GPHOTOS_UPLOAD_DIR
+         GPHOTOS_IPA_URL GPHOTOS_IPA_SHA256 IPA_INSTALL MAC_INBOX_MAX AVD_NAME AVD_SDK_ROOT AVD_ABI AVD_TAG AVD_DEVICE
          AVD_RES AVD_DPI AVD_RAM AVD_CORES AVD_DISK AVD_HEAP AVD_GPU AVD_SPOOF
          RECENT UNTIL_FOUND PUSH_CAP UPLOAD_WAIT ADB_TIMEOUT RECLAIM_TIMEOUT
          DELETE_FROM_ICLOUD KEEP_ICLOUD_DAYS PRUNE_DEVICE_AFTER_UPLOAD
@@ -71,6 +72,36 @@ ap_defaults() {
   # printed, as a reminder of which account to register the device under.
   GOOGLE_ACCOUNT="${GOOGLE_ACCOUNT-}"
 
+  # ── Which Google Photos does the uploading ─────────────────────────────────
+  # mac = the iPhone/iPad Google Photos running natively on an Apple silicon Mac
+  #       (converted by ipa-install-on-mac), uploading through the GoToHP engine
+  #       of the Gunshot tweak with ios/gp-bridge.m linked in. No emulator, no
+  #       root, no device registration: the tweak asks for the Pixel XL
+  #       original-quality profile itself (2026-09-16).
+  # avd = the rooted Android emulator below. The only choice on an Intel Mac,
+  #       which cannot run iOS apps.
+  case "$(uname -m)" in arm64) _ap_backend=mac ;; *) _ap_backend=avd ;; esac
+  PHOTOS_BACKEND="${PHOTOS_BACKEND:-$_ap_backend}"
+  # Where ipa-install-on-mac puts the app (--dest /Applications, named after
+  # the IPA's bundle), and the folder the bridge watches. The folder must stay
+  # under ~/Pictures: the converted app's sandbox reaches exactly that
+  # (com.apple.security.assets.pictures.read-write) and nothing else of yours.
+  GPHOTOS_APP="${GPHOTOS_APP:-/Applications/GooglePhotos.app}"
+  GPHOTOS_UPLOAD_DIR="${GPHOTOS_UPLOAD_DIR:-$HOME/Pictures/Google Photos Upload}"
+  # The IPA gphotos-mac-setup installs: Google Photos 7.92.0 with the Gunshot
+  # tweak's GunshotJailed.dylib already injected (the tweak's own supported
+  # sideload shape). The hash is checked before anything is installed.
+  GPHOTOS_IPA_URL="${GPHOTOS_IPA_URL:-https://github.com/ayush5harma/icloud-to-google-photos/releases/download/google-photos-7.92.0/GooglePhotos-7.92.0-gunshot.ipa}"
+  GPHOTOS_IPA_SHA256="${GPHOTOS_IPA_SHA256:-65a968d3619ba472392b3ba504a9f7ed65577956d4fb3540c82b8fd348ee8303}"
+  # The converter. On PATH when installed (a Nix flake or a clone's bin/);
+  # otherwise gphotos-mac-setup fetches the pinned revision below into the
+  # state directory.
+  IPA_INSTALL="${IPA_INSTALL:-ipa-install-on-mac}"
+  # Files waiting in the upload folder at once. The engine copies each file
+  # into the app's container while it uploads, so a backlog costs its size
+  # twice over; a few hundred photos is a few GB.
+  MAC_INBOX_MAX="${MAC_INBOX_MAX:-300}"
+
   # ── The emulator ───────────────────────────────────────────────────────────
   AVD_NAME="${AVD_NAME:-gphotos-tablet}"
   # DELIBERATELY NOT a system-wide Android SDK: rooting rewrites ramdisk.img IN
@@ -78,7 +109,10 @@ ap_defaults() {
   # root is writable and owned by the pipeline (it is also what ANDROID_HOME is
   # set to when the emulator and avdmanager are invoked).
   AVD_SDK_ROOT="${AVD_SDK_ROOT:-$HOME/.local/share/android-avd-sdk}"
-  AVD_ABI="${AVD_ABI:-arm64-v8a}"
+  # The image must match the host CPU: HVF runs arm64 guests on Apple silicon
+  # only, and an Intel Mac runs x86_64 ones (under Hypervisor.framework too).
+  case "$(uname -m)" in arm64) _ap_abi=arm64-v8a ;; *) _ap_abi=x86_64 ;; esac
+  AVD_ABI="${AVD_ABI:-$_ap_abi}"
   # google_apis, never google_apis_playstore: the certified image is a `user`
   # build with adb root disabled and stronger verified boot, which resists
   # ramdisk patching and defeats device spoofing outright. google_apis is

@@ -10,5 +10,7 @@
 # single pixel is drawn) and stalls forever on the Play Services splash under
 # `-gpu host`. It reads exactly like Google refusing an uncertified device, which
 # sends you off chasing Play certification instead.
+# On Apple silicon the sign-in happens inside Google Photos for Mac itself:
+# avd-photos-setup --start opens it there, and the GPU setting is unused.
 AVD_GPU="${AVD_SIGNIN_GPU:-swiftshader_indirect}" \
   exec "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/avd-photos-setup" --start "$@"

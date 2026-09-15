@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# Google Photos for iPhone and iPad, running natively on this Apple silicon
+# Mac, as the pipeline's uploader (PHOTOS_BACKEND=mac): fetch the IPA, verify
+# it, convert and install it with ipa-install-on-mac, with ios/gp-bridge.m
+# linked in. Zero taps, apart from the one sign-in this cannot do.
+#
+# MODES:  (no args) install or update      --check   report, change nothing
+#         --ipa FILE  install this IPA instead of downloading GPHOTOS_IPA_URL
+#         --force     reinstall even when nothing changed
+#
+# WHAT THE IPA IS: Google Photos 7.92.0 with the Gunshot tweak's
+# GunshotJailed.dylib injected (github.com/tqmane/gunshot, GPL-3.0), the
+# tweak's own supported sideload shape. Its GoToHP engine uploads with the
+# Pixel XL original-quality profile; the bridge feeds that engine from a
+# folder (ios/gp-bridge.m has the contract). The app keeps its sandbox: it
+# reads and writes ~/Pictures and its own container, nothing else.
+#
+# A REINSTALL KEEPS THE SIGN-IN: ipa-install-on-mac re-signs the bundle with a
+# stable identity and its emulated keychain lives in the app's container, so
+# an update of the IPA, the bridge or the converter keeps the account. Only
+# --reset (never run from here) clears it.
+#
+# THE STAMP is the IPA's hash, the bridge source's hash and the converter's
+# revision; the install is repeated only when one of them moves, so the
+# weekly agent and every switch cost one hash of a 175 MB file when nothing
+# changed.
+
+set -uo pipefail
+
+LIB_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/../lib"
+# shellcheck disable=SC1091
+. "$LIB_DIR/config.sh"
+# shellcheck disable=SC1091
+. "$LIB_DIR/log.sh"
+# shellcheck disable=SC1091
+. "$LIB_DIR/proc.sh"
+ap_load_config
+
+BRIDGE_SRC="$LIB_DIR/../ios/gp-bridge.m"
+LOG="$LOG_DIR/gphotos-mac-setup.log"
+STAMP="$STATE_DIR/gphotos-mac.stamp"
+IPA_CACHE="$STATE_DIR/GooglePhotos.ipa"
+# The converter, when it is not on PATH: this revision of the public repo,
+# fetched once into the state directory. Bump it with the flake input.
+IPA_INSTALL_REPO="ayush5harma/ipa-install-on-mac"
+IPA_INSTALL_REV="94601bc012a5e9eaf84861f2bedd3f9aa9a1537b"
+
+CHECK=0; FORCE=0; IPA_FILE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check) CHECK=1 ;;
+    --force) FORCE=1 ;;
+    --ipa) shift; IPA_FILE="${1:-}" ;;
+    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+  [ $# -gt 0 ] && shift
+done
+log_init "$LOG"
+say() { log "$*"; printf '%s\n' "$*"; }
+die() { say "ERROR: $*"; exit 1; }
+
+[ "$(uname -m)" = arm64 ] || die "an iOS app runs only on an Apple silicon Mac; this one is $(uname -m) (PHOTOS_BACKEND=avd is the Intel path)"
+[ -f "$BRIDGE_SRC" ] || die "bridge source missing: $BRIDGE_SRC"
+xcrun --sdk macosx --show-sdk-path >/dev/null 2>&1 || die "Xcode is needed (the bridge is compiled for Mac Catalyst against the macOS SDK): xcode-select --install is not enough"
+
+# ── The converter ────────────────────────────────────────────────────────────
+converter=""
+if command -v "$IPA_INSTALL" >/dev/null 2>&1; then
+  converter="$(command -v "$IPA_INSTALL")"
+else
+  fetched="$STATE_DIR/ipa-install-on-mac-$IPA_INSTALL_REV"
+  if [ ! -x "$fetched/bin/ipa-install-on-mac" ]; then
+    [ "$CHECK" -eq 1 ] && { say "converter: not installed (would fetch $IPA_INSTALL_REPO@${IPA_INSTALL_REV:0:7})"; }
+    if [ "$CHECK" -eq 0 ]; then
+      say "fetching ipa-install-on-mac ${IPA_INSTALL_REV:0:7}"
+      tmp="$(mktemp -d)"
+      curl -fsSL --retry 3 -o "$tmp/src.tgz" "https://github.com/$IPA_INSTALL_REPO/archive/$IPA_INSTALL_REV.tar.gz" \
+        || die "could not download the converter"
+      mkdir -p "$fetched" && tar -xzf "$tmp/src.tgz" -C "$fetched" --strip-components 1 || die "could not unpack the converter"
+      rm -rf "$tmp"
+    fi
+  fi
+  [ -x "$fetched/bin/ipa-install-on-mac" ] && converter="$fetched/bin/ipa-install-on-mac"
+fi
+converter_rev="$( [ -n "$converter" ] && git -C "$(dirname "$converter")" rev-parse HEAD 2>/dev/null || echo "$IPA_INSTALL_REV" )"
+
+# ── The IPA ──────────────────────────────────────────────────────────────────
+ipa=""
+if [ -n "$IPA_FILE" ]; then
+  [ -f "$IPA_FILE" ] || die "no such file: $IPA_FILE"
+  ipa="$IPA_FILE"
+elif [ -f "$IPA_CACHE" ] && [ "$(shasum -a 256 "$IPA_CACHE" | cut -c1-64)" = "$GPHOTOS_IPA_SHA256" ]; then
+  ipa="$IPA_CACHE"
+fi
+ipa_sha="$( [ -n "$ipa" ] && shasum -a 256 "$ipa" | cut -c1-64 )"
+bridge_sha="$(shasum -a 256 "$BRIDGE_SRC" | cut -c1-64)"
+want="$GPHOTOS_IPA_SHA256 $bridge_sha $converter_rev"
+[ -n "$IPA_FILE" ] && want="$ipa_sha $bridge_sha $converter_rev"
+have="$(cat "$STAMP" 2>/dev/null || true)"
+
+installed=no; engine=unknown; bridge=unknown
+if [ -d "$GPHOTOS_APP" ]; then
+  installed=yes
+  exe="$GPHOTOS_APP/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$GPHOTOS_APP/Info.plist" 2>/dev/null || echo GooglePhotos)"
+  links="$(otool -L "$exe" 2>/dev/null)"
+  case "$links" in *GunshotJailed*) engine=yes ;; *) engine=no ;; esac
+  case "$links" in *gp-bridge*) bridge=yes ;; *) bridge=no ;; esac
+fi
+
+if [ "$CHECK" -eq 1 ]; then
+  say "backend:      $PHOTOS_BACKEND"
+  say "app:          $GPHOTOS_APP ($installed; GoToHP engine: $engine; folder bridge: $bridge)"
+  say "IPA:          ${ipa:-not cached} (${ipa_sha:-would download $GPHOTOS_IPA_URL})"
+  say "converter:    ${converter:-none}"
+  say "up to date:   $([ "$installed" = yes ] && [ "$have" = "$want" ] && echo yes || echo no)"
+  say "upload folder: $GPHOTOS_UPLOAD_DIR"
+  exit 0
+fi
+
+if [ "$FORCE" -eq 0 ] && [ "$installed" = yes ] && [ "$have" = "$want" ]; then
+  say "Google Photos is installed and current (IPA ${want:0:7}, bridge ${bridge_sha:0:7}, converter ${converter_rev:0:7})"
+  exit 0
+fi
+[ -n "$converter" ] || die "no converter"
+
+if [ -z "$ipa" ]; then
+  say "downloading Google Photos from $GPHOTOS_IPA_URL"
+  tmp="$IPA_CACHE.part"
+  curl -fL --retry 3 --progress-bar -o "$tmp" "$GPHOTOS_IPA_URL" || die "download failed"
+  got="$(shasum -a 256 "$tmp" | cut -c1-64)"
+  [ "$got" = "$GPHOTOS_IPA_SHA256" ] || { rm -f "$tmp"; die "the download's sha256 ($got) is not GPHOTOS_IPA_SHA256 ($GPHOTOS_IPA_SHA256): nothing installed"; }
+  mv -f "$tmp" "$IPA_CACHE"; ipa="$IPA_CACHE"; ipa_sha="$got"
+fi
+# grep without -q: under pipefail a -q that exits on the first match leaves
+# unzip with a broken pipe, and the pipeline reads as "no dylib".
+/usr/bin/unzip -l "$ipa" 2>/dev/null | grep 'GunshotJailed.dylib' >/dev/null \
+  || die "this IPA carries no GunshotJailed.dylib: without the Gunshot tweak's engine the app cannot upload from a folder"
+
+# ── Install ──────────────────────────────────────────────────────────────────
+# The app is not quit for the install: the converter replaces the bundle and
+# the running process keeps its old mapping; the sync launches the new one at
+# its next run once the old process exits. An install while Google Photos is
+# uploading would lose that job, so refuse while the upload folder is busy.
+busy=0
+for f in "$GPHOTOS_UPLOAD_DIR"/*; do [ -f "$f" ] && { busy=1; break; }; done
+if [ "$busy" -eq 1 ] && pgrep -f "^$GPHOTOS_APP/[^/]*$" >/dev/null 2>&1; then
+  die "Google Photos is running with files in $GPHOTOS_UPLOAD_DIR: let it finish (or quit it) before reinstalling"
+fi
+say "installing Google Photos (${ipa_sha:0:7}) with the folder bridge, converter ${converter_rev:0:7}"
+if ! "$converter" "$ipa" --dest "$(dirname "$GPHOTOS_APP")" --dylib "$BRIDGE_SRC" >>"$LOG" 2>&1; then
+  die "ipa-install-on-mac failed; see $LOG"
+fi
+[ -d "$GPHOTOS_APP" ] || die "the converter finished but $GPHOTOS_APP does not exist (it names the app after the IPA's bundle: check $LOG for where it went)"
+mkdir -p "$GPHOTOS_UPLOAD_DIR"
+printf '%s\n' "$want" > "$STAMP"
+# The pipeline's "setup finished" marker, which the login agent checks before
+# it runs the setup again (avd-photos-setup --bootstrap), the same one the
+# emulator path writes after its last phase.
+date +%s > "$STATE_DIR/setup-complete"
+say "installed $GPHOTOS_APP"
+pgrep -f "^$GPHOTOS_APP/[^/]*$" >/dev/null 2>&1 && say "the previous copy is still running; quit it so the new one starts at the next sync"
+say ""
+say "ONE THING LEFT, once: open Google Photos and sign in to the Google account the photos should go to."
+say "Then: avd-photos-arm"

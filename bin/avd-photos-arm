@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Arm (or disarm) the sync. ARM ONLY AFTER a signed-in emulator with the spoof
-# active has been verified: from this moment the job downloads originals, pushes
-# them into the emulator and -- once Google Photos' own database confirms them,
-# and only then -- DELETES THEM FROM iCLOUD.
+# Arm (or disarm) the sync. ARM ONLY AFTER a signed-in Google Photos has been
+# verified (the Mac app on Apple silicon, the emulator with the spoof active on
+# Intel): from this moment the job downloads originals, hands them to Google
+# Photos and -- once Google has confirmed each one, and only then -- DELETES
+# THEM FROM iCLOUD.
 #
 #   avd-photos-arm          print what arming would switch on; arm if reclaim is
 #                           off, otherwise ask for --yes
@@ -43,7 +44,10 @@ esac
 printf 'Arming will run the sync every 15 minutes with these settings:\n\n'
 printf '  Apple ID              %s\n' "$ICLOUD_USERNAME"
 printf '  staging               %s\n' "$STAGING"
-printf '  emulator              %s\n' "$AVD_NAME"
+case "$PHOTOS_BACKEND" in
+  mac) printf '  uploader              Google Photos for Mac (%s)\n' "$GPHOTOS_APP" ;;
+  *)   printf '  emulator              %s\n' "$AVD_NAME" ;;
+esac
 if [ "$DELETE_FROM_ICLOUD" = "1" ]; then
   printf '  delete from iCloud    YES, once Google Photos has confirmed each file\n'
   if [ -n "$KEEP_ICLOUD_DAYS" ] && [ "$KEEP_ICLOUD_DAYS" != "0" ]; then

@@ -24,6 +24,13 @@ LIB_DIR="$SELF_DIR/../lib"
 . "$LIB_DIR/config.sh"
 ap_load_config
 
+# On Apple silicon Google Photos IS a Mac app (PHOTOS_BACKEND=mac): nothing to
+# wrap, and a launcher named after the emulator would only mislead.
+if [ "$PHOTOS_BACKEND" = mac ]; then
+  echo "  the Mac backend needs no launcher: Google Photos is $GPHOTOS_APP"
+  exit 0
+fi
+
 APP_NAME="${AVD_APP_NAME:-Google Photos (AVD)}"
 APP_DIR="${AVD_APP_DIR:-/Applications}/${APP_NAME}.app"
 SETUP_BIN="$SELF_DIR/avd-photos-setup"
