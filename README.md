@@ -180,6 +180,9 @@ pipeline becomes a one-way copier.
    sync records the confirmation, puts the staged path on the reclaim list, and
    deletes the moved copy. A job the engine gave up on lands in `Failed/`; the
    sync hands the file over again on a later run, three times, then leaves it.
+   A handoff the bridge has said nothing about for six hours counts as one of
+   those failures, so one stuck file cannot hold the pipeline's confirmation
+   (and with it the iCloud reclaim) hostage.
    `remote_live_photo_component_exists` - Google already holds one half of a
    Live Photo pair, by hash - is neither: the pair goes on `mac-exists.list`
    and stays in iCloud, because which half matched is not reported.
@@ -197,9 +200,12 @@ Mac run marks everything on the reclaim lists as handled.
 reports): it downloads the IPA named by `GPHOTOS_IPA_URL` - Google Photos
 7.92.0 with `GunshotJailed.dylib` injected, a release asset of this repo -
 verifies `GPHOTOS_IPA_SHA256`, and runs `ipa-install-on-mac <ipa> --dylib
-ios/gp-bridge.m`. A reinstall keeps the sign-in. The app is sandboxed: it
-reads and writes `~/Pictures` and its own container, nothing else of yours.
-Then open it once and sign in to Google; that is the whole human part.
+ios/gp-bridge.m`. A reinstall keeps the sign-in. The app runs in the sandbox
+the converter gives every iOS app - its own container, the standard user
+folders (Pictures, Downloads, Movies, Music) and the devices an iOS app may ask
+for, each behind macOS's usual prompt - and the bridge only ever touches the
+upload folder. Then open it once and sign in to Google; that is the whole
+human part.
 
 ### On Intel: the rooted emulator
 

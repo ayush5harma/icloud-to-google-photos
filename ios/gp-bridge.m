@@ -23,8 +23,8 @@
 //                      the engine may upload now ("online": a visible window
 //                      and a network), paused, last error
 //       request-<id>.json / response-<id>.json
-//                      raw engine requests for a caller that needs one
-//                      (role "photos"; "configure" runs as "settings")
+//                      read-only engine queries (ping, list, job, options,
+//                      upload_summary, accounts) for a caller that needs one
 //
 // A caller drops a file under a dot-name and renames it into place (the
 // scanner skips dot-names, and waits out anything whose inode changed in the
@@ -114,11 +114,12 @@ static void relax_wifi_only(void) {
   if (g_wifiChecked) return;
   NSDictionary *o = call(@{@"op": @"options"}, "photos");
   if (![o isKindOfClass:NSDictionary.class]) return;
-  g_wifiChecked = YES;
-  if (![o[@"wifiOnly"] boolValue]) return;
+  if (![o[@"wifiOnly"] boolValue]) { g_wifiChecked = YES; return; }
   NSMutableDictionary *n = [o mutableCopy];
   n[@"wifiOnly"] = @NO;
-  call(@{@"op": @"configure", @"options": n}, "settings");
+  // Checked only once it took: the engine's default is Wi-Fi-only, and a
+  // configure refused at launch would otherwise leave every upload waiting.
+  if (call(@{@"op": @"configure", @"options": n}, "settings")) g_wifiChecked = YES;
 }
 
 static NSString *stem_of(NSString *name) {
@@ -269,7 +270,7 @@ static void refresh_jobs(void) {
   for (NSString *n in g_ledger.allKeys) {
     NSMutableDictionary *e = g_ledger[n];
     NSString *state = e[@"state"], *jid = e[@"id"];
-    if (!jid.length || finished(e) || [seen containsObject:jid]) continue;
+    if (![jid isKindOfClass:NSString.class] || !jid.length || finished(e) || [seen containsObject:jid]) continue;
     if ([state isEqual:@"completed"] || [state isEqual:@"cancelled"] || [state isEqual:@"import_failed"]) continue;
     [seen addObject:jid];
     NSDictionary *j = call(@{@"op": @"job", @"id": jid}, "photos");
@@ -285,7 +286,11 @@ static void refresh_jobs(void) {
     if ([j[@"state"] isEqual:@"completed"] && [j[@"mediaKey"] length]) {
       for (NSString *f in files) g_ledger[f][@"uploaded"] = @((long long)NSDate.date.timeIntervalSince1970);
       move_into(@"Uploaded", files);
-    } else if ([j[@"state"] isEqual:@"failed"] && [j[@"attempts"] intValue] > 0 && !j[@"next"]) {
+    } else if ([j[@"state"] isEqual:@"failed"] && [j[@"next"] longLongValue] <= (long long)NSDate.date.timeIntervalSince1970) {
+      // Given up: no retry scheduled ahead. The engine keeps a stale "next"
+      // on a job that ran out of retries (queue.go's terminal branch never
+      // clears it), so "no next" would only ever match a first-attempt
+      // refusal such as remote_live_photo_component_exists.
       move_into(@"Failed", files);
     }
   }
@@ -300,12 +305,17 @@ static void serve_requests(void) {
     [fm removeItemAtPath:path error:NULL];
     NSDictionary *req = body ? [NSJSONSerialization JSONObjectWithData:body options:0 error:NULL] : nil;
     NSMutableDictionary *reply = [NSMutableDictionary dictionary];
-    if (![req isKindOfClass:NSDictionary.class]) {
-      reply[@"bridgeError"] = @"the request is not a JSON object";
+    // Read-only operations only. The folder is reachable by every process of
+    // this user, so a passthrough that could upload, cancel or reconfigure
+    // would hand the app's signed-in engine to any of them.
+    NSString *op = [req isKindOfClass:NSDictionary.class] ? req[@"op"] : nil;
+    NSSet *readOnly = [NSSet setWithArray:@[@"ping", @"list", @"job", @"options", @"upload_summary", @"accounts"]];
+    if (![op isKindOfClass:NSString.class] || ![readOnly containsObject:op]) {
+      reply[@"bridgeError"] = @"only ping, list, job, options, upload_summary and accounts are served";
     } else {
       NSData *raw = [NSJSONSerialization dataWithJSONObject:req options:0 error:NULL];
       NSString *text = [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding];
-      char *out = g_request(text.UTF8String, [req[@"op"] isEqual:@"configure"] ? "settings" : "photos");
+      char *out = g_request(text.UTF8String, "photos");
       if (out) {
         id parsed = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:out length:strlen(out)] options:0 error:NULL];
         reply[@"reply"] = parsed ?: @(out);
@@ -345,7 +355,9 @@ static void tick(void) {
   write_json([g_dir stringByAppendingPathComponent:@"alive.json"],
              @{@"pid": @(getpid()), @"time": @((long long)NSDate.date.timeIntervalSince1970), @"engine": g_request ? @YES : @NO,
                @"account": g_account ? @YES : @NO, @"online": g_conditions[@"online"] ?: @NO,
-               @"paused": g_conditions[@"paused"] ?: @NO, @"lastError": g_lastError ?: @"", @"folder": g_root});
+               @"wifi": g_conditions[@"wifi"] ?: @NO, @"charging": g_conditions[@"charging"] ?: @NO,
+               @"wifiOnly": @(!g_wifiChecked), @"paused": g_conditions[@"paused"] ?: @NO,
+               @"lastError": g_lastError ?: @"", @"folder": g_root});
 }
 
 __attribute__((constructor)) static void gp_bridge_start(void) {
@@ -356,7 +368,13 @@ __attribute__((constructor)) static void gp_bridge_start(void) {
   NSData *prev = [NSData dataWithContentsOfFile:[g_dir stringByAppendingPathComponent:@"ledger.json"]];
   NSDictionary *old = prev ? [NSJSONSerialization JSONObjectWithData:prev options:0 error:NULL][@"files"] : nil;
   g_ledger = [NSMutableDictionary dictionary];
-  for (NSString *k in old) if ([old[k] isKindOfClass:NSDictionary.class]) g_ledger[k] = [old[k] mutableCopy];
+  for (NSString *k in old) {
+    if (![old[k] isKindOfClass:NSDictionary.class]) continue;
+    NSMutableDictionary *e = [old[k] mutableCopy];
+    if (![e[@"id"] isKindOfClass:NSString.class]) e[@"id"] = @"";
+    if (![e[@"state"] isKindOfClass:NSString.class]) e[@"state"] = @"unknown";
+    g_ledger[k] = e;
+  }
   static dispatch_source_t timer;
   dispatch_queue_t queue = dispatch_queue_create("gp-bridge", DISPATCH_QUEUE_SERIAL);
   timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);

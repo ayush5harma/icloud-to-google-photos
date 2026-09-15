@@ -20,7 +20,7 @@
 # the emulator path's device naming), so the staging tree is never touched
 # and the ledger maps every name back exactly, with no basename guessing.
 
-MAC_LEDGER="$STATE_DIR/mac-queued.tsv"         # <name> TAB <staged rel>, one line per handoff
+MAC_LEDGER="$STATE_DIR/mac-queued.tsv"         # <name> TAB <staged rel> TAB <handoff epoch>, one line per handoff
 MAC_CONFIRMED="$STATE_DIR/mac-confirmed.list"  # staged rel: Google answered with a media key
 MAC_FAILED="$STATE_DIR/mac-failed.tsv"         # <staged rel> TAB <engine error>, one line per failure
 # A Live Photo pair the engine refused because Google already holds one of its
@@ -28,6 +28,12 @@ MAC_FAILED="$STATE_DIR/mac-failed.tsv"         # <staged rel> TAB <engine error>
 # matched is not reported, so the pair stays in iCloud -- the safe direction.
 MAC_EXISTS="$STATE_DIR/mac-exists.list"
 MAC_RETRIES=3                                  # handoffs per file before it is left alone
+# A handoff the bridge has reported nothing about for this long is treated as
+# a failure and handed over again (it counts against MAC_RETRIES): a job
+# cancelled in the app, a bridge entry lost with the folder, an app that never
+# ran. Without it one such file would keep every run from confirming, and the
+# confirmation stamp gates the iCloud reclaim for every OTHER file too.
+MAC_GIVE_UP=$((6 * 3600))
 MAC_INBOX="$GPHOTOS_UPLOAD_DIR"
 MAC_BRIDGE="$MAC_INBOX/.bridge"
 MAC_HANDED=0                                   # handed over this run, for the "done" line
@@ -79,12 +85,21 @@ mac_launch() {
   fail "Google Photos is running but its upload bridge never reported (no fresh $MAC_BRIDGE/alive.json) -- reinstall it with gphotos-mac-setup"
 }
 
+# Records one failed handoff: out of the ledger first (so a kill between the
+# two leaves a file that is simply handed over again), then the failure line
+# that counts against MAC_RETRIES.
+mac_fail() {  # <name> <rel> <error>
+  awk -F'\t' -v n="$1" '$1 != n' "$MAC_LEDGER" > "$MAC_LEDGER.tmp" && mv -f "$MAC_LEDGER.tmp" "$MAC_LEDGER"
+  printf '%s\t%s\n' "$2" "${3:--}" >> "$MAC_FAILED"
+}
+
 # Take in every outcome the bridge has reported: confirmations to the reclaim
 # list, failures to the retry count. The moved file is deleted once recorded,
 # which is the bridge's signal that the entry was consumed. A file this
-# pipeline did not hand over is left exactly where it is.
+# pipeline did not hand over is left exactly where it is. Then every handoff
+# older than MAC_GIVE_UP that the bridge never reported on.
 mac_collect() {
-  local name state key err moved rel
+  local name state key err moved rel stamp now
   [ -r "$MAC_BRIDGE/ledger.json" ] || return 0
   while IFS="$(printf '\t')" read -r name state key err moved; do
     [ -n "$name" ] && [ -n "$moved" ] || continue
@@ -103,10 +118,7 @@ mac_collect() {
           grep -qxF "$rel" "$MAC_EXISTS" 2>/dev/null || printf '%s\n' "$rel" >> "$MAC_EXISTS"
           log "  already in Google Photos (a Live Photo component matched by hash), kept in iCloud: $rel"
         else
-          printf '%s\t%s\n' "$rel" "${err:--}" >> "$MAC_FAILED"
-          # Out of the ledger, so the next run hands it over again while it
-          # has retries left.
-          awk -F'\t' -v n="$name" '$1 != n' "$MAC_LEDGER" > "$MAC_LEDGER.tmp" && mv -f "$MAC_LEDGER.tmp" "$MAC_LEDGER"
+          mac_fail "$name" "$rel" "$err"
           log "  upload failed ($err): $rel"
         fi
         rm -f "$MAC_INBOX/$moved" ;;
@@ -114,6 +126,15 @@ mac_collect() {
   done < <(mac_jq -r '.files | to_entries[] | select((.value.moved // "") != "")
                       | [.key, (.value.state // "-"), (.value.mediaKey // "-"), (.value.error // "-"), .value.moved] | @tsv' \
              "$MAC_BRIDGE/ledger.json" 2>/dev/null)
+  now="$(date +%s)"
+  while IFS="$(printf '\t')" read -r name rel stamp; do
+    [ -n "$name" ] && [ -n "$rel" ] || continue
+    [ "${stamp:-$now}" -le $((now - MAC_GIVE_UP)) ] || continue
+    grep -qxF "$rel" "$MAC_CONFIRMED" "$MAC_EXISTS" 2>/dev/null && continue
+    mac_fail "$name" "$rel" "no_outcome_after_$((MAC_GIVE_UP / 3600))h"
+    rm -f "$MAC_INBOX/$name"
+    log "  no outcome from Google Photos after $((MAC_GIVE_UP / 3600)) h, handed over again next run: $rel"
+  done < <(cat "$MAC_LEDGER" 2>/dev/null)
 }
 
 # Seeds the ledger on the first run of this backend on a Mac whose emulator
@@ -123,10 +144,14 @@ mac_seed() {
   [ -e "$MAC_LEDGER" ] && return 0
   : > "$MAC_LEDGER"
   if [ -s "$RECLAIM_PENDING" ] || [ -s "$STATE_DIR/reclaimed.list" ]; then
-    cat "$RECLAIM_PENDING" "$STATE_DIR/reclaimed.list" 2>/dev/null | grep . | sort -u > "$MAC_CONFIRMED.seed"
-    sort -u "$MAC_CONFIRMED" "$MAC_CONFIRMED.seed" 2>/dev/null > "$MAC_CONFIRMED.tmp" && mv -f "$MAC_CONFIRMED.tmp" "$MAC_CONFIRMED"
-    log "first run on Google Photos for Mac: $(count_lines "$MAC_CONFIRMED.seed") file(s) the emulator already confirmed are not sent again"
-    rm -f "$MAC_CONFIRMED.seed"
+    # cat, never `sort -u a b`: on this first run MAC_CONFIRMED does not exist
+    # yet, sort fails on the missing file and the mv never happens -- which is
+    # how the first production run (2026-09-16) logged "3108 not sent again"
+    # and then handed 300 of them to Google Photos.
+    cat "$RECLAIM_PENDING" "$STATE_DIR/reclaimed.list" "$MAC_CONFIRMED" 2>/dev/null | grep . | sort -u > "$MAC_CONFIRMED.tmp" \
+      && mv -f "$MAC_CONFIRMED.tmp" "$MAC_CONFIRMED" \
+      || fail "could not seed $MAC_CONFIRMED from the emulator's reclaim lists"
+    log "first run on Google Photos for Mac: $(count_lines "$MAC_CONFIRMED") file(s) the emulator already confirmed are not sent again"
   fi
 }
 
@@ -165,7 +190,14 @@ mac_handoff() {
     if [ "${src_sz:-0}" -eq 0 ]; then
       empty=$((empty + 1)); log "  empty staged file skipped (delete it to let icloudpd fetch it again): $rel"; continue
     fi
+    # The flat name must map back to ONE staged path: "a/b_c" and "a_b/c"
+    # both flatten to "a_b_c", and the second would be confirmed and deleted
+    # from iCloud on the strength of the first's upload. The second waits
+    # until the first has left the ledger.
     name="${rel//\//_}"
+    if [ "$(awk -F'\t' -v n="$name" -v r="$rel" '$1 == n && $2 != r { c++ } END { print c + 0 }' "$MAC_LEDGER" "$batch" 2>/dev/null)" -gt 0 ]; then
+      log "  name clash, waits for the next run: $rel"; continue
+    fi
     if /bin/cp -p "$STAGING/$rel" "$MAC_INBOX/.incoming-$name" 2>/dev/null \
        && dst_sz="$(/usr/bin/stat -f %z "$MAC_INBOX/.incoming-$name" 2>/dev/null)" && [ "$dst_sz" = "$src_sz" ]; then
       printf '%s\t%s\n' "$name" "$rel" >> "$batch"
@@ -178,7 +210,7 @@ mac_handoff() {
   while IFS="$(printf '\t')" read -r name rel; do
     [ -n "$name" ] || continue
     if mv -f "$MAC_INBOX/.incoming-$name" "$MAC_INBOX/$name"; then
-      printf '%s\t%s\n' "$name" "$rel" >> "$MAC_LEDGER"
+      printf '%s\t%s\t%s\n' "$name" "$rel" "$(date +%s)" >> "$MAC_LEDGER"
       MAC_HANDED=$((MAC_HANDED + 1))
     fi
   done < "$batch"
@@ -197,18 +229,20 @@ mac_sync() {
   mkdir -p "$MAC_INBOX" 2>/dev/null || fail "cannot create $MAC_INBOX"
   mac_seed
   mac_collect
-  mac_handoff
-  local waiting start end done_now failed_now polls=0 online prev_conf prev_fail
-  waiting="$(mac_outstanding | grep -c .)"
-  if [ "$waiting" -eq 0 ]; then
-    log "nothing waiting for Google Photos"
-    date +%s > "$STATE_DIR/last-upload-confirmed"
-    return 0
-  fi
+  # The app before any copying: a Mac that has never signed in would otherwise
+  # fill ~/Pictures with a library's worth of copies for nothing.
   mac_launch
   case "$(mac_alive engine)" in true|1) ;; *) fail "this Google Photos has no GoToHP engine (the IPA must carry the Gunshot tweak's GunshotJailed.dylib) — run gphotos-mac-setup" ;; esac
   [ "$(mac_alive account)" = true ] || fail "Google Photos is not signed in (open it and sign in once; the bridge reports no account)"
+  local waiting start end done_now failed_now polls=0 online prev_conf prev_fail
   prev_conf="$(count_lines "$MAC_CONFIRMED")"; prev_fail="$(count_lines "$MAC_FAILED")"
+  mac_handoff
+  waiting="$(mac_outstanding | grep -c .)"
+  if [ "$waiting" -eq 0 ]; then
+    log "nothing waiting for Google Photos"
+    if [ "$(count_lines "$MAC_FAILED")" -eq "$prev_fail" ]; then date +%s > "$STATE_DIR/last-upload-confirmed"; fi
+    return 0
+  fi
   start="$waiting"; end=$((SECONDS + UPLOAD_WAIT + waiting * 2))
   phase "verifying uploads: 0 of $start confirmed"
   while :; do
@@ -222,8 +256,14 @@ mac_sync() {
     [ "$SECONDS" -ge "$end" ] && break
     mac_bridge_up || fail "the Google Photos upload bridge stopped reporting (the app quit or hung)"
     online="$(mac_alive online)"
-    if [ "$online" != true ] && [ $((polls % 4)) -eq 1 ]; then
-      log "  Google Photos cannot upload right now: its window is minimised or hidden, or the Mac is offline (uploads resume on their own once it is visible)"
+    if [ $((polls % 4)) -eq 1 ]; then
+      if [ "$online" != true ]; then
+        log "  Google Photos cannot upload right now: its window is minimised or hidden, or the Mac is offline (uploads resume on their own once it is visible)"
+      elif [ "$(mac_alive paused)" = true ]; then
+        log "  uploads are PAUSED in Google Photos' GoToHP settings"
+      elif [ "$(mac_alive wifiOnly)" = true ] && [ "$(mac_alive wifi)" != true ]; then
+        log "  Google Photos is still set to Wi-Fi only and the Mac is not on Wi-Fi (the bridge retries turning that off)"
+      fi
     fi
     [ $((polls % 4)) -eq 0 ] && log "upload in progress: $done_now/$start confirmed, $waiting waiting, $failed_now failed"
     phase "verifying uploads: $done_now of $start confirmed"
