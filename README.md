@@ -169,7 +169,9 @@ pipeline becomes a one-way copier.
    (`2026/05/IMG_2885.HEIC` -> `2026_05_IMG_2885.HEIC`) so the ledger maps every
    name back exactly. The staging tree is never touched.
 3. **Google Photos is launched in the background** (`open -g`) if it is not
-   running. The bridge inside it scans the folder every 3 s, waits for a file's
+   running and there is something to hand over or to wait for; a tick with
+   nothing new and nothing waiting is one listing and one read of the
+   bridge's ledger, and never launches it. The bridge inside it scans the folder every 3 s, waits for a file's
    inode to be quiet for 5 s, pairs a Live Photo's still and video by stem, and
    imports each item into the engine, which uploads it with the Pixel XL
    original-quality profile. The engine uploads only while the app has a
@@ -180,9 +182,11 @@ pipeline becomes a one-way copier.
    sync records the confirmation, puts the staged path on the reclaim list, and
    deletes the moved copy. A job the engine gave up on lands in `Failed/`; the
    sync hands the file over again on a later run, three times, then leaves it.
-   A handoff the bridge has said nothing about for six hours counts as one of
-   those failures, so one stuck file cannot hold the pipeline's confirmation
-   (and with it the iCloud reclaim) hostage.
+   A handoff the bridge never picked up - no entry in its ledger six hours
+   later: a copy that never settled, a folder emptied by hand - counts as
+   one of those failures and is handed over again; a job the bridge does
+   hold is the engine's however long it takes, since it uploads one item at
+   a time and only while the app is visible and online.
    `remote_live_photo_component_exists` - Google already holds one half of a
    Live Photo pair, by hash - is neither: the pair goes on `mac-exists.list`
    and stays in iCloud, because which half matched is not reported.

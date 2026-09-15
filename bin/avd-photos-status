@@ -19,6 +19,7 @@ LIB_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BAS
 # shellcheck disable=SC1091
 . "$LIB_DIR/proc.sh"
 ap_load_config
+export LC_ALL=C   # bytewise sort/comm over staged paths, as in avd-photos-sync
 # After the config: the Mac backend's paths are config keys.
 # shellcheck disable=SC1091
 . "$LIB_DIR/mac.sh"

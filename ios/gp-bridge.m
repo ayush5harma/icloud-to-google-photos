@@ -22,9 +22,6 @@
 //       alive.json     heartbeat: pid, time, engine found, signed in, whether
 //                      the engine may upload now ("online": a visible window
 //                      and a network), paused, last error
-//       request-<id>.json / response-<id>.json
-//                      read-only engine queries (ping, list, job, options,
-//                      upload_summary, accounts) for a caller that needs one
 //
 // A caller drops a file under a dot-name and renames it into place (the
 // scanner skips dot-names, and waits out anything whose inode changed in the
@@ -190,8 +187,16 @@ static void move_into(NSString *sub, NSArray<NSString *> *names) {
     if ([NSFileManager.defaultManager fileExistsAtPath:[dest stringByAppendingPathComponent:leaf]])
       leaf = [NSString stringWithFormat:@"%@-%lld.%@", n.stringByDeletingPathExtension,
                                         (long long)NSDate.date.timeIntervalSince1970, n.pathExtension];
-    [NSFileManager.defaultManager moveItemAtPath:[g_root stringByAppendingPathComponent:n]
-                                          toPath:[dest stringByAppendingPathComponent:leaf] error:NULL];
+    // Recorded only when the move happened: an entry that claims a file
+    // nowhere on disk could never be consumed, and its upload -- media key
+    // and all -- would never be confirmed. A failed move is tried again on
+    // the next tick, since the entry stays unfinished.
+    NSError *err = nil;
+    if (![NSFileManager.defaultManager moveItemAtPath:[g_root stringByAppendingPathComponent:n]
+                                               toPath:[dest stringByAppendingPathComponent:leaf] error:&err]) {
+      g_lastError = [NSString stringWithFormat:@"move %@: %@", n, err.localizedDescription ?: @"failed"];
+      continue;
+    }
     NSMutableDictionary *e = g_ledger[n];
     e[@"moved"] = [sub stringByAppendingPathComponent:leaf];
     e[@"movedAt"] = @((long long)NSDate.date.timeIntervalSince1970);
@@ -296,37 +301,6 @@ static void refresh_jobs(void) {
   }
 }
 
-static void serve_requests(void) {
-  NSFileManager *fm = NSFileManager.defaultManager;
-  for (NSString *name in [[fm contentsOfDirectoryAtPath:g_dir error:NULL] sortedArrayUsingSelector:@selector(compare:)]) {
-    if (![name hasPrefix:@"request-"] || ![name hasSuffix:@".json"]) continue;
-    NSString *path = [g_dir stringByAppendingPathComponent:name];
-    NSData *body = [NSData dataWithContentsOfFile:path];
-    [fm removeItemAtPath:path error:NULL];
-    NSDictionary *req = body ? [NSJSONSerialization JSONObjectWithData:body options:0 error:NULL] : nil;
-    NSMutableDictionary *reply = [NSMutableDictionary dictionary];
-    // Read-only operations only. The folder is reachable by every process of
-    // this user, so a passthrough that could upload, cancel or reconfigure
-    // would hand the app's signed-in engine to any of them.
-    NSString *op = [req isKindOfClass:NSDictionary.class] ? req[@"op"] : nil;
-    NSSet *readOnly = [NSSet setWithArray:@[@"ping", @"list", @"job", @"options", @"upload_summary", @"accounts"]];
-    if (![op isKindOfClass:NSString.class] || ![readOnly containsObject:op]) {
-      reply[@"bridgeError"] = @"only ping, list, job, options, upload_summary and accounts are served";
-    } else {
-      NSData *raw = [NSJSONSerialization dataWithJSONObject:req options:0 error:NULL];
-      NSString *text = [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding];
-      char *out = g_request(text.UTF8String, "photos");
-      if (out) {
-        id parsed = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:out length:strlen(out)] options:0 error:NULL];
-        reply[@"reply"] = parsed ?: @(out);
-        g_free(out);
-      }
-    }
-    write_json([g_dir stringByAppendingPathComponent:[NSString stringWithFormat:@"response-%@.json",
-                                                      [[name substringFromIndex:8] stringByDeletingPathExtension]]], reply);
-  }
-}
-
 static void tick(void) {
   if (!g_request) {
     g_request = (gs_request_fn)dlsym(RTLD_DEFAULT, "GunshotRequest");
@@ -335,7 +309,6 @@ static void tick(void) {
   NSFileManager *fm = NSFileManager.defaultManager;
   [fm createDirectoryAtPath:g_dir withIntermediateDirectories:YES attributes:nil error:NULL];
   if (g_request && g_free) {
-    serve_requests();
     if (!g_account) g_account = selected_account();
     relax_wifi_only();
     if (g_account) {
@@ -356,7 +329,7 @@ static void tick(void) {
              @{@"pid": @(getpid()), @"time": @((long long)NSDate.date.timeIntervalSince1970), @"engine": g_request ? @YES : @NO,
                @"account": g_account ? @YES : @NO, @"online": g_conditions[@"online"] ?: @NO,
                @"wifi": g_conditions[@"wifi"] ?: @NO, @"charging": g_conditions[@"charging"] ?: @NO,
-               @"wifiOnly": @(!g_wifiChecked), @"paused": g_conditions[@"paused"] ?: @NO,
+               @"wifiOnly": g_wifiChecked ? @NO : @YES, @"paused": g_conditions[@"paused"] ?: @NO,
                @"lastError": g_lastError ?: @"", @"folder": g_root});
 }
 
@@ -373,6 +346,7 @@ __attribute__((constructor)) static void gp_bridge_start(void) {
     NSMutableDictionary *e = [old[k] mutableCopy];
     if (![e[@"id"] isKindOfClass:NSString.class]) e[@"id"] = @"";
     if (![e[@"state"] isKindOfClass:NSString.class]) e[@"state"] = @"unknown";
+    if (![e[@"files"] isKindOfClass:NSArray.class]) e[@"files"] = @[k];
     g_ledger[k] = e;
   }
   static dispatch_source_t timer;

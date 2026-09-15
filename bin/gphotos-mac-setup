@@ -6,6 +6,10 @@
 #
 # MODES:  (no args) install or update      --check   report, change nothing
 #         --ipa FILE  install this IPA instead of downloading GPHOTOS_IPA_URL
+#                     (a one-off: unless its content is the pinned release,
+#                     the login agent restores the pinned IPA on its next
+#                     run -- change GPHOTOS_IPA_URL / GPHOTOS_IPA_SHA256 in
+#                     the config to make a different IPA the one to keep)
 #         --force     reinstall even when nothing changed
 #
 # WHAT THE IPA IS: Google Photos 7.92.0 with the Gunshot tweak's
@@ -166,6 +170,8 @@ printf '%s\n' "$want" > "$STAMP"
 # emulator path writes after its last phase.
 date +%s > "$STATE_DIR/setup-complete"
 say "installed $GPHOTOS_APP"
+[ -n "$IPA_FILE" ] && [ "$ipa_sha" != "$GPHOTOS_IPA_SHA256" ] \
+  && say "note: this IPA is not the pinned release; the login agent will reinstall the pinned one unless GPHOTOS_IPA_URL / GPHOTOS_IPA_SHA256 are changed in $CONFIG_FILE"
 pgrep -f "^$GPHOTOS_APP/[^/]*$" >/dev/null 2>&1 && say "the previous copy is still running; quit it so the new one starts at the next sync"
 say ""
 say "ONE THING LEFT, once: open Google Photos and sign in to the Google account the photos should go to."
