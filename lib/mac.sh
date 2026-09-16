@@ -81,7 +81,7 @@ mac_state_set() {  # <rel> <name> <state> <tries> [detail]
     $1 == r { next }
     { print }
     END { print r, n, s, now, t + 0, d }' "$MAC_STATE" > "$MAC_STATE.tmp" \
-    && mv -f "$MAC_STATE.tmp" "$MAC_STATE"
+    && mv -f "$MAC_STATE.tmp" "$MAC_STATE" || { rm -f "$MAC_STATE.tmp"; return 1; }
 }
 
 # Every staged path in one state, one per line.
