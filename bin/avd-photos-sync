@@ -20,6 +20,14 @@
 # relative to staging, so a re-download or a staging move does not confuse it.
 
 set -uo pipefail
+# BYTEWISE, WHATEVER THE TERMINAL'S LOCALE: every ledger comparison here is
+# sort | comm over staged paths, and under a UTF-8 locale sort and comm
+# collate -- two paths that differ only in "/" and "_" (a/b_c, a_b/c) order
+# differently and can compare EQUAL, so sort -u drops one and comm misses
+# it. launchd runs this in the C locale and never showed it; a hand run from
+# a terminal (avd-photos-offload, a --reclaim-dry-run) would (test/mac.sh
+# found it, 2026-09-16).
+export LC_ALL=C
 
 LIB_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/../lib"
 # shellcheck disable=SC1091
@@ -57,6 +65,8 @@ AVD_EMU="$AVD_SDK_ROOT/emulator/emulator"
 SER=""
 # --reclaim-dry-run: report what the iCloud reclaim WOULD delete and stop.
 RECLAIM_DRY_RUN=0
+# --retry-given-up: put the files this backend gave up on back in the queue.
+RETRY_GIVEN_UP=0
 
 ap_seed_path "$AVD_SDK_ROOT/platform-tools"
 
@@ -279,6 +289,19 @@ esac
 case " $* " in
   *" --reclaim-dry-run "*) RECLAIM_DRY_RUN=1 ;;
 esac
+case " $* " in
+  *" --retry-given-up "*) RETRY_GIVEN_UP=1 ;;
+esac
+
+# THE ONLY WAY BACK IN for a file that failed MAC_RETRIES times: the retry
+# budget is reset and the next run hands it over again. Bookkeeping only --
+# nothing is uploaded, nothing leaves iCloud, and no "done (" line is written,
+# so the status collector does not read this as a completed sync run.
+if [ "$RETRY_GIVEN_UP" = "1" ]; then
+  [ "$PHOTOS_BACKEND" = mac ] || fail "--retry-given-up belongs to the Mac backend (PHOTOS_BACKEND is $PHOTOS_BACKEND)"
+  mac_retry_given_up
+  exit 0
+fi
 
 # A DRY RUN of the reclaim only: which confirmed files would leave iCloud, and
 # whether their staged paths still resolve to assets in the library. It touches
@@ -367,8 +390,10 @@ else
 fi
 
 # ── 2-5 on Apple silicon: Google Photos for Mac ──────────────────────────────
-# No virtual machine to keep off, so no quiet-tick gate: a tick with nothing new
-# is one listing and a read of the bridge's ledger.
+# The quiet-tick gate lives INSIDE mac_sync rather than here, because it needs
+# the bridge's ledger taken in first: a tick with nothing new and nothing
+# waiting is one listing and one read of that ledger, and never launches the
+# app. There is no virtual machine to keep off, only a window not to open.
 if [ "$PHOTOS_BACKEND" = mac ]; then
   mac_sync
   if [ "$DELETE_FROM_ICLOUD" = "1" ] && [ -s "$RECLAIM_PENDING" ]; then reclaim_icloud; fi

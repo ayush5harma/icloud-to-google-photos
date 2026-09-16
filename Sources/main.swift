@@ -110,17 +110,19 @@ if cliArgs.first == "--run" {
 // "Check iCloud now" kickstarts <prefix>.sync so the run is launchd's child and
 // a restart of this app cannot kill it mid-push.
 let labelPrefix = "com.ayushsharma.icloud-to-google-photos"
-// Where gphotos-mac-setup installs Google Photos for iPhone/iPad (GPHOTOS_APP
-// in lib/config.sh; the environment override is honoured here too).
-let gphotosApp = ProcessInfo.processInfo.environment["GPHOTOS_APP"] ?? "/Applications/GooglePhotos.app"
-
 // MARK: - Model
 
 struct Stats {
     var armed = false, emulator = false
     var backend = "avd"      // "mac": Google Photos for iPhone/iPad on this Mac; "avd": the emulator
     var app = false, appOnline = false, signedIn = false   // the Mac backend's app, from the bridge heartbeat
+    // Where GPHOTOS_APP says Google Photos is. Published by the collector,
+    // which is the only reader of the config file this app can ask: a launchd
+    // agent's environment carries PATH and nothing else, so reading it here
+    // always yielded the default.
+    var appPath = "/Applications/GooglePhotos.app"
     var staged = 0, remaining = 0, onDevice = 0, uploaded = 0, queued = 0, failed = 0
+    var givenUp = 0          // failed their three tries; nothing retries them on its own
     var uploadAge = -1
     var confirmed = false    // last-upload-confirmed stamp present
     var confirmedAge = -1
@@ -392,9 +394,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         s.app = b["app"] as? Bool ?? false
         s.appOnline = b["app_online"] as? Bool ?? false
         s.signedIn = b["signed_in"] as? Bool ?? false
+        s.appPath = b["app_path"] as? String ?? s.appPath
         s.staged = b["staged"] as? Int ?? 0
         s.remaining = b["remaining"] as? Int ?? 0
         s.onDevice = b["on_device"] as? Int ?? 0
+        s.givenUp = b["given_up"] as? Int ?? 0
         s.uploaded = b["uploaded"] as? Int ?? 0
         s.queued = b["queued"] as? Int ?? 0
         s.failed = b["failed"] as? Int ?? 0
@@ -596,6 +600,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         mono(m, "Backlog", stats.remaining == 0 ? "caught up" : "\(stats.remaining)")
         if stats.backend == "mac" {
             if stats.onDevice > 0 { mono(m, "Uploading", "\(stats.onDevice) waiting on Google") }
+            // Shown only when there are any: these files are out of the
+            // pipeline until a human asks for them back, and a count nobody
+            // can act on is worse than no row.
+            if stats.givenUp > 0 { mono(m, "Given up", "\(stats.givenUp) — avd-photos-sync --retry-given-up") }
         } else if stats.emulator || stats.onDevice > 0 {
             mono(m, "On device", "\(stats.onDevice)\(stats.queued > 0 ? " (\(stats.queued) queued)" : "")")
         }
@@ -626,7 +634,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         m.addItem(.separator())
         if stats.backend == "mac" {
-            if FileManager.default.fileExists(atPath: gphotosApp) {
+            if FileManager.default.fileExists(atPath: stats.appPath) {
                 action(m, "Open Google Photos", #selector(openGPhotos))
             }
         } else if FileManager.default.fileExists(atPath: "/Applications/Google Photos (AVD).app") {
@@ -709,7 +717,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     @objc private func quit() { NSApp.terminate(nil) }
     @objc private func openAVD() { NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/Google Photos (AVD).app")) }
-    @objc private func openGPhotos() { NSWorkspace.shared.open(URL(fileURLWithPath: gphotosApp)) }
+    @objc private func openGPhotos() { NSWorkspace.shared.open(URL(fileURLWithPath: stats.appPath)) }
 }
 
 let app = NSApplication.shared

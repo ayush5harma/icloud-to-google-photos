@@ -6,6 +6,10 @@
 #
 # MODES:  (no args) install or update      --check   report, change nothing
 #         --ipa FILE  install this IPA instead of downloading GPHOTOS_IPA_URL
+#                     (a one-off: unless its content is the pinned release,
+#                     the login agent restores the pinned IPA on its next
+#                     run -- change GPHOTOS_IPA_URL / GPHOTOS_IPA_SHA256 in
+#                     the config to make a different IPA the one to keep)
 #         --force     reinstall even when nothing changed
 #
 # WHAT THE IPA IS: Google Photos 7.92.0 with the Gunshot tweak's
@@ -23,9 +27,10 @@
 # --reset (never run from here) clears it.
 #
 # THE STAMP is the IPA's hash, the bridge source's hash and the converter's
-# revision; the install is repeated only when one of them moves, so the
-# weekly agent and every switch cost one hash of a 175 MB file when nothing
-# changed.
+# content; the install is repeated only when one of them moves. All three are
+# known WITHOUT reading the cached IPA, which is why the cache is hashed only
+# once an install is going to happen: the login agent asks this question at
+# every login and the answer is almost always "nothing to do".
 
 set -uo pipefail
 
@@ -37,6 +42,9 @@ LIB_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BAS
 # shellcheck disable=SC1091
 . "$LIB_DIR/proc.sh"
 ap_load_config
+# For MAC_INBOX, the one definition of the folder the bridge watches.
+# shellcheck disable=SC1091
+. "$LIB_DIR/mac.sh"
 
 BRIDGE_SRC="$LIB_DIR/../ios/gp-bridge.m"
 LOG="$LOG_DIR/gphotos-mac-setup.log"
@@ -53,7 +61,7 @@ while [ $# -gt 0 ]; do
     --check) CHECK=1 ;;
     --force) FORCE=1 ;;
     --ipa) shift; IPA_FILE="${1:-}" ;;
-    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;   # through the last MODES line
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   [ $# -gt 0 ] && shift
@@ -62,9 +70,28 @@ log_init "$LOG"
 say() { log "$*"; printf '%s\n' "$*"; }
 die() { say "ERROR: $*"; exit 1; }
 
+# SINGLE INSTANCE, and its own lock rather than the caller's: the weekly setup
+# agent and the login bootstrap agent can fire together, and two converters
+# rewriting /Applications/GooglePhotos.app at once is how that bundle ends up
+# neither the old app nor the new one. --check reads and installs nothing.
+if [ "$CHECK" -eq 0 ]; then
+  LOCK="$STATE_DIR/gphotos-mac-setup.lock"
+  single_flight_lock "$LOCK" say
+  case $? in
+    1) say "another gphotos-mac-setup is running (pid $SFL_PID) — exiting"; exit 0 ;;
+    2) die "cannot take lock $LOCK" ;;
+  esac
+  trap 'rm -rf "$LOCK"' EXIT
+fi
+
 [ "$(uname -m)" = arm64 ] || die "an iOS app runs only on an Apple silicon Mac; this one is $(uname -m) (PHOTOS_BACKEND=avd is the Intel path)"
 [ -f "$BRIDGE_SRC" ] || die "bridge source missing: $BRIDGE_SRC"
-xcrun --sdk macosx --show-sdk-path >/dev/null 2>&1 || die "Xcode is needed (the bridge is compiled for Mac Catalyst against the macOS SDK): xcode-select --install is not enough"
+# TEST THE THING, not a proxy for it: `xcrun --show-sdk-path` succeeds with the
+# Command Line Tools alone, which carry no iOS-on-Mac SDK, so a CLT-only Mac
+# used to sail past this guard and fail deep inside the converter, unattended,
+# with the reason buried in a log.
+[ -d "$(xcrun --sdk macosx --show-sdk-path 2>/dev/null)/System/iOSSupport" ] \
+  || die "Xcode is needed: the Command Line Tools alone do not carry the iOS-on-Mac (Mac Catalyst) SDK the bridge is compiled against, so xcode-select --install is not enough"
 
 # ── The converter ────────────────────────────────────────────────────────────
 converter=""
@@ -85,20 +112,36 @@ else
   fi
   [ -x "$fetched/bin/ipa-install-on-mac" ] && converter="$fetched/bin/ipa-install-on-mac"
 fi
-# The converter's content, not a revision: an on-PATH converter (a Nix store
+# The converter's CONTENT, not a revision: an on-PATH converter (a Nix store
 # symlink here) has no git to ask, and a stamp that never moved would leave the
-# app on the old conversion after every converter bump.
-converter_rev="$( [ -n "$converter" ] && shasum -a 256 "$(readlink -f "$converter" 2>/dev/null || echo "$converter")" | cut -c1-64 || echo none )"
+# app on the old conversion after every converter bump. Its sibling lib/ counts
+# too -- the entry point resolves its library from its own real path, so a bump
+# that only touches lib/ changes the conversion while leaving bin/ byte-for-byte
+# identical. Hashes only and never paths, so the same converter fetched into
+# the state directory and installed on PATH stamp alike -- moving it is not a
+# new conversion.
+converter_hash() {  # <path to the converter>
+  local real dir
+  real="$(readlink -f "$1" 2>/dev/null || echo "$1")"
+  dir="$(dirname "$real")/../lib"
+  { shasum -a 256 "$real" | cut -c1-64
+    [ -d "$dir" ] && find "$dir" -type f -exec shasum -a 256 {} + 2>/dev/null | cut -c1-64 | sort
+    true
+  } | shasum -a 256 | cut -c1-64
+}
+converter_rev=none
+[ -n "$converter" ] && converter_rev="$(converter_hash "$converter")"
 
-# ── The IPA ──────────────────────────────────────────────────────────────────
-ipa=""
+# ── What the install would be ────────────────────────────────────────────────
+# WITHOUT READING THE CACHED IPA: the pinned hash is what an ordinary run
+# installs, so "nothing to do" is decided from three cheap values and the 175 MB
+# cache is hashed only below, once an install is actually going to happen. Only
+# --ipa, an explicit one-off, has to hash the file it was handed.
+ipa=""; ipa_sha=""
 if [ -n "$IPA_FILE" ]; then
   [ -f "$IPA_FILE" ] || die "no such file: $IPA_FILE"
-  ipa="$IPA_FILE"
-elif [ -f "$IPA_CACHE" ] && [ "$(shasum -a 256 "$IPA_CACHE" | cut -c1-64)" = "$GPHOTOS_IPA_SHA256" ]; then
-  ipa="$IPA_CACHE"
+  ipa="$IPA_FILE"; ipa_sha="$(shasum -a 256 "$ipa" | cut -c1-64)"
 fi
-ipa_sha="$( [ -n "$ipa" ] && shasum -a 256 "$ipa" | cut -c1-64 )"
 bridge_sha="$(shasum -a 256 "$BRIDGE_SRC" | cut -c1-64)"
 # --ipa with the same content as the download stamps the same, so the login
 # agent does not reinstall (and re-download) after a hand install.
@@ -116,12 +159,17 @@ if [ -d "$GPHOTOS_APP" ]; then
 fi
 
 if [ "$CHECK" -eq 1 ]; then
+  # A report a human asked for is the one place the cache is worth hashing
+  # whatever the answer, because "is the cached IPA the pinned one" is part of
+  # what was asked.
+  cached=none
+  [ -f "$IPA_CACHE" ] && cached="$(shasum -a 256 "$IPA_CACHE" | cut -c1-64)"
   say "backend:      $PHOTOS_BACKEND"
   say "app:          $GPHOTOS_APP ($installed; GoToHP engine: $engine; folder bridge: $bridge)"
-  say "IPA:          ${ipa:-not cached} (${ipa_sha:-would download $GPHOTOS_IPA_URL})"
+  say "IPA:          ${ipa:-$IPA_CACHE} (cached $cached; pinned $GPHOTOS_IPA_SHA256)"
   say "converter:    ${converter:-none}"
   say "up to date:   $([ "$installed" = yes ] && [ "$have" = "$want" ] && echo yes || echo no)"
-  say "upload folder: $GPHOTOS_UPLOAD_DIR"
+  say "upload folder: $MAC_INBOX"
   exit 0
 fi
 
@@ -131,6 +179,11 @@ if [ "$FORCE" -eq 0 ] && [ "$installed" = yes ] && [ "$have" = "$want" ]; then
 fi
 [ -n "$converter" ] || die "no converter"
 
+# An install IS going to happen, so now the cache is worth its 175 MB read: it
+# stands in for the download only when it is byte-for-byte the pinned release.
+if [ -z "$ipa" ] && [ -f "$IPA_CACHE" ] && [ "$(shasum -a 256 "$IPA_CACHE" | cut -c1-64)" = "$GPHOTOS_IPA_SHA256" ]; then
+  ipa="$IPA_CACHE"; ipa_sha="$GPHOTOS_IPA_SHA256"
+fi
 if [ -z "$ipa" ]; then
   say "downloading Google Photos from $GPHOTOS_IPA_URL"
   tmp="$IPA_CACHE.part"
@@ -150,22 +203,24 @@ fi
 # its next run once the old process exits. An install while Google Photos is
 # uploading would lose that job, so refuse while the upload folder is busy.
 busy=0
-for f in "$GPHOTOS_UPLOAD_DIR"/*; do [ -f "$f" ] && { busy=1; break; }; done
+for f in "$MAC_INBOX"/*; do [ -f "$f" ] && { busy=1; break; }; done
 if [ "$busy" -eq 1 ] && pgrep -f "^$GPHOTOS_APP/[^/]*$" >/dev/null 2>&1; then
-  die "Google Photos is running with files in $GPHOTOS_UPLOAD_DIR: let it finish (or quit it) before reinstalling"
+  die "Google Photos is running with files in $MAC_INBOX: let it finish (or quit it) before reinstalling"
 fi
 say "installing Google Photos (${ipa_sha:0:7}) with the folder bridge, converter ${converter_rev:0:7}"
 if ! "$converter" "$ipa" --dest "$(dirname "$GPHOTOS_APP")" --dylib "$BRIDGE_SRC" >>"$LOG" 2>&1; then
   die "ipa-install-on-mac failed; see $LOG"
 fi
 [ -d "$GPHOTOS_APP" ] || die "the converter finished but $GPHOTOS_APP does not exist (it names the app after the IPA's bundle: check $LOG for where it went)"
-mkdir -p "$GPHOTOS_UPLOAD_DIR"
+mkdir -p "$MAC_INBOX"
 printf '%s\n' "$want" > "$STAMP"
 # The pipeline's "setup finished" marker, which the login agent checks before
 # it runs the setup again (avd-photos-setup --bootstrap), the same one the
 # emulator path writes after its last phase.
 date +%s > "$STATE_DIR/setup-complete"
 say "installed $GPHOTOS_APP"
+[ -n "$IPA_FILE" ] && [ "$ipa_sha" != "$GPHOTOS_IPA_SHA256" ] \
+  && say "note: this IPA is not the pinned release; the login agent will reinstall the pinned one unless GPHOTOS_IPA_URL / GPHOTOS_IPA_SHA256 are changed in $CONFIG_FILE"
 pgrep -f "^$GPHOTOS_APP/[^/]*$" >/dev/null 2>&1 && say "the previous copy is still running; quit it so the new one starts at the next sync"
 say ""
 say "ONE THING LEFT, once: open Google Photos and sign in to the Google account the photos should go to."

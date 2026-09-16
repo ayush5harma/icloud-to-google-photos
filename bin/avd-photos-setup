@@ -90,10 +90,27 @@ for a in "$@"; do
   esac
 done
 
+# FRESH-MACHINE BOOTSTRAP: runs at login so a new Mac builds the whole rooted
+# stack unattended. It MUST be a no-op once setup has COMPLETED -- the full path
+# boots an emulator and downloads several GB -- and an interrupted build must
+# resume at the next login, which is why the marker is the last phase's, not the
+# emulator directory's.
+#
+# ABOVE THE BACKEND BRANCH, so that a login costs one stat(2) on both backends:
+# below it, every login on Apple silicon ran the whole Mac setup instead.
+if [ "$BOOTSTRAP" -eq 1 ]; then
+  [ -f "$SETUP_DONE" ] && exit 0
+  HEADLESS=1   # nobody asked for a window at login
+fi
+
 # ON APPLE SILICON THERE IS NO EMULATOR TO SET UP (PHOTOS_BACKEND=mac, lib/
 # config.sh): the same agents and commands drive Google Photos for Mac instead,
 # so a login or weekly tick, avd-start, avd-stop and avd-photos-check do the
 # equivalent thing there and never download an Android image.
+#
+# STILL ABOVE single_flight_lock: exec'ing away after taking the lock would
+# leave its directory behind for good, since the exit trap that removes it dies
+# with the image it replaced. gphotos-mac-setup takes a lock of its own.
 if [ "$PHOTOS_BACKEND" = mac ]; then
   SELF_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")"
   if [ "$START_ONLY" -eq 1 ]; then
@@ -106,16 +123,6 @@ if [ "$PHOTOS_BACKEND" = mac ]; then
   else
     exec "$SELF_DIR/gphotos-mac-setup"
   fi
-fi
-
-# FRESH-MACHINE BOOTSTRAP: runs at login so a new Mac builds the whole rooted
-# stack unattended. It MUST be a no-op once setup has COMPLETED -- the full path
-# boots an emulator and downloads several GB -- and an interrupted build must
-# resume at the next login, which is why the marker is the last phase's, not the
-# emulator directory's.
-if [ "$BOOTSTRAP" -eq 1 ]; then
-  [ -f "$SETUP_DONE" ] && exit 0
-  HEADLESS=1   # nobody asked for a window at login
 fi
 
 ap_seed_path "$SDK_ROOT/platform-tools"

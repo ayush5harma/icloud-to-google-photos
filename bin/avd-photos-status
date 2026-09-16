@@ -19,6 +19,7 @@ LIB_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BAS
 # shellcheck disable=SC1091
 . "$LIB_DIR/proc.sh"
 ap_load_config
+export LC_ALL=C   # bytewise sort/comm over staged paths, as in avd-photos-sync
 # After the config: the Mac backend's paths are config keys.
 # shellcheck disable=SC1091
 . "$LIB_DIR/mac.sh"
@@ -46,9 +47,13 @@ fi
 staged=0
 [ -d "$STAGING" ] && staged="$(find "$STAGING" -type f ! -name '.*' 2>/dev/null | wc -l | tr -d ' ')"
 
-ondev=0; uploaded=0; queued=0; failed=0; upl_age=-1
+ondev=0; uploaded=0; queued=0; failed=0; upl_age=-1; given_up=0
 if [ "$PHOTOS_BACKEND" = mac ]; then
-  ondev="$(mac_outstanding | grep -c . || true)"; ondev="${ondev:-0}"
+  ondev="$(mac_outstanding | mac_count)"
+  # Failed MAC_RETRIES times: nothing retries them until a human runs
+  # avd-photos-sync --retry-given-up, so they are their own number rather than
+  # part of a backlog that would otherwise never go down.
+  given_up="$(mac_given_up | mac_count)"
 elif [ "$emu" = true ]; then
   # ASK WHICH SERIAL IS OURS rather than assuming 5554: another emulator on this
   # Mac would otherwise have its camera folder counted as this pipeline's
@@ -72,11 +77,12 @@ fi
 
 # THE BACKLOG is staged files the ledger has not seen. `grep -c .` prints its own
 # 0 on an empty file AND exits 1, so a `|| echo 0` would print a second 0 and
-# break the JSON -- hence the `|| true` plus the ${x:-0} default, here and below.
+# break the JSON -- hence the `|| true` plus the ${x:-0} default below, and
+# mac_count (lib/mac.sh) where the count comes off a pipe.
 remaining=0
 if [ "$PHOTOS_BACKEND" = mac ]; then
   if [ "${staged:-0}" -gt 0 ]; then
-    handled_n="$(mac_handled | grep -c . || true)"; handled_n="${handled_n:-0}"
+    handled_n="$(mac_handled | mac_count)"
     remaining=$(( staged - handled_n )); [ "$remaining" -lt 0 ] && remaining=0
   fi
 elif [ "${staged:-0}" -gt 0 ] && [ -r "$STATE_DIR/pushed.list" ]; then
@@ -94,7 +100,7 @@ fi
 # line parsed below.
 if [ -r "$STATE_DIR/upload-status" ]; then
   read -r u t f ts _ < "$STATE_DIR/upload-status" 2>/dev/null || true
-  led="$STATE_DIR/pushed.list"; [ "$PHOTOS_BACKEND" = mac ] && led="$STATE_DIR/mac-queued.tsv"
+  led="$STATE_DIR/pushed.list"; [ "$PHOTOS_BACKEND" = mac ] && led="$MAC_STATE"
   led_m="$(stat -f %m "$led" 2>/dev/null || echo 0)"
   if [ "${ts:-0}" -ge "${led_m:-0}" ]; then
     uploaded="${u:-0}"; failed="${f:-0}"; queued="$(( ${t:-0} - ${u:-0} ))"
@@ -155,6 +161,11 @@ if [ -r "$lp" ]; then
   [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null && running=true
 fi
 [ -r "$STATE_DIR/phase" ] && phase="$(head -1 "$STATE_DIR/phase" | tr -d '"\\' | cut -c1-160)"
+# The app's path travels in the JSON because the menu bar is the third reader of
+# this config file and the only one that cannot source it: a launchd agent's
+# environment holds PATH and nothing else, so an env read there was always the
+# default (L5/B13 of the 2026-09-16 reviews). Escaped like phase.
+app_path="$(printf '%s' "$GPHOTOS_APP" | tr -d '"\\')"
 # A verify pass in flight publishes "verifying uploads: N of M confirmed" as its
 # phase; while the run is alive that is the live count for the batch on the
 # device (upload-status is written only after the pass ends).
@@ -169,5 +180,5 @@ if [ "$running" = true ]; then
   esac
 fi
 
-printf '{"backup":{"armed":%s,"backend":"%s","app":%s,"app_online":%s,"signed_in":%s,"emulator":%s,"staged":%s,"remaining":%s,"on_device":%s,"uploaded":%s,"queued":%s,"failed":%s,"upload_age":%s,"confirmed":%s,"confirmed_age":%s,"last_run_age":%s,"running":%s,"phase":"%s","reclaimed":%s,"reclaim_pending":%s},"ts":%s}\n' \
-  "$armed" "$PHOTOS_BACKEND" "$app" "$app_online" "$signed_in" "$emu" "${staged:-0}" "${remaining:-0}" "${ondev:-0}" "${uploaded:-0}" "${queued:-0}" "${failed:-0}" "${upl_age:--1}" "$confirmed" "$confirmed_age" "$last_run_age" "$running" "$phase" "$reclaimed" "$reclaim_pending" "$(date +%s)"
+printf '{"backup":{"armed":%s,"backend":"%s","app":%s,"app_online":%s,"signed_in":%s,"app_path":"%s","emulator":%s,"staged":%s,"remaining":%s,"on_device":%s,"given_up":%s,"uploaded":%s,"queued":%s,"failed":%s,"upload_age":%s,"confirmed":%s,"confirmed_age":%s,"last_run_age":%s,"running":%s,"phase":"%s","reclaimed":%s,"reclaim_pending":%s},"ts":%s}\n' \
+  "$armed" "$PHOTOS_BACKEND" "$app" "$app_online" "$signed_in" "$app_path" "$emu" "${staged:-0}" "${remaining:-0}" "${ondev:-0}" "${given_up:-0}" "${uploaded:-0}" "${queued:-0}" "${failed:-0}" "${upl_age:--1}" "$confirmed" "$confirmed_age" "$last_run_age" "$running" "$phase" "$reclaimed" "$reclaim_pending" "$(date +%s)"
