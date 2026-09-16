@@ -390,8 +390,10 @@ else
 fi
 
 # ── 2-5 on Apple silicon: Google Photos for Mac ──────────────────────────────
-# No virtual machine to keep off, so no quiet-tick gate: a tick with nothing new
-# is one listing and a read of the bridge's ledger.
+# The quiet-tick gate lives INSIDE mac_sync rather than here, because it needs
+# the bridge's ledger taken in first: a tick with nothing new and nothing
+# waiting is one listing and one read of that ledger, and never launches the
+# app. There is no virtual machine to keep off, only a window not to open.
 if [ "$PHOTOS_BACKEND" = mac ]; then
   mac_sync
   if [ "$DELETE_FROM_ICLOUD" = "1" ] && [ -s "$RECLAIM_PENDING" ]; then reclaim_icloud; fi

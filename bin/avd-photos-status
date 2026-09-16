@@ -77,7 +77,8 @@ fi
 
 # THE BACKLOG is staged files the ledger has not seen. `grep -c .` prints its own
 # 0 on an empty file AND exits 1, so a `|| echo 0` would print a second 0 and
-# break the JSON -- hence the `|| true` plus the ${x:-0} default, here and below.
+# break the JSON -- hence the `|| true` plus the ${x:-0} default below, and
+# mac_count (lib/mac.sh) where the count comes off a pipe.
 remaining=0
 if [ "$PHOTOS_BACKEND" = mac ]; then
   if [ "${staged:-0}" -gt 0 ]; then
