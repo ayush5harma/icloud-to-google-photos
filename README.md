@@ -186,10 +186,12 @@ pipeline becomes a one-way copier.
    later: a copy that never settled, a folder emptied by hand - counts as
    one of those failures and is handed over again; a job the bridge does
    hold is the engine's however long it takes, since it uploads one item at
-   a time and only while the app is visible and online.
+   a time and only while the app is visible and online. A file that used up
+   its three tries is left alone and counted in the menu bar's **Given up**
+   row; `avd-photos-sync --retry-given-up` is the only way back in.
    `remote_live_photo_component_exists` - Google already holds one half of a
-   Live Photo pair, by hash - is neither: the pair goes on `mac-exists.list`
-   and stays in iCloud, because which half matched is not reported.
+   Live Photo pair, by hash - is neither: the pair's row reads `exists` and
+   it stays in iCloud, because which half matched is not reported.
 5. **Reclaim iCloud space** for exactly the confirmed paths, the same step as
    the emulator's.
 

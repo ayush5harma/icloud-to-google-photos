@@ -65,6 +65,8 @@ AVD_EMU="$AVD_SDK_ROOT/emulator/emulator"
 SER=""
 # --reclaim-dry-run: report what the iCloud reclaim WOULD delete and stop.
 RECLAIM_DRY_RUN=0
+# --retry-given-up: put the files this backend gave up on back in the queue.
+RETRY_GIVEN_UP=0
 
 ap_seed_path "$AVD_SDK_ROOT/platform-tools"
 
@@ -287,6 +289,19 @@ esac
 case " $* " in
   *" --reclaim-dry-run "*) RECLAIM_DRY_RUN=1 ;;
 esac
+case " $* " in
+  *" --retry-given-up "*) RETRY_GIVEN_UP=1 ;;
+esac
+
+# THE ONLY WAY BACK IN for a file that failed MAC_RETRIES times: the retry
+# budget is reset and the next run hands it over again. Bookkeeping only --
+# nothing is uploaded, nothing leaves iCloud, and no "done (" line is written,
+# so the status collector does not read this as a completed sync run.
+if [ "$RETRY_GIVEN_UP" = "1" ]; then
+  [ "$PHOTOS_BACKEND" = mac ] || fail "--retry-given-up belongs to the Mac backend (PHOTOS_BACKEND is $PHOTOS_BACKEND)"
+  mac_retry_given_up
+  exit 0
+fi
 
 # A DRY RUN of the reclaim only: which confirmed files would leave iCloud, and
 # whether their staged paths still resolve to assets in the library. It touches
