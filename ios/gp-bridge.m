@@ -69,16 +69,22 @@ static const NSTimeInterval kForget = 3600;      // a consumed entry is dropped 
 static NSSet *image_exts(void) { return [NSSet setWithArray:@[@"jpg", @"jpeg", @"heic", @"heif", @"png", @"gif", @"webp", @"tif", @"tiff", @"dng", @"raw", @"cr2", @"cr3", @"nef", @"arw", @"orf", @"rw2", @"avif", @"bmp"]]; }
 static NSSet *video_exts(void) { return [NSSet setWithArray:@[@"mov", @"mp4", @"m4v", @"3gp", @"avi", @"mkv", @"mts", @"m2ts", @"wmv", @"webm"]]; }
 
-// A write that failed is recorded rather than swallowed: these files are the
-// bridge's only channel to the caller, so "the folder went read-only" must
+// A write that failed is recorded rather than swallowed: these two files are
+// the bridge's only channel to the caller, so "the folder went read-only" must
 // reach the next heartbeat that does get through instead of showing up 30 s
 // later as an unexplained silence.
+static BOOL write_file(NSString *path, NSData *data) {
+  NSError *err = nil;
+  if ([data writeToFile:path options:NSDataWritingAtomic error:&err]) return YES;
+  g_lastError = [NSString stringWithFormat:@"write %@: %@", path.lastPathComponent,
+                                           err.localizedDescription ?: @"failed"];
+  return NO;
+}
+
 static void write_json(NSString *path, id obj) {
   NSData *data = [NSJSONSerialization dataWithJSONObject:obj options:NSJSONWritingSortedKeys error:NULL];
-  if (!data) { g_lastError = [NSString stringWithFormat:@"serialise %@", path.lastPathComponent]; return; }
-  NSError *err = nil;
-  if (![data writeToFile:path options:NSDataWritingAtomic error:&err])
-    g_lastError = [NSString stringWithFormat:@"write %@: %@", path.lastPathComponent, err.localizedDescription ?: @"failed"];
+  if (data) write_file(path, data);
+  else g_lastError = [NSString stringWithFormat:@"serialise %@", path.lastPathComponent];
 }
 
 // One engine call. Returns the reply's "data" (NSNull when empty) or nil on
@@ -346,14 +352,9 @@ static void tick(void) {
     // Written only when it changed: thousands of entries rewritten every 3 s
     // is disk traffic for nothing. Sorted keys make the comparison stable.
     NSData *now = [NSJSONSerialization dataWithJSONObject:@{@"files": g_ledger} options:NSJSONWritingSortedKeys error:NULL];
-    if (now && ![now isEqualToData:g_written]) {
-      NSError *err = nil;
-      if ([now writeToFile:[g_dir stringByAppendingPathComponent:@"ledger.json"]
-                   options:NSDataWritingAtomic error:&err])
-        g_written = now;
-      else
-        g_lastError = [NSString stringWithFormat:@"write ledger.json: %@", err.localizedDescription ?: @"failed"];
-    }
+    if (now && ![now isEqualToData:g_written]
+        && write_file([g_dir stringByAppendingPathComponent:@"ledger.json"], now))
+      g_written = now;
   }
   write_json([g_dir stringByAppendingPathComponent:@"alive.json"],
              @{@"pid": @(getpid()), @"time": @((long long)NSDate.date.timeIntervalSince1970), @"engine": g_request ? @YES : @NO,
