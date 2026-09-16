@@ -122,11 +122,25 @@ mac_given_up() {
   awk -F'\t' -v max="$MAC_RETRIES" '$3 == "failed" && $5 + 0 >= max { print $1 }' "$MAC_STATE"
 }
 
+# A transition that leaves the retry budget where it is -- every state change
+# but a failure.
+mac_state_to() {  # <rel> <name> <state> [detail]
+  mac_state_set "$1" "$2" "$3" "$(mac_state_tries "$1")" "${4:--}"
+}
+
 # Records one failed handoff against the staged path's own row: the try count
 # is what MAC_RETRIES is measured against, and the detail is the last reason.
 mac_fail() {  # <rel> <name> <error>
   MAC_FAILURES=$((MAC_FAILURES + 1))
   mac_state_set "$1" "$2" failed "$(( $(mac_state_tries "$1") + 1 ))" "${3:--}"
+}
+
+# THE ONLY DOOR TO DELETING FROM iCLOUD, and it opens for a run that recorded
+# no failure at all. A run that did leaves the stamp for the poll loop to
+# remove, so the reclaim step refuses on the very next run.
+mac_stamp_if_clean() {
+  [ "$MAC_FAILURES" -eq 0 ] && date +%s > "$STATE_DIR/last-upload-confirmed"
+  return 0
 }
 
 # The lines of one legacy file, each tagged with what it is, or nothing when
@@ -253,14 +267,14 @@ mac_collect() {
     case "$moved" in
       Uploaded/*)
         if [ "$state" = completed ] && [ -n "$key" ] && [ "$key" != "-" ]; then
-          mac_state_set "$rel" "$name" confirmed "$(mac_state_tries "$rel")" -
+          mac_state_to "$rel" "$name" confirmed
           grep -qxF "$rel" "$RECLAIM_PENDING" 2>/dev/null || printf '%s\n' "$rel" >> "$RECLAIM_PENDING"
           rm -f "$MAC_INBOX/$moved"
           MAC_DONE=$((MAC_DONE + 1))
         fi ;;
       Failed/*)
         if [ "$err" = remote_live_photo_component_exists ]; then
-          mac_state_set "$rel" "$name" exists "$(mac_state_tries "$rel")" "$err"
+          mac_state_to "$rel" "$name" exists "$err"
           log "  already in Google Photos (a Live Photo component matched by hash), kept in iCloud: $rel"
         else
           mac_fail "$rel" "$name" "$err"
@@ -327,19 +341,18 @@ mac_list_new() {
 # Live Photo's still and video together. cp -p keeps the photo's own date,
 # which the engine turns into the item's timestamp.
 mac_handoff() {
-  local newf batch outs rel name tries src_sz dst_sz room cap evicted=0 empty=0 short=0 total_new clash
-  newf="$(mktemp)"; batch="$(mktemp)"; outs="$(mktemp)"
+  local newf batch rel name src_sz dst_sz room cap target evicted=0 empty=0 short=0 total_new clash
+  newf="$(mktemp)"; batch="$(mktemp)"
   rm -f "$MAC_INBOX"/.incoming-* 2>/dev/null
   mac_list_new "$newf"
   total_new="$(count_lines "$newf")"
-  mac_outstanding > "$outs"
-  room=$((MAC_INBOX_MAX - $(count_lines "$outs")))
+  room=$((MAC_INBOX_MAX - $(mac_outstanding | mac_count)))
   cap="$PUSH_CAP"; [ "$room" -lt "$cap" ] && cap="$room"; [ "$cap" -lt 0 ] && cap=0
-  [ "$total_new" -gt 0 ] && [ "$cap" -gt 0 ] && phase "pushing 0 of $(( total_new < cap ? total_new : cap )) to Google Photos"
+  target=$(( total_new < cap ? total_new : cap ))
+  [ "$target" -gt 0 ] && phase "pushing 0 of $target to Google Photos"
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
     [ "$(count_lines "$batch")" -ge "$cap" ] && break
-    tries="$(mac_state_tries "$rel")"
     # An online-only stub can block forever when read: metadata only, skip it.
     if /usr/bin/stat -f %Sf "$STAGING/$rel" 2>/dev/null | grep -q dataless; then evicted=$((evicted + 1)); continue; fi
     src_sz="$(/usr/bin/stat -f %z "$STAGING/$rel" 2>/dev/null || echo 0)"
@@ -359,59 +372,34 @@ mac_handoff() {
     fi
     if /bin/cp -p "$STAGING/$rel" "$MAC_INBOX/.incoming-$name" 2>/dev/null \
        && dst_sz="$(/usr/bin/stat -f %z "$MAC_INBOX/.incoming-$name" 2>/dev/null)" && [ "$dst_sz" = "$src_sz" ]; then
-      printf '%s\t%s\t%s\n' "$name" "$rel" "$tries" >> "$batch"
-      [ $(( $(count_lines "$batch") % 25 )) -eq 0 ] && phase "pushing $(count_lines "$batch") of $(( total_new < cap ? total_new : cap )) to Google Photos"
+      printf '%s\t%s\n' "$name" "$rel" >> "$batch"
+      [ $(( $(count_lines "$batch") % 25 )) -eq 0 ] && phase "pushing $(count_lines "$batch") of $target to Google Photos"
     else
       log "WARNING: short copy, not handed over: $rel (staged $src_sz bytes, copied ${dst_sz:-?})"
       rm -f "$MAC_INBOX/.incoming-$name"; short=$((short + 1))
     fi
   done < "$newf"
-  while IFS="$(printf '\t')" read -r name rel tries; do
+  while IFS="$(printf '\t')" read -r name rel; do
     [ -n "$name" ] || continue
     if mv -f "$MAC_INBOX/.incoming-$name" "$MAC_INBOX/$name"; then
-      mac_state_set "$rel" "$name" queued "$tries" -
+      mac_state_to "$rel" "$name" queued
       MAC_HANDED=$((MAC_HANDED + 1))
     fi
   done < "$batch"
   log "staged $MAC_STAGED media file(s); new since last run: $total_new; handed to Google Photos $MAC_HANDED (cap $cap), short $short, evicted-skipped $evicted, empty-skipped $empty; given up after $MAC_RETRIES failures so far: $(mac_given_up | mac_count)"
   [ "$total_new" -gt "$MAC_HANDED" ] && log "$((total_new - MAC_HANDED)) left for the next run"
-  rm -f "$newf" "$batch" "$outs"
+  rm -f "$newf" "$batch"
 }
 
-# The whole backend: prerequisites, handoff, then wait for Google's answers
-# (bounded by UPLOAD_WAIT, like the emulator's verify pass), publishing the
-# counts the menu bar reads. Uploads keep going after the wait; the next run
-# collects whatever finished in between.
-mac_sync() {
-  [ -d "$GPHOTOS_APP" ] || fail "Google Photos is not installed at $GPHOTOS_APP — run gphotos-mac-setup"
-  command -v jq >/dev/null 2>&1 || [ -x /usr/bin/jq ] || fail "jq missing (it ships with macOS 15 and later)"
-  mkdir -p "$MAC_INBOX" 2>/dev/null || fail "cannot create $MAC_INBOX"
-  mac_migrate
-  local waiting new newf start end polls=0 online
-  mac_collect
-  # A quiet tick is one listing and one read of the bridge's ledger: the app
-  # is launched only when there is something to hand over or to wait for.
-  newf="$(mktemp)"; mac_list_new "$newf"; new="$(count_lines "$newf")"; rm -f "$newf"
-  waiting="$(mac_outstanding | mac_count)"
-  if [ "$new" -eq 0 ] && [ "$waiting" -eq 0 ]; then
-    log "staged $MAC_STAGED media file(s); nothing new, nothing waiting for Google Photos"
-    [ "$MAC_FAILURES" -eq 0 ] && date +%s > "$STATE_DIR/last-upload-confirmed"
-    return 0
-  fi
-  # The app, and its sign-in, before any copying: a Mac that has never signed
-  # in would otherwise fill ~/Pictures with a library's worth of copies.
-  mac_launch
-  case "$(mac_alive engine)" in true|1) ;; *) fail "this Google Photos has no GoToHP engine (the IPA must carry the Gunshot tweak's GunshotJailed.dylib) — run gphotos-mac-setup" ;; esac
-  [ "$(mac_alive account)" = true ] || fail "Google Photos is not signed in (open it and sign in once; the bridge reports no account)"
-  mac_expire
-  [ "$new" -gt 0 ] && mac_handoff
-  waiting="$(mac_outstanding | mac_count)"
-  if [ "$waiting" -eq 0 ]; then
-    log "nothing waiting for Google Photos"
-    [ "$MAC_FAILURES" -eq 0 ] && date +%s > "$STATE_DIR/last-upload-confirmed"
-    return 0
-  fi
-  start="$waiting"; end=$((SECONDS + UPLOAD_WAIT + waiting * 2))
+# Wait for Google's answers to the handoffs in flight, bounded by UPLOAD_WAIT
+# (like the emulator's verify pass), and report what came back. Uploads keep
+# going after the wait; the next run collects whatever finished in between.
+# Every fourth poll says why nothing is moving, if that is the case: the engine
+# uploads only while the app has a visible window, and none of its three
+# reasons for standing still is visible from outside.
+mac_wait_for_google() {  # <how many were outstanding when the wait began>
+  local start="$1" waiting end polls=0
+  end=$((SECONDS + UPLOAD_WAIT + start * 2))
   phase "verifying uploads: 0 of $start confirmed"
   while :; do
     sleep 15
@@ -421,9 +409,8 @@ mac_sync() {
     [ "$waiting" -eq 0 ] && break
     [ "$SECONDS" -ge "$end" ] && break
     mac_bridge_up || fail "the Google Photos upload bridge stopped reporting (the app quit or hung)"
-    online="$(mac_alive online)"
     if [ $((polls % 4)) -eq 1 ]; then
-      if [ "$online" != true ]; then
+      if [ "$(mac_alive online)" != true ]; then
         log "  Google Photos cannot upload right now: its window is minimised or hidden, or the Mac is offline (uploads resume on their own once it is visible)"
       elif [ "$(mac_alive paused)" = true ]; then
         log "  uploads are PAUSED in Google Photos' GoToHP settings"
@@ -443,4 +430,38 @@ mac_sync() {
     log "         the ones still waiting keep uploading; the next run collects them"
     rm -f "$STATE_DIR/last-upload-confirmed"
   fi
+}
+
+# The whole backend: prerequisites, the outcomes waiting since last time, then
+# the handoff and the wait, publishing the counts the menu bar reads.
+mac_sync() {
+  [ -d "$GPHOTOS_APP" ] || fail "Google Photos is not installed at $GPHOTOS_APP — run gphotos-mac-setup"
+  command -v jq >/dev/null 2>&1 || [ -x /usr/bin/jq ] || fail "jq missing (it ships with macOS 15 and later)"
+  mkdir -p "$MAC_INBOX" 2>/dev/null || fail "cannot create $MAC_INBOX"
+  mac_migrate
+  local waiting new newf
+  mac_collect
+  # A quiet tick is one listing and one read of the bridge's ledger: the app
+  # is launched only when there is something to hand over or to wait for.
+  newf="$(mktemp)"; mac_list_new "$newf"; new="$(count_lines "$newf")"; rm -f "$newf"
+  waiting="$(mac_outstanding | mac_count)"
+  if [ "$new" -eq 0 ] && [ "$waiting" -eq 0 ]; then
+    log "staged $MAC_STAGED media file(s); nothing new, nothing waiting for Google Photos"
+    mac_stamp_if_clean
+    return 0
+  fi
+  # The app, and its sign-in, before any copying: a Mac that has never signed
+  # in would otherwise fill ~/Pictures with a library's worth of copies.
+  mac_launch
+  case "$(mac_alive engine)" in true|1) ;; *) fail "this Google Photos has no GoToHP engine (the IPA must carry the Gunshot tweak's GunshotJailed.dylib) — run gphotos-mac-setup" ;; esac
+  [ "$(mac_alive account)" = true ] || fail "Google Photos is not signed in (open it and sign in once; the bridge reports no account)"
+  mac_expire
+  [ "$new" -gt 0 ] && mac_handoff
+  waiting="$(mac_outstanding | mac_count)"
+  if [ "$waiting" -eq 0 ]; then
+    log "nothing waiting for Google Photos"
+    mac_stamp_if_clean
+    return 0
+  fi
+  mac_wait_for_google "$waiting"
 }
