@@ -5,7 +5,9 @@
 # back through the bridge's ledger. Sourced by avd-photos-sync after its own
 # helpers (log, phase, fail, count_lines, enumerate_staging, ENUM_ERR);
 # mac_sync stands in for steps 2 to 5 of the emulator path, and step 6, the
-# iCloud reclaim, is the same code for both.
+# iCloud reclaim, is the same code for both. avd-photos-status and
+# gphotos-mac-setup source it too -- the first for the counts, the second for
+# MAC_INBOX, which is defined here and nowhere else.
 #
 # CONFIRMATION IS GOOGLE'S MEDIA KEY. The bridge moves a file into Uploaded/
 # only when the engine's job completed with a media key, which is the commit
@@ -48,7 +50,12 @@ MAC_RETRIES=3                                  # handoffs per file before it is 
 # while the app is visible and online, so wall-clock time says nothing about
 # it, and a re-drop of a name the bridge tracks is ignored by it anyway.
 MAC_GIVE_UP=$((6 * 3600))
-MAC_INBOX="$GPHOTOS_UPLOAD_DIR"
+# THE ONE DEFINITION OF THE UPLOAD FOLDER, and deliberately not a config key:
+# the bridge inside the app hardcodes this path (ios/gp-bridge.m) because the
+# app's sandbox reaches exactly ~/Pictures and cannot read this pipeline's
+# config at all. A key only the sync honoured moved one half of the contract
+# and left the other where it was.
+MAC_INBOX="$HOME/Pictures/Google Photos Upload"
 MAC_BRIDGE="$MAC_INBOX/.bridge"
 MAC_HANDED=0                                   # handed over this run, for the "done" line
 MAC_DONE=0                                     # confirmed this run

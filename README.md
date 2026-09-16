@@ -573,7 +573,6 @@ first place.
 | `GOOGLE_ACCOUNT` | (unset) | The account the emulator signs in as. Only ever printed. |
 | `PHOTOS_BACKEND` | `mac` on arm64, `avd` otherwise | `mac` = Google Photos for Mac (Apple silicon only); `avd` = the emulator. |
 | `GPHOTOS_APP` | `/Applications/GooglePhotos.app` | Where `gphotos-mac-setup` installs the app (named after the IPA's bundle by the converter). |
-| `GPHOTOS_UPLOAD_DIR` | `~/Pictures/Google Photos Upload` | The folder the bridge watches. Keep it under `~/Pictures`: that is all the app's sandbox reaches. |
 | `GPHOTOS_IPA_URL` / `GPHOTOS_IPA_SHA256` | this repo's release asset | The IPA to install and the hash it must have. |
 | `IPA_INSTALL` | `ipa-install-on-mac` | The converter; fetched at a pinned revision when not on PATH. |
 | `MAC_INBOX_MAX` | `300` | Files waiting in the upload folder at once (the engine keeps a second copy of each while it uploads). |

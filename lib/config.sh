@@ -37,7 +37,7 @@ AP_LABEL_PREFIX="com.ayushsharma.icloud-to-google-photos"
 # Every key the config file may set. Used for the precedence restore above, and
 # it is the list the README documents.
 AP_KEYS="ICLOUD_USERNAME ICLOUDPD STAGING ICLOUD_DIR SHARED_CACHE_DIR
-         GOOGLE_ACCOUNT PHOTOS_BACKEND GPHOTOS_APP GPHOTOS_UPLOAD_DIR
+         GOOGLE_ACCOUNT PHOTOS_BACKEND GPHOTOS_APP
          GPHOTOS_IPA_URL GPHOTOS_IPA_SHA256 IPA_INSTALL MAC_INBOX_MAX AVD_NAME AVD_SDK_ROOT AVD_ABI AVD_TAG AVD_DEVICE
          AVD_RES AVD_DPI AVD_RAM AVD_CORES AVD_DISK AVD_HEAP AVD_GPU AVD_SPOOF
          RECENT UNTIL_FOUND PUSH_CAP UPLOAD_WAIT ADB_TIMEOUT RECLAIM_TIMEOUT
@@ -82,12 +82,10 @@ ap_defaults() {
   #       which cannot run iOS apps.
   case "$(uname -m)" in arm64) _ap_backend=mac ;; *) _ap_backend=avd ;; esac
   PHOTOS_BACKEND="${PHOTOS_BACKEND:-$_ap_backend}"
-  # Where ipa-install-on-mac puts the app (--dest /Applications, named after
-  # the IPA's bundle), and the folder the bridge watches. The folder must stay
-  # under ~/Pictures: the converted app's sandbox reaches exactly that
-  # (com.apple.security.assets.pictures.read-write) and nothing else of yours.
+  # Where ipa-install-on-mac puts the app: --dest /Applications, named after
+  # the IPA's bundle. The folder the bridge watches is NOT a key beside it --
+  # lib/mac.sh has the one definition and the reason.
   GPHOTOS_APP="${GPHOTOS_APP:-/Applications/GooglePhotos.app}"
-  GPHOTOS_UPLOAD_DIR="${GPHOTOS_UPLOAD_DIR:-$HOME/Pictures/Google Photos Upload}"
   # The IPA gphotos-mac-setup installs: Google Photos 7.92.0 with the Gunshot
   # tweak's GunshotJailed.dylib already injected (the tweak's own supported
   # sideload shape). The hash is checked before anything is installed.
@@ -265,7 +263,28 @@ ICLOUD_USERNAME=
 # against one -- see "Staging" in the README for the permission that costs.
 #STAGING="$HOME/Pictures/icloud-photos-staging"
 
-# ── The emulator ────────────────────────────────────────────────────────────
+# ── Google Photos for Mac (Apple silicon) ───────────────────────────────────
+# THE DEFAULT ON AN APPLE SILICON MAC, and the section that applies to you
+# there; the emulator below is the Intel path. mac = the iPhone/iPad Google
+# Photos app running natively, uploading through the Gunshot tweak's engine.
+#PHOTOS_BACKEND=mac
+# Where gphotos-mac-setup installs the app. The converter names it after the
+# IPA's bundle, so change this only together with the IPA.
+#GPHOTOS_APP=/Applications/GooglePhotos.app
+# The IPA to install and the hash it must have before anything is installed.
+# Point these at your own build to stop using this repo's release asset.
+#GPHOTOS_IPA_URL=
+#GPHOTOS_IPA_SHA256=
+# The IPA-to-Mac converter. On PATH when installed; otherwise a pinned
+# revision is fetched into the state directory.
+#IPA_INSTALL=ipa-install-on-mac
+# Files waiting in the upload folder at once. The engine keeps its own copy of
+# each file while it uploads, so a backlog costs its size twice over.
+#MAC_INBOX_MAX=300
+# The upload folder itself is NOT configurable: the bridge inside the app
+# hardcodes ~/Pictures/Google Photos Upload, which is all its sandbox reaches.
+
+# ── The emulator (Intel) ────────────────────────────────────────────────────
 #AVD_NAME=gphotos-tablet
 # The pipeline's own writable Android SDK (its ANDROID_HOME). It must be
 # writable: rooting rewrites the system image's ramdisk.img in place.

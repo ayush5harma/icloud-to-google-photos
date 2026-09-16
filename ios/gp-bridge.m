@@ -69,9 +69,16 @@ static const NSTimeInterval kForget = 3600;      // a consumed entry is dropped 
 static NSSet *image_exts(void) { return [NSSet setWithArray:@[@"jpg", @"jpeg", @"heic", @"heif", @"png", @"gif", @"webp", @"tif", @"tiff", @"dng", @"raw", @"cr2", @"cr3", @"nef", @"arw", @"orf", @"rw2", @"avif", @"bmp"]]; }
 static NSSet *video_exts(void) { return [NSSet setWithArray:@[@"mov", @"mp4", @"m4v", @"3gp", @"avi", @"mkv", @"mts", @"m2ts", @"wmv", @"webm"]]; }
 
+// A write that failed is recorded rather than swallowed: these files are the
+// bridge's only channel to the caller, so "the folder went read-only" must
+// reach the next heartbeat that does get through instead of showing up 30 s
+// later as an unexplained silence.
 static void write_json(NSString *path, id obj) {
   NSData *data = [NSJSONSerialization dataWithJSONObject:obj options:NSJSONWritingSortedKeys error:NULL];
-  if (data) [data writeToFile:path atomically:YES];
+  if (!data) { g_lastError = [NSString stringWithFormat:@"serialise %@", path.lastPathComponent]; return; }
+  NSError *err = nil;
+  if (![data writeToFile:path options:NSDataWritingAtomic error:&err])
+    g_lastError = [NSString stringWithFormat:@"write %@: %@", path.lastPathComponent, err.localizedDescription ?: @"failed"];
 }
 
 // One engine call. Returns the reply's "data" (NSNull when empty) or nil on
@@ -92,9 +99,10 @@ static id call(NSDictionary *request, const char *role) {
   return r[@"data"] ?: NSNull.null;
 }
 
-static NSString *selected_account(void) {
-  NSDictionary *a = call(@{@"op": @"accounts"}, "photos");
-  if (![a isKindOfClass:NSDictionary.class]) return nil;
+// The account an `accounts` reply names, or nil when it names none. Reading the
+// REPLY rather than making the call is what lets the caller tell "signed out"
+// (a reply with no account) from "could not ask" (no reply at all).
+static NSString *account_in(NSDictionary *a) {
   id sel = a[@"selected"];
   if ([sel isKindOfClass:NSString.class] && [sel length]) return sel;
   NSArray *all = a[@"accounts"];
@@ -233,8 +241,15 @@ static void scan_folder(void) {
     // keeps the photo's own date (cp -p, which the engine turns into the
     // item's timestamp) hands over a file whose mtime is years old while its
     // bytes are still landing; every write, the date restore and the final
-    // rename all bump the ctime. Anything still arriving holds the whole scan,
-    // so a Live Photo's still and video are seen together.
+    // rename all bump the ctime.
+    //
+    // ONE UNSETTLED FILE ABANDONS THE WHOLE SCAN, deliberately: a Live Photo is
+    // a still and a video that must be imported as one item, the caller renames
+    // the pair into place back to back, and taking the half that has settled
+    // would upload them as two. What bounds this is the caller's batching -- it
+    // copies under dot-names and renames in a burst, so the folder goes quiet.
+    // A writer dropping a file every few seconds instead would starve every
+    // already-settled file for as long as it kept going.
     struct stat st;
     if (stat([g_root stringByAppendingPathComponent:n].fileSystemRepresentation, &st) != 0) continue;
     if (st.st_ctimespec.tv_sec > (time_t)settled.timeIntervalSince1970) return;   // still arriving: next tick
@@ -309,7 +324,17 @@ static void tick(void) {
   NSFileManager *fm = NSFileManager.defaultManager;
   [fm createDirectoryAtPath:g_dir withIntermediateDirectories:YES attributes:nil error:NULL];
   if (g_request && g_free) {
-    if (!g_account) g_account = selected_account();
+    // Re-resolved every minute rather than cached for the life of the process:
+    // this app is resident for weeks, and a sign-out left the heartbeat
+    // reporting an account -- which the sync trusts before it copies anything
+    // -- while every begin failed. Only a reply that arrived may clear it, so
+    // one unanswered call does not read as a sign-out.
+    static NSUInteger ticks;
+    if (!g_account || ticks % 20 == 0) {
+      NSDictionary *a = call(@{@"op": @"accounts"}, "photos");
+      if ([a isKindOfClass:NSDictionary.class]) g_account = account_in(a);
+    }
+    ticks++;
     relax_wifi_only();
     if (g_account) {
       scan_folder();
@@ -322,7 +347,12 @@ static void tick(void) {
     // is disk traffic for nothing. Sorted keys make the comparison stable.
     NSData *now = [NSJSONSerialization dataWithJSONObject:@{@"files": g_ledger} options:NSJSONWritingSortedKeys error:NULL];
     if (now && ![now isEqualToData:g_written]) {
-      if ([now writeToFile:[g_dir stringByAppendingPathComponent:@"ledger.json"] atomically:YES]) g_written = now;
+      NSError *err = nil;
+      if ([now writeToFile:[g_dir stringByAppendingPathComponent:@"ledger.json"]
+                   options:NSDataWritingAtomic error:&err])
+        g_written = now;
+      else
+        g_lastError = [NSString stringWithFormat:@"write ledger.json: %@", err.localizedDescription ?: @"failed"];
     }
   }
   write_json([g_dir stringByAppendingPathComponent:@"alive.json"],

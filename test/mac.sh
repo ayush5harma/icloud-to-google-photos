@@ -18,7 +18,7 @@ trap 'rm -rf "$T"' EXIT
 export HOME="$T/home"
 export AVD_PHOTOS_CONFIG_DIR="$T/config" AVD_PHOTOS_STATE_DIR="$T/state"
 mkdir -p "$HOME/Pictures" "$T/config" "$T/state" "$T/staging/2026/05" "$T/staging/a/b_c" "$T/staging/a_b/c"
-printf 'ICLOUD_USERNAME=t@example.invalid\nSTAGING="%s/staging"\nGPHOTOS_UPLOAD_DIR="%s/home/Pictures/Google Photos Upload"\nPHOTOS_BACKEND=mac\n' "$T" "$T" > "$T/config/config"
+printf 'ICLOUD_USERNAME=t@example.invalid\nSTAGING="%s/staging"\nPHOTOS_BACKEND=mac\n' "$T" > "$T/config/config"
 
 PASS=0; FAIL=0
 ok()  { echo "  PASS  $*"; PASS=$((PASS + 1)); }
