@@ -66,6 +66,16 @@ row g6 sha1ffff staged  "messages/2025/07/sha1ffff-waiting.HEIC"      2 'a@examp
   printf '2025/07/IMG_9.HEIC\tn\texists\t0\t0\t-\n'
 } > "$MAC_STATE"
 
+# The Mac backend's own states, checked against this report's rule: a file
+# Google was found to hold already (present) counts, a Live Photo component
+# that matched by hash (exists) does not -- which half matched is not reported,
+# so it is not something a delete-these list may guess at.
+check "confirmed and present count, exists and queued do not" \
+  test "$(msg_confirmed_rels | wc -l | tr -d ' ')" = 4
+printf 'messages/2025/08/sha1dddd-p2.HEIC\tn\tpresent\t0\t0\talready_in_google_photos\n' >> "$MAC_STATE"
+check "a present row is taken as Google holding the bytes" \
+  test "$(msg_confirmed_rels | grep -c 'sha1dddd')" = 2
+
 # The app database: three dedup groups, one of them a triple.
 GPDB="$T/gpstore/photos-1234567890.db"
 sqlite "$GPDB" <<'SQL'

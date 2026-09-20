@@ -38,14 +38,18 @@ msg_report_dir() {
   printf '%s/%s\n' "$drive" "$MSG_REPORT_SUBPATH"
 }
 
-# Every staged path Google Photos has CONFIRMED, one per line. The Mac
-# backend's own ledger is the only authority: a media key came back for that
-# file. `exists` is deliberately not confirmation -- it means a Live Photo
-# component matched by hash and which half is not reported, so those stay in
-# both places, the safe direction.
+# Every staged path Google Photos holds, one per line, from the Mac backend's
+# own ledger -- the only authority on it. TWO of its states count:
+#   confirmed  Google answered this pipeline's own upload with a media key.
+#   present    the file's bytes were found in Google Photos' own database
+#              before it was uploaded (lib/presence.sh). Same evidence the
+#              reclaim already acts on, from the other end.
+# `exists` deliberately does not: it means a Live Photo component matched by
+# hash and WHICH half is not reported, so those stay in both places -- and a
+# report that says "delete this" must never be the place that guess is made.
 msg_confirmed_rels() {
   [ -r "${MAC_STATE:-}" ] || return 0
-  awk -F'\t' '$3 == "confirmed" { print $1 }' "$MAC_STATE"
+  awk -F'\t' '$3 == "confirmed" || $3 == "present" { print $1 }' "$MAC_STATE"
 }
 
 # Written through a temporary file and renamed: the reports live in a synced
