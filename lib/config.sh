@@ -47,7 +47,7 @@ AP_KEYS="ICLOUD_USERNAME ICLOUDPD STAGING ICLOUD_DIR SHARED_CACHE_DIR
          PRUNE_DEVICE_AFTER_UPLOAD
          STOP_EMULATOR_WHEN_IDLE DEST_DCIM GITHUB_TOKEN
          MESSAGES_SOURCE MESSAGES_DIR MESSAGES_DB MESSAGES_REPORT_DIR
-         GPHOTOS_DB_DIR SC_PATHS_ENV"
+         SC_PATHS_ENV"
 
 ap_defaults() {
   # ── Identity and sources ───────────────────────────────────────────────────
@@ -170,9 +170,6 @@ ap_defaults() {
   # a folder. A deployment that wants them somewhere else sets this key.
   MESSAGES_REPORT_DIR="${MESSAGES_REPORT_DIR-}"
   SC_PATHS_ENV="${SC_PATHS_ENV:-/etc/system-config/paths.env}"
-  # The Google Photos app's own database directory: one photos-<accountId>.db
-  # per signed-in account, which the duplicates report reads through a copy.
-  GPHOTOS_DB_DIR="${GPHOTOS_DB_DIR:-$HOME/Library/Containers/com.google.photos/Data/Library/Application Support/store}"
 
   # ── Pacing ─────────────────────────────────────────────────────────────────
   RECENT="${RECENT:-2000}"          # how many of the newest iCloud items a run walks

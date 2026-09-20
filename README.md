@@ -732,7 +732,6 @@ first place.
 | `MESSAGES_SOURCE` | `0` | 1 scans Messages attachments and stages new images and videos (needs Full Disk Access). |
 | `MESSAGES_DIR` / `MESSAGES_DB` | `~/Library/Messages/Attachments` / `~/Library/Messages/chat.db` | What that scan reads. The database is always copied, with its `-wal` and `-shm`, and never opened in place. |
 | `MESSAGES_REPORT_DIR` | (unset) | Where the two reports go. Empty follows `SC_PATHS_ENV`'s `SC_MY_DRIVE`, and skips the reports when that resolves to nothing. |
-| `GPHOTOS_DB_DIR` | `~/Library/Containers/com.google.photos/…/store` | The Google Photos app's own databases, read (through a copy) for the duplicates report. |
 | `SC_PATHS_ENV` | `/etc/system-config/paths.env` | A declared-paths file to read `SC_MY_DRIVE` from. Read as data, never sourced. |
 
 Also read from the environment, never from the config: `AVD_RECREATE=1` (recreate

@@ -35,7 +35,7 @@ log() { LOGGED="$LOGGED$*"$'\n'; }
 phase() { :; }
 # shellcheck disable=SC1091
 . "$HERE/../lib/config.sh"; ap_load_config
-GPHOTOS_DB_DIR="$T/gpstore"
+GP_STORE_DIR="$T/gpstore"
 SC_PATHS_ENV="$T/paths.env"
 # shellcheck disable=SC1091
 . "$HERE/../lib/messages.sh"
@@ -142,7 +142,7 @@ check "photos-shared.db is not read as a library" none grep -q 'skipped' <<<"$LO
 check "it says plainly that it deleted nothing" grep -q 'nothing here deletes anything' "$D"
 
 echo "no Google Photos database"
-LOGGED=""; GPHOTOS_DB_DIR="$T/empty-store"; mkdir -p "$GPHOTOS_DB_DIR"
+LOGGED=""; GP_STORE_DIR="$T/empty-store"; mkdir -p "$GP_STORE_DIR"
 gp_duplicates_report "$T/out/none.md"
 check "the report is skipped with one line, and the old one is left alone" \
   test ! -e "$T/out/none.md" && grep -q 'duplicates report skipped' <<<"$LOGGED"

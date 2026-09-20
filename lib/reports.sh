@@ -165,10 +165,14 @@ msg_cleanup_report() {  # <destination file>
 
 # The newest account database in the app's container: one photos-<accountId>.db
 # per signed-in account, and photos-shared.db (which holds no library) is not
-# one of them.
+# one of them. The FOLDER is GP_STORE_DIR, lib/presence.sh's: the presence
+# check and this report read the same database, so it is named once and not
+# twice. The default below is for a caller that loaded this file without that
+# one; the tick always has both.
 gp_db_path() {
-  local f newest="" nt=0 t
-  for f in "$GPHOTOS_DB_DIR"/photos-*.db; do
+  local f newest="" nt=0 t store
+  store="${GP_STORE_DIR:-$HOME/Library/Containers/com.google.photos/Data/Library/Application Support/store}"
+  for f in "$store"/photos-*.db; do
     [ -f "$f" ] || continue
     case "$f" in *photos-shared.db) continue ;; esac
     t="$(/usr/bin/stat -f %m "$f" 2>/dev/null || echo 0)"
@@ -180,7 +184,7 @@ gp_db_path() {
 
 gp_duplicates_report() {  # <destination file>
   local src snap groups totals
-  src="$(gp_db_path)" || { log "duplicates report skipped: no Google Photos database under $GPHOTOS_DB_DIR"; return 0; }
+  src="$(gp_db_path)" || { log "duplicates report skipped: no Google Photos database in the app's own store"; return 0; }
   snap="$(mktemp -d)" || return 0
   # db + -wal + -shm together, and opened read-write, for the same reasons the
   # Messages copy is (lib/messages.sh): the WAL holds everything since the last
