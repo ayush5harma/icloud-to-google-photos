@@ -233,6 +233,30 @@ reclaim_icloud() {
     0) ;;
     *) rargs+=( --keep-days "$KEEP_ICLOUD_DAYS" ) ;;
   esac
+  # THE KEEP LIST. Confirmed in Google Photos is not the same as safe to lose
+  # from iCloud: a favourite, an album a human filled by hand, something an app
+  # saved into the library last week, or anything added to the library recently
+  # stays whatever the pending list says. Each rule is its own key so a
+  # deployment can turn one off without turning the reclaim off.
+  case "${KEEP_ICLOUD_ADDED_DAYS:-0}" in
+    0|'') ;;
+    *) rargs+=( --keep-added-days "$KEEP_ICLOUD_ADDED_DAYS" ) ;;
+  esac
+  case "${KEEP_ICLOUD_SAVED_FROM_APPS:-1}" in
+    1|yes|true) rargs+=( --keep-saved-from-apps ) ;;
+  esac
+  # One flag per album name, never one comma-separated string: an album name
+  # may contain a comma, and a name given on its own line then survives it.
+  # The Python side strips the whitespace, so nothing is trimmed here.
+  if [ -n "${KEEP_ICLOUD_ALBUMS_EXCLUDE:-}" ]; then
+    while IFS= read -r c; do
+      [ -n "$c" ] && rargs+=( --keep-album-exclude "$c" )
+    done < <(printf '%s\n' "$KEEP_ICLOUD_ALBUMS_EXCLUDE" | tr ',' '\n')
+  fi
+  rargs+=( --keep-state "$STATE_DIR/keep-set.tsv" )
+  # The presence ledger, for the counts only: how many of the pending paths
+  # were confirmed from Google Photos' own database rather than by an upload.
+  [ -r "$MAC_PRESENT" ] && rargs+=( --present "$MAC_PRESENT" )
   local dry=0
   if [ "$RECLAIM_DRY_RUN" = "1" ]; then dry=1; rargs+=( --dry-run ); fi
   [ "$dry" -eq 1 ] && log "iCloud reclaim (DRY RUN): $n confirmed file(s) pending (icloudpd library $ver)" \
@@ -351,6 +375,10 @@ if [ "$DELETE_FROM_ICLOUD" = "1" ]; then
     0) log "iCloud reclaim ON: confirmed uploads are deleted from iCloud after verification" ;;
     *) log "iCloud reclaim ON: confirmed uploads are deleted from iCloud after verification (keeping the newest $KEEP_ICLOUD_DAYS day(s))" ;;
   esac
+  # Which of the keep rules are in force, said once per run: the rules decide
+  # what is NOT deleted, and a rule that was quietly off is the kind of thing
+  # nobody notices until the photograph is gone.
+  log "  keep list: favourites and user albums always; saved-from-an-app ${KEEP_ICLOUD_SAVED_FROM_APPS:-1}; added to the library within ${KEEP_ICLOUD_ADDED_DAYS:-0} day(s)${KEEP_ICLOUD_ALBUMS_EXCLUDE:+; albums not counted: $KEEP_ICLOUD_ALBUMS_EXCLUDE}"
 else
   log "iCloud reclaim OFF (DELETE_FROM_ICLOUD=0 in $CONFIG_FILE): confirmed uploads stay in iCloud"
 fi
