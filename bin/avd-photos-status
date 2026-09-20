@@ -149,6 +149,15 @@ if [ -r "$STATE_DIR/reclaim-pending.list" ]; then
 fi
 reclaimed="${reclaimed:-0}"; reclaim_pending="${reclaim_pending:-0}"
 
+# Two counts that say what the pipeline decided WITHOUT uploading or deleting:
+# files Google Photos already had (lib/presence.sh) and assets the last reclaim
+# kept in iCloud on purpose. The keep set carries one comment line, which is why
+# this counts rows rather than lines.
+present=0; kept=0
+[ -r "$STATE_DIR/mac-present.tsv" ] && present="$(grep -c . "$STATE_DIR/mac-present.tsv" 2>/dev/null || true)"
+[ -r "$STATE_DIR/keep-set.tsv" ] && kept="$(grep -cv '^#' "$STATE_DIR/keep-set.tsv" 2>/dev/null || true)"
+present="${present:-0}"; kept="${kept:-0}"
+
 # LIVE PHASE AND THE RUNNING FLAG come from the sync job itself: sync.lock/pid
 # names the run in flight and $STATE_DIR/phase is its current step ("pushing 120
 # of 500 to the emulator", "verifying uploads: 40 of 500 confirmed") or the
@@ -180,5 +189,5 @@ if [ "$running" = true ]; then
   esac
 fi
 
-printf '{"backup":{"armed":%s,"backend":"%s","app":%s,"app_online":%s,"signed_in":%s,"app_path":"%s","emulator":%s,"staged":%s,"remaining":%s,"on_device":%s,"given_up":%s,"uploaded":%s,"queued":%s,"failed":%s,"upload_age":%s,"confirmed":%s,"confirmed_age":%s,"last_run_age":%s,"running":%s,"phase":"%s","reclaimed":%s,"reclaim_pending":%s},"ts":%s}\n' \
-  "$armed" "$PHOTOS_BACKEND" "$app" "$app_online" "$signed_in" "$app_path" "$emu" "${staged:-0}" "${remaining:-0}" "${ondev:-0}" "${given_up:-0}" "${uploaded:-0}" "${queued:-0}" "${failed:-0}" "${upl_age:--1}" "$confirmed" "$confirmed_age" "$last_run_age" "$running" "$phase" "$reclaimed" "$reclaim_pending" "$(date +%s)"
+printf '{"backup":{"armed":%s,"backend":"%s","app":%s,"app_online":%s,"signed_in":%s,"app_path":"%s","emulator":%s,"staged":%s,"remaining":%s,"on_device":%s,"given_up":%s,"uploaded":%s,"queued":%s,"failed":%s,"upload_age":%s,"confirmed":%s,"confirmed_age":%s,"last_run_age":%s,"running":%s,"phase":"%s","reclaimed":%s,"reclaim_pending":%s,"present":%s,"kept":%s},"ts":%s}\n' \
+  "$armed" "$PHOTOS_BACKEND" "$app" "$app_online" "$signed_in" "$app_path" "$emu" "${staged:-0}" "${remaining:-0}" "${ondev:-0}" "${given_up:-0}" "${uploaded:-0}" "${queued:-0}" "${failed:-0}" "${upl_age:--1}" "$confirmed" "$confirmed_age" "$last_run_age" "$running" "$phase" "$reclaimed" "$reclaim_pending" "$present" "$kept" "$(date +%s)"
