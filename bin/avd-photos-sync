@@ -220,6 +220,12 @@ reclaim_icloud() {
   log_init "$rlog"
   pend="$(mktemp)"; out="$(mktemp)"; stats="$(mktemp)"
   sort -u "$RECLAIM_PENDING" | comm -23 - <(sort -u "$RECLAIMED" 2>/dev/null) > "$pend"
+  # Whatever the Messages source staged is confirmed the same way, and is not
+  # an iCloud asset at all (lib/messages.sh says why this matters).
+  local nmsg
+  if [ "$RECLAIM_DRY_RUN" = "1" ]; then nmsg="$(msg_drop_from_reclaim "$pend" "")"
+  else nmsg="$(msg_drop_from_reclaim "$pend" "$RECLAIMED")"; fi
+  [ "${nmsg:-0}" -gt 0 ] && log "iCloud reclaim: $nmsg Messages attachment(s) were never in iCloud — nothing to delete for them"
   n="$(count_lines "$pend")"
   if [ "$n" -eq 0 ]; then
     [ "$RECLAIM_DRY_RUN" = "1" ] && log "nothing pending: no confirmed file is waiting to leave iCloud"

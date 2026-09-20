@@ -245,6 +245,23 @@ check "a known attachment is never charged to the budget (it is one stat)" \
 unset -f msg_elapsed
 msg_elapsed() { echo $(( $(date +%s) - MSG_T0 )); }
 
+echo "the iCloud reclaim"
+# A staged Messages attachment reaches the reclaim list exactly like an iCloud
+# original, and is not an iCloud asset at all: the walk would report each one
+# as "NOT FOUND in iCloud (already gone)", the line that means "the staged-path
+# rebuild is broken" for a real original.
+PEND="$T/state/pending.list"; DONE_LIST="$T/state/reclaimed.list"
+printf '2026/07/IMG_1.HEIC\nmessages/2026/07/abcd1234-clip.MOV\n2026/08/IMG_2.HEIC\n' > "$PEND"
+: > "$DONE_LIST"
+check "it reports how many it took off the list" test "$(msg_drop_from_reclaim "$PEND" "$DONE_LIST")" = 1
+check "the iCloud originals are untouched" \
+  test "$(tr '\n' ' ' < "$PEND")" = "2026/07/IMG_1.HEIC 2026/08/IMG_2.HEIC "
+check "and the Messages path is resolved rather than carried for ever" \
+  grep -qx 'messages/2026/07/abcd1234-clip.MOV' "$DONE_LIST"
+printf 'messages/2026/07/abcd1234-clip.MOV\n' > "$PEND"; : > "$DONE_LIST"
+check "a dry run records nothing" \
+  test "$(msg_drop_from_reclaim "$PEND" "")" = 1 -a ! -s "$DONE_LIST"
+
 echo "no Full Disk Access"
 LOGGED=""; BEFORE="$(rows)"
 chmod 000 "$A"

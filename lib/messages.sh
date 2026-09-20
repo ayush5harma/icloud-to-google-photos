@@ -255,6 +255,36 @@ msg_stage() {  # <source file> <staging-relative destination>
   return 1
 }
 
+# THE RECLAIM HAS NOTHING TO DO WITH THESE, and telling it so is cheaper than
+# letting it find out. A staged Messages attachment reaches the reclaim list
+# the same way an iCloud original does -- Google Photos confirmed it -- but it
+# was never in iCloud, so the walk spends a full library pass on it and then
+# reports "NOT FOUND in iCloud (already gone)", which is the very line that
+# means "the staged-path rebuild no longer matches" for a real original. On the
+# first run of this source that alarm would fire a thousand times.
+#
+# The paths are taken off the list given here and, unless this is a dry run,
+# written to the reclaimed ledger so the list drains rather than carrying them
+# for ever. "Reclaimed" for one of these means resolved, not deleted: there was
+# never anything in iCloud to delete.
+#
+# Returns the number it removed; the caller logs it.
+msg_drop_from_reclaim() {  # <pending list file> <reclaimed ledger|"">
+  local pend="$1" done_list="${2:-}" n
+  [ -r "$pend" ] || { printf '0\n'; return 0; }
+  n="$(grep -c "^$MSG_PREFIX/" "$pend" 2>/dev/null)"; n="${n:-0}"
+  if [ "$n" -gt 0 ]; then
+    if [ -n "$done_list" ]; then
+      grep "^$MSG_PREFIX/" "$pend" >> "$done_list"
+      sort -u "$done_list" -o "$done_list"
+    fi
+    grep -v "^$MSG_PREFIX/" "$pend" > "$pend.keep"
+    mv -f "$pend.keep" "$pend"
+  fi
+  printf '%s\n' "$n"
+  return 0
+}
+
 # gp_present (lib/presence.sh) when it is loaded, "unknown" when it is not, so
 # this source works on its own and gets cheaper the moment presence lands.
 # Exit 0 = present (its media key on stdout, which is deliberately NOT stored:
