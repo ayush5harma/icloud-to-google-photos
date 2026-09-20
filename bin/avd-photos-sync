@@ -107,9 +107,13 @@ phase() { printf '%s\n' "$*" > "$PHASE"; }
 OUTCOME=""
 cleanup() {
   if [ -n "$OUTCOME" ]; then phase "$OUTCOME"; else rm -f "$PHASE"; fi
-  # The presence check's copy of the Google Photos database, if a run died
-  # holding one: it is the whole ~100 MB file and nothing else removes it.
+  # THE COPIED DATABASES, whatever killed the run. Each is a copy of somebody's
+  # whole history -- the presence check's ~100 MB of Google Photos library and,
+  # with the Messages source on, every message ever sent -- and a tick fires 96
+  # times a day: leaving them behind is both a disclosure and, on a pipeline
+  # whose purpose is reclaiming disk, gigabytes a day of TMPDIR until a reboot.
   command -v gp_db_close >/dev/null 2>&1 && gp_db_close
+  command -v msg_cleanup_snapshot >/dev/null 2>&1 && msg_cleanup_snapshot
   rm -rf "$LOCK"
 }
 trap cleanup EXIT

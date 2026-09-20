@@ -160,6 +160,21 @@ check "a key with one row is not a group" none grep -q 'uniqueCC' "$D"
 check "photos-shared.db is not read as a library" none grep -q 'skipped' <<<"$LOGGED"
 check "it says plainly that it deleted nothing" grep -q 'nothing here deletes anything' "$D"
 
+echo "a tick where nothing changed"
+# Every 15 minutes into a synced folder: a report that says the same thing as
+# the one already there must not become another version of it in the cloud.
+BEFORE_MTIME="$(/usr/bin/stat -f %m "$R")"
+BEFORE_INODE="$(/usr/bin/stat -f %i "$R")"
+msg_cleanup_report "$R"
+check "an unchanged report is left exactly as it was" \
+  test "$(/usr/bin/stat -f %i "$R")" = "$BEFORE_INODE" -a "$(/usr/bin/stat -f %m "$R")" = "$BEFORE_MTIME"
+check "and no temporary file is left beside it" \
+  test "$(find "$T/out" -name '*.tmp.*' | wc -l | tr -d ' ')" = 0
+printf 'g7\tsha1gggg\tpresent\t0\t-\t3\t+15550002222\t2025-09-01\t2097152\timage\n' >> "$MSG_STATE"
+msg_cleanup_report "$R"
+check "a report that has something new to say is written" \
+  test "$(/usr/bin/stat -f %i "$R")" != "$BEFORE_INODE" && grep -q '+15550002222' "$R"
+
 echo "a tick that staged nothing"
 LOGGED=""
 SAVED_MSG="$MSG_STATE"; MSG_STATE="$T/state/no-such-ledger.tsv"

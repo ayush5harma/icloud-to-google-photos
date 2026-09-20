@@ -63,10 +63,19 @@ msg_confirmed_rels() {
 
 # Written through a temporary file and renamed: the reports live in a synced
 # folder, and a half-written file is one the cloud client uploads anyway.
+#
+# AND ONLY WHEN THE CONTENT CHANGED, ignoring the "Generated" line, which is
+# the only part that differs on a tick where nothing happened. A tick fires 96
+# times a day and Drive keeps a version per write; a report that says the same
+# thing as the one already there is not worth 96 versions of it.
 msg_write() {  # <destination> < body
   local dst="$1" tmp
   tmp="$dst.tmp.$$"
   cat > "$tmp" || { rm -f "$tmp"; return 1; }
+  if [ -f "$dst" ] \
+     && diff -q <(grep -v '^Generated ' "$tmp") <(grep -v '^Generated ' "$dst") >/dev/null 2>&1; then
+    rm -f "$tmp"; return 0
+  fi
   mv -f "$tmp" "$dst" || { rm -f "$tmp"; return 1; }
 }
 
@@ -229,14 +238,14 @@ gp_duplicates_report() {  # <destination file>
     WITH g AS (SELECT localDedupKey k, COUNT(*) n, MAX(size) sz, MIN(timestampMs) t
                FROM ServerPhotos WHERE localDedupKey IS NOT NULL AND localDedupKey <> ''
                GROUP BY 1 HAVING COUNT(*) >= 2)
-    SELECT strftime('%Y-%m', t/1000, 'unixepoch'), COUNT(*), SUM(n), SUM(n-1), SUM((n-1)*sz)
+    SELECT strftime('%Y-%m', t/1000, 'unixepoch', 'localtime'), COUNT(*), SUM(n), SUM(n-1), SUM((n-1)*sz)
     FROM g GROUP BY 1 ORDER BY 1 DESC;" 2>/dev/null)"
   local largest
   largest="$(msg_sqlite -batch -noheader -separator "$(printf '\t')" "$snap/gp.db" "
     WITH g AS (SELECT localDedupKey k, COUNT(*) n, MAX(size) sz, MIN(timestampMs) t
                FROM ServerPhotos WHERE localDedupKey IS NOT NULL AND localDedupKey <> ''
                GROUP BY 1 HAVING COUNT(*) >= 2)
-    SELECT strftime('%Y-%m-%d', t/1000, 'unixepoch'), n, sz, (n-1)*sz, substr(k,1,8)
+    SELECT strftime('%Y-%m-%d', t/1000, 'unixepoch', 'localtime'), n, sz, (n-1)*sz, substr(k,1,8)
     FROM g ORDER BY (n-1)*sz DESC LIMIT 25;" 2>/dev/null)"
   {
     printf '# Google Photos duplicate groups\n\n'
