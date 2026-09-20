@@ -171,6 +171,35 @@ msg_scan
 check "a different attachment with the same bytes is its own row (the key is guid AND sha1)" \
   test "$(field guid-fwd 3)" = staged -a "$(field guid-fwd 2)" = "$(field guid-new 2)"
 
+echo "the per-tick budget"
+LOGGED=""
+mkfile "$A/10/budget.JPG" "a photo arriving after the budget is spent"
+sqlite "$DB" "INSERT INTO message VALUES (11, $(ns $AUG), NULL);
+              INSERT INTO attachment VALUES (11, 'guid-budget', '$A/10/budget.JPG', 40, 'image/jpeg', $(ns $AUG), 0);
+              INSERT INTO message_attachment_join VALUES (11,11);
+              INSERT INTO chat_message_join VALUES (1,11);"
+# The clock, not the work: msg_elapsed is what the budget is measured with, so
+# a test can spend it without spending it.
+msg_elapsed() { echo 9999; }
+msg_scan
+check "a spent budget stops the scan before any file is read" test "$MSG_STAGED" = 0
+check "and says how much is left for the next tick" grep -q 'stopped at the 300s budget with 1 row(s) not looked at' <<<"$LOGGED"
+check "nothing it did not reach is recorded" test "$(field guid-budget 3)" = ""
+unset -f msg_elapsed
+msg_elapsed() { echo $(( $(date +%s) - MSG_T0 )); }
+LOGGED=""; msg_scan
+check "the next scan picks it up" test "$(field guid-budget 3)" = staged
+# With the budget spent from the first row, a scan that finds everything
+# already in the ledger must still walk to the end and stop nothing: the check
+# sits after the ledger test, so recognising a file costs one stat and no time.
+unset -f msg_elapsed
+msg_elapsed() { echo 9999; }
+LOGGED=""; msg_scan
+check "a known attachment is never charged to the budget (it is one stat)" \
+  test "$MSG_NEW" = 0 && none grep -q 'stopped at the' <<<"$LOGGED"
+unset -f msg_elapsed
+msg_elapsed() { echo $(( $(date +%s) - MSG_T0 )); }
+
 echo "no Full Disk Access"
 LOGGED=""; BEFORE="$(rows)"
 chmod 000 "$A"

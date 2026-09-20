@@ -68,6 +68,11 @@ MSG_UNREADABLE="" # why the source was skipped, when it was
 
 msg_enabled() { [ "${MESSAGES_SOURCE:-0}" = "1" ]; }
 
+# Seconds this scan has been running. Its own function because that is what a
+# test can replace to prove the budget without spending it.
+MSG_T0=0
+msg_elapsed() { echo $(( $(date +%s) - MSG_T0 )); }
+
 # macOS ships both of these; a PATH copy is used only if the system one is
 # missing. Named absolutely for the same reason lib/fs.sh names stat: a
 # launchd-seeded PATH can put a GNU build first, and GNU shasum is not the one
@@ -234,8 +239,9 @@ msg_present() {  # <file> -> 0 present, 1 absent, 2 unknown
 msg_scan() {
   msg_enabled || return 0
   MSG_SEEN=0; MSG_NEW=0; MSG_STAGED=0; MSG_PRESENT=0; MSG_SKIPPED=0
-  local t0 snap rows guid path when chat handle kind sha rel size gone=0 failed=0 secs
-  t0="$(date +%s)"
+  local snap rows guid path when chat handle kind sha rel size secs total
+  local gone=0 failed=0 seen_rows=0 over=0
+  MSG_T0="$(date +%s)"
   if ! msg_readable; then
     log "Messages source skipped: cannot read $MESSAGES_DIR ($MSG_UNREADABLE) — Full Disk Access is needed by whatever runs this sync"
     return 0
@@ -255,7 +261,9 @@ msg_scan() {
     rm -rf "$snap" "$rows"; return 0
   fi
   phase "scanning Messages attachments"
+  total="$(grep -c . "$rows")"
   while IFS="$(printf '\t')" read -r guid path when chat handle; do
+    seen_rows=$((seen_rows + 1))
     [ -n "$guid" ] && [ -n "$path" ] || continue
     # chat.db stores the path as "~/Library/Messages/Attachments/..." -- the
     # tilde is data in a column, not a shell expansion.
@@ -272,6 +280,12 @@ msg_scan() {
     size="$(/usr/bin/stat -f %z "$path" 2>/dev/null || echo 0)"
     [ "${size:-0}" -gt 0 ] || { gone=$((gone + 1)); continue; }
     msg_known "$guid" "$size" && continue
+    # EVERYTHING BELOW READS THE FILE'S BYTES, so the budget is spent here and
+    # nowhere else: recognising an attachment already in the ledger is one stat
+    # and stays free however long the scan has been going.
+    if [ "${MESSAGES_BUDGET:-0}" -gt 0 ] && [ "$(msg_elapsed)" -ge "${MESSAGES_BUDGET}" ]; then
+      over=$((total - seen_rows + 1)); break
+    fi
     sha="$(msg_sha1 "$path")"
     [ -n "$sha" ] || { failed=$((failed + 1)); continue; }
     msg_known_key "$guid" "$sha" && continue
@@ -297,8 +311,9 @@ msg_scan() {
       failed=$((failed + 1))
     fi
   done < "$rows"
-  secs=$(( $(date +%s) - t0 ))
-  log "Messages source: $MSG_SEEN media attachment(s) seen, $MSG_NEW new, $MSG_STAGED staged, $MSG_PRESENT already in Google Photos, $gone with no bytes on disk, $failed not staged, ${secs}s"
+  secs="$(msg_elapsed)"
+  log "Messages source: $MSG_SEEN media attachment(s) seen, $MSG_NEW new, $MSG_STAGED staged, $MSG_PRESENT already in Google Photos, $gone with no bytes on disk, $MSG_SKIPPED not media, $failed not staged, ${secs}s"
+  [ "$over" -gt 0 ] && log "  stopped at the ${MESSAGES_BUDGET}s budget with $over row(s) not looked at; the next tick continues where this one stopped"
   rm -rf "$snap" "$rows"
   return 0
 }

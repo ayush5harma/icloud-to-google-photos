@@ -46,7 +46,7 @@ AP_KEYS="ICLOUD_USERNAME ICLOUDPD STAGING ICLOUD_DIR SHARED_CACHE_DIR
          KEEP_ICLOUD_ALBUMS_EXCLUDE KEEP_ICLOUD_SAVED_FROM_APPS
          PRUNE_DEVICE_AFTER_UPLOAD
          STOP_EMULATOR_WHEN_IDLE DEST_DCIM GITHUB_TOKEN
-         MESSAGES_SOURCE MESSAGES_DIR MESSAGES_DB MESSAGES_REPORT_DIR
+         MESSAGES_SOURCE MESSAGES_DIR MESSAGES_DB MESSAGES_BUDGET MESSAGES_REPORT_DIR
          SC_PATHS_ENV"
 
 ap_defaults() {
@@ -163,6 +163,13 @@ ap_defaults() {
   MESSAGES_SOURCE="${MESSAGES_SOURCE:-0}"
   MESSAGES_DIR="${MESSAGES_DIR:-$HOME/Library/Messages/Attachments}"
   MESSAGES_DB="${MESSAGES_DB:-$HOME/Library/Messages/chat.db}"
+  # SECONDS PER TICK, the same lever PRESENCE_BUDGET is and for the same
+  # reason: the scan reads every new attachment's bytes, so a first run against
+  # a large Messages library would otherwise own the tick (1,161 attachments
+  # and 1.96 GB took 92 s here, 2026-09-20). What it does not reach carries to
+  # the next tick, because a file is only ever recorded once it is dealt with.
+  # 0 means no bound.
+  MESSAGES_BUDGET="${MESSAGES_BUDGET:-300}"
   # Where the two reports are written. Empty means "work it out": on a machine
   # carrying /etc/system-config/paths.env (this fleet's declared-paths file) the
   # reports go to that host's own Drive under the media area below, and
@@ -385,6 +392,9 @@ ICLOUD_USERNAME=
 #MESSAGES_SOURCE=0
 #MESSAGES_DIR="$HOME/Library/Messages/Attachments"
 #MESSAGES_DB="$HOME/Library/Messages/chat.db"
+# Seconds the scan may spend per tick; what it does not reach waits for the
+# next one. 0 removes the bound.
+#MESSAGES_BUDGET=300
 # Where the two reports go (the conversation cleanup list and the Google Photos
 # duplicate groups). Left empty they follow /etc/system-config/paths.env when
 # that file exists, and are skipped otherwise.

@@ -424,7 +424,10 @@ the upload backend, so what it stages goes up in the same tick:
 The ledger is `messages-state.tsv`, keyed by the attachment's GUID **and** the
 SHA-1 of its bytes, so a re-scan never re-stages; it carries the size too, so a
 15-minute tick skips a known attachment before reading it rather than hashing
-3 GB again.
+2 GB again. `MESSAGES_BUDGET` (300 s) bounds what one tick spends on the files
+it does not yet know -- the first scan of a large Messages library takes as
+many ticks as it needs, and a file is only ever recorded once it is dealt
+with.
 
 **Full Disk Access is the prerequisite**, and a process without it gets EPERM on
 the folder itself -- which is indistinguishable from "no such folder" unless you
@@ -731,6 +734,7 @@ first place.
 | `GITHUB_TOKEN` | (unset) | Raises the release-lookup rate limit. Optional. |
 | `MESSAGES_SOURCE` | `0` | 1 scans Messages attachments and stages new images and videos (needs Full Disk Access). |
 | `MESSAGES_DIR` / `MESSAGES_DB` | `~/Library/Messages/Attachments` / `~/Library/Messages/chat.db` | What that scan reads. The database is always copied, with its `-wal` and `-shm`, and never opened in place. |
+| `MESSAGES_BUDGET` | `300` | Seconds the scan may spend reading new attachments per tick; what it does not reach waits for the next one. 0 removes the bound. |
 | `MESSAGES_REPORT_DIR` | (unset) | Where the two reports go. Empty follows `SC_PATHS_ENV`'s `SC_MY_DRIVE`, and skips the reports when that resolves to nothing. |
 | `SC_PATHS_ENV` | `/etc/system-config/paths.env` | A declared-paths file to read `SC_MY_DRIVE` from. Read as data, never sourced. |
 
