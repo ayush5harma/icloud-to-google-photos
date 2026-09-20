@@ -7,7 +7,8 @@
 #       pipeline has CONFIRMED in Google Photos -- so they can be deleted from
 #       Messages by hand, which is the only supported way (Apple ships no API
 #       for it, and writing chat.db is how a Messages database gets corrupted).
-#       Videos first: they are 74 % of the bytes in 8 % of the files.
+#       Videos first: 8 % of the attachments and 63 % of the bytes, measured
+#       2026-09-20.
 #   gphotos-duplicates-report.md  the account's duplicate groups by content
 #       hash, from the Google Photos app's own database -- so they can be
 #       cleaned in Google Photos by hand. 8,186 groups and 11,599 excess copies

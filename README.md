@@ -392,10 +392,12 @@ deleted for real.
 ### Messages as a second source (off by default)
 
 iCloud Photos is not the only place originals pile up. On the Mac this was built
-for, `~/Library/Messages/Attachments` held **1,435 media attachments and 3.17 GB**
-(measured 2026-09-20), of which **video was 74 % of the bytes in 8 % of the
-files** -- and none of it was backed up anywhere, so deleting a conversation took
-it with it.
+for, `~/Library/Messages/Attachments` held 1,435 attachment rows and 3.17 GB by
+the database's own sizes; the first real scan, on 2026-09-20, took the media
+among them: **1,171 image and video attachments, 1.96 GB on disk, of which 97
+videos carried 1.24 GB** -- 8 % of the files and 63 % of the bytes. Of those
+1,161 new attachments, **19 were already in Google Photos** and the other 1,142
+were backed up nowhere at all, so deleting a conversation took them with it.
 
 `MESSAGES_SOURCE=1` turns on a scan that runs between the iCloud download and
 the upload backend, so what it stages goes up in the same tick:

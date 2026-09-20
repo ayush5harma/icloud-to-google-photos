@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # A SECOND SOURCE OF MEDIA FOR THE TICK: the photos and videos people sent in
-# Messages. iCloud Photos is not the only place originals accumulate -- on this
-# Mac, measured 2026-09-20, ~/Library/Messages/Attachments held 1,435 media
-# attachments and 3.17 GB, of which video was 74 % of the bytes in 8 % of the
-# files. Those bytes are backed up nowhere: the photo pipeline never looked at
-# them, and deleting a conversation takes them with it.
+# Messages. iCloud Photos is not the only place originals accumulate -- the
+# first real scan on this Mac, 2026-09-20, found 1,171 media attachments and
+# 1.96 GB on disk, 97 videos carrying 1.24 GB of it (8 % of the files, 63 % of
+# the bytes). Of the 1,161 it recorded, Google Photos already held 19: the rest
+# was backed up nowhere at all, because a Messages attachment never passes
+# through the photo library the phone uploads from. Deleting a conversation
+# takes them with it.
 #
 # What this does, and deliberately does not do:
 #   - it READS. Messages is never modified, no attachment is ever deleted, and
