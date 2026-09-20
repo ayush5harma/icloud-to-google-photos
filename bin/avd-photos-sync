@@ -95,6 +95,9 @@ phase() { printf '%s\n' "$*" > "$PHASE"; }
 OUTCOME=""
 cleanup() {
   if [ -n "$OUTCOME" ]; then phase "$OUTCOME"; else rm -f "$PHASE"; fi
+  # The presence check's copy of the Google Photos database, if a run died
+  # holding one: it is the whole ~100 MB file and nothing else removes it.
+  command -v gp_db_close >/dev/null 2>&1 && gp_db_close
   rm -rf "$LOCK"
 }
 trap cleanup EXIT

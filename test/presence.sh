@@ -69,6 +69,7 @@ if ! command -v sqlite3 >/dev/null 2>&1; then
 else
   DB="$GP_STORE_DIR/photos-1234567890.db"
   sqlite3 "$DB" 'create table ServerPhotos (mediaKey TEXT PRIMARY KEY, localDedupKey TEXT);'
+  sqlite3 "$DB" 'create table ServerTombstones (mediaKey TEXT PRIMARY KEY, localDedupKey TEXT, tombstoneFlag INTEGER);'
   # Two staged files: a Live Photo (still + motion) and a standalone photo.
   printf 'still-bytes'  > "$T/staging/2026/05/IMG_1.HEIC"
   printf 'motion-bytes' > "$T/staging/2026/05/IMG_1_HEVC.MOV"
@@ -77,6 +78,15 @@ else
   sqlite3 "$DB" "insert into ServerPhotos values ('AF1QmediaKeyForTheStill', '$STILL_KEY');"
   # A decoy row with an empty key: it must never match anything.
   sqlite3 "$DB" "insert into ServerPhotos values ('AF1QemptyKey', '');"
+  # A photo DELETED in Google Photos: the app writes a tombstone and KEEPS the
+  # ServerPhotos row, dedup key and all. Without the tombstone join this file
+  # answers "present" and its iCloud original is queued for deletion -- gone
+  # from both sides. Measured on the real library 2026-09-20: 2 tombstones,
+  # both still carrying a ServerPhotos row.
+  printf 'deleted-at-google' > "$T/staging/2026/05/IMG_3.HEIC"
+  DEAD_KEY="$(gp_hash "$T/staging/2026/05/IMG_3.HEIC")"
+  sqlite3 "$DB" "insert into ServerPhotos values ('AF1QdeletedAtGoogle', '$DEAD_KEY');"
+  sqlite3 "$DB" "insert into ServerTombstones values ('AF1QdeletedAtGoogle', '$DEAD_KEY', 0);"
 
   check "the database is found by its account-suffixed name" test "$(gp_db_path)" = "$DB"
   check "opening it reports ready" gp_db_open
@@ -92,15 +102,61 @@ else
   # THE RULE THIS WHOLE FEATURE RESTS ON: the video half of a Live Photo has no
   # row of its own, so asking about its bytes can only answer "absent".
   check "the motion half is not in the database by its own bytes" test "$(rc_of gp_present "$T/staging/2026/05/IMG_1_HEVC.MOV")" = 1
+  # THE ONE THAT WOULD LOSE A PHOTOGRAPH FROM BOTH SIDES.
+  check "a photo deleted in Google Photos is ABSENT, not present" test "$(rc_of gp_present "$T/staging/2026/05/IMG_3.HEIC")" = 1
+  check "and its row is not in the key table at all" none grep -q 'AF1QdeletedAtGoogle' "$GP_DB_KEYS"
+
+  # Every empty file has the same sha1, so one empty row would make every empty
+  # staged file "present". The handoff refuses these too.
+  printf '' > "$T/staging/2026/05/EMPTY.HEIC"
+  check "a zero-byte staged file is UNKNOWN, never present" test "$(rc_of gp_present "$T/staging/2026/05/EMPTY.HEIC")" = 2
+  rm -f "$T/staging/2026/05/EMPTY.HEIC"
+
+  # A Mac that has had two Google accounts keeps both databases, and nothing
+  # here can tell which one the app is signed into now: a row in the other
+  # account's library must never authorise a deletion.
+  gp_db_close
+  cp "$DB" "$GP_STORE_DIR/photos-9876543210.db"
+  gp_db_open; rc=$?
+  check "two account databases is UNKNOWN, not a guess" test "$rc" = 2
+  # The reason must reach THIS shell: gp_db_path runs in a command
+  # substitution, so a reason it set there would be discarded.
+  check "and the reason says why, in this shell" grep -q 'more than one Google Photos database' <<<"$GP_DB_REASON"
+  rm -f "$GP_STORE_DIR/photos-9876543210.db"
+  gp_db_close
+
+  # The copy is the whole database and the sync runs every 15 minutes.
+  gp_db_open
+  KEPT_DIR="$GP_DB_DIR"
+  check "an open database has a temporary directory" test -d "$KEPT_DIR"
+  gp_db_close
+  check "closing removes it" test ! -d "$KEPT_DIR"
 fi
 
 echo "the Live Photo pairing"
 check "a _HEVC.MOV resolves to its still" test "$(gp_still_of "$STAGING" 2026/05/IMG_1_HEVC.MOV)" = 2026/05/IMG_1.HEIC
 printf 'plain-motion' > "$T/staging/2026/05/IMG_2.MOV"
+# icloudpd gives both components of one asset the same mtime (the asset's own
+# creation date), which is what the bare-.MOV branch requires as evidence.
+touch -r "$T/staging/2026/05/IMG_2.HEIC" "$T/staging/2026/05/IMG_2.MOV"
 check "a plain .MOV beside a still resolves to it" test "$(gp_still_of "$STAGING" 2026/05/IMG_2.MOV)" = 2026/05/IMG_2.HEIC
 printf 'standalone' > "$T/staging/2026/05/00000955-VIDEO.MOV"
 check "a video with no still beside it resolves to nothing" test "$(rc_of gp_still_of "$STAGING" 2026/05/00000955-VIDEO.MOV)" = 1
 check "a still is not the video half of anything" test "$(rc_of gp_still_of "$STAGING" 2026/05/IMG_1.HEIC)" = 1
+# THE STEM IS NOT EVIDENCE for a bare .MOV: iPhone names recycle (the counter
+# wraps at 9999, and a merged library holds two devices' IMG_00xx), so a
+# standalone video must not be paired with an unrelated photo and deleted from
+# iCloud on that photo's evidence. icloudpd stamps both components of one asset
+# with the asset's own creation date (measured: 784 of 784 pairs on the real
+# tree), so a differing mtime means they are not one asset.
+touch -t 200001010000 "$T/staging/2026/05/IMG_2.MOV"
+check "a bare .MOV whose still has another mtime is NOT its video half" test "$(rc_of gp_still_of "$STAGING" 2026/05/IMG_2.MOV)" = 1
+touch -r "$T/staging/2026/05/IMG_2.HEIC" "$T/staging/2026/05/IMG_2.MOV"
+check "the same pair with one mtime resolves again" test "$(gp_still_of "$STAGING" 2026/05/IMG_2.MOV)" = 2026/05/IMG_2.HEIC
+# The _HEVC form is icloudpd's own Live Photo name and needs no such guard.
+touch -t 200001010000 "$T/staging/2026/05/IMG_1_HEVC.MOV"
+check "a _HEVC.MOV needs no mtime agreement (the suffix is the evidence)" test "$(gp_still_of "$STAGING" 2026/05/IMG_1_HEVC.MOV)" = 2026/05/IMG_1.HEIC
+touch -r "$T/staging/2026/05/IMG_1.HEIC" "$T/staging/2026/05/IMG_1_HEVC.MOV"
 
 echo "the tick pass"
 if command -v sqlite3 >/dev/null 2>&1; then
@@ -144,6 +200,19 @@ printf '2026/05/IMG_1.HEIC\n' > "$newf"
 mac_presence_pass "$newf"
 check "PRESENCE_CHECK=0 checks nothing at all" test "$(count_lines "$newf")" = 1 -a "$MAC_PRESENT_N" = 0
 check "and does not even open the database" test -z "$LOGGED"
+
+echo "a budget that is not a number"
+# shellcheck disable=SC2034  # read by lib/mac.sh
+PRESENCE_CHECK=1
+# shellcheck disable=SC2034  # read by lib/mac.sh
+PRESENCE_BUDGET="five minutes"
+LOGGED=""; MAC_PRESENT_N=0
+: > "$MAC_STATE"; : > "$RECLAIM_PENDING"
+printf '2026/05/IMG_1.HEIC\n' > "$newf"
+mac_presence_pass "$newf"
+check "a config typo does not abort the run under set -u" test "$MAC_PRESENT_N" = 1
+check "and the budget fell back to the default" test "$PRESENCE_BUDGET" = 300
+gp_db_close
 
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

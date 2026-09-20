@@ -390,12 +390,24 @@ mac_present_confirm() {  # <rel> <media key>
 mac_presence_pass() {  # <file of new staged paths>
   local newf="$1" cache out rel still key rc deadline
   local n_present=0 n_absent=0 n_unknown=0 n_pair=0 n_skipped=0 checked=0
-  case "$PRESENCE_CHECK" in 1|yes|true) ;; *) return 0 ;; esac
+  case "${PRESENCE_CHECK:-1}" in 1|yes|true) ;; *) return 0 ;; esac
   if ! gp_db_open; then
     log "  Google Photos' own library is not readable ($GP_DB_REASON): every new file is handed over as before"
     return 0
   fi
+  # WHICH database answered, how much it knew and how fresh it is. This check
+  # decides what is never uploaded and what may leave iCloud, so a run that
+  # consulted a stale or nearly empty library says so in the log rather than
+  # only in its results.
+  local db db_age
+  db="$(gp_db_path)"
+  db_age=$(( ( $(date +%s) - $(/usr/bin/stat -f %m "$db" 2>/dev/null || date +%s) ) / 60 ))
+  log "  Google Photos' own library: $(gp_db_rows) item(s), written ${db_age} min ago ($db)"
   cache="$(mktemp)"; out="$(mktemp)"
+  # A config file is a human's file: a budget that is not a number would
+  # otherwise leave `deadline` unset and abort the whole sync at the first
+  # comparison, under set -u.
+  case "${PRESENCE_BUDGET:-}" in ''|*[!0-9]*) PRESENCE_BUDGET=300 ;; esac
   deadline=$((SECONDS + PRESENCE_BUDGET))
   phase "checking what Google Photos already has"
   while IFS= read -r rel; do
@@ -423,6 +435,12 @@ mac_presence_pass() {  # <file of new staged paths>
   done < "$newf"
   mv -f "$out" "$newf"
   rm -f "$cache"
+  # THE COPY OF THE DATABASE GOES NOW, not at process exit: it is the whole
+  # file (about 100 MB), this runs every fifteen minutes, and nothing else
+  # would ever remove it -- gigabytes a day leaked by the step that exists to
+  # reclaim space. gp_db_open is idempotent, so a later gp_present simply makes
+  # a fresh copy.
+  gp_db_close
   log "already in Google Photos: $n_present of $((n_present + n_absent + n_unknown)) checked (of which $n_pair Live Photo component(s) by their still); to upload: $n_absent; undecidable, so uploaded anyway: $n_unknown"
   [ "$n_skipped" -gt 0 ] \
     && log "  the ${PRESENCE_BUDGET}s presence budget ran out with $n_skipped file(s) unchecked; they are handed over as usual"
