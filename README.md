@@ -162,6 +162,25 @@ pipeline becomes a one-way copier.
 ```
 
 1. **`icloudpd` first**, exactly as below.
+1. **Ask before uploading.** Every staged file the ledger has not seen is
+   looked up in Google Photos' **own** database first
+   (`~/Library/Containers/com.google.photos/.../store/photos-<accountId>.db`,
+   copied with its `-wal` and `-shm` once per run and read from the copy --
+   never the live file). `ServerPhotos` holds one row per item Google has,
+   keyed by `localDedupKey` = `base64url(sha1(the file's bytes))` without
+   padding, 27 characters. A file with a row is **already backed up**: it is
+   recorded with that media key, put on the reclaim list and never uploaded.
+   A Live Photo is one item at Google, keyed by the still's bytes, so only the
+   still is hashed and its answer carries the `.MOV` beside it.
+   This matters most for a library some other device already backed up: this
+   backend confirms from the reply to its own upload, so without the check it
+   cannot tell, and hands the whole library over again for Google to discard
+   one file at a time. Measured on a 4,346-file staging tree: 3,207 of them
+   (73.8%) needed no upload at all.
+   **Unknown is never "present"**: no database, no sha1, or a staging file
+   whose bytes a cloud folder has not materialised all mean "upload it", and a
+   run bounded by `PRESENCE_BUDGET` hands over whatever it did not reach.
+   `PRESENCE_CHECK=0` turns the whole thing off.
 2. **Hand over** every staged file the Mac ledger has not seen, up to
    `PUSH_CAP` and `MAC_INBOX_MAX` waiting at once: a copy (`cp -p`, so the
    photo keeps its date, which becomes the item's timestamp) written under a
@@ -311,6 +330,37 @@ the installed tool's version and sharing its `~/.pyicloud` session. It:
   deletion stays pending and is retried on the next run;
 - treats a pending path with no asset in the library as "already gone" - the safe
   direction, since a wrong match can only leave a photo in iCloud.
+
+#### The keep list
+
+Confirmed in Google Photos is not the same as safe to lose from iCloud, so
+before anything is deleted the asset is asked four more questions. Any one of
+them keeps it, and the reason is logged and written to
+`~/.cache/avd-photos/keep-set.tsv` (record id, reason, staged path; rewritten
+each run, dry runs included, for the reports to read):
+
+- **a favourite** - `isFavorite` on the CloudKit asset record;
+- **in an album you made** - every album the server returns that is not one of
+  pyicloud's smart albums (Favorites, Live, Videos, Screenshots, Bursts,
+  Panoramas, Slo-mo, Time-lapse, Hidden, Recently Deleted). Name albums in
+  `KEEP_ICLOUD_ALBUMS_EXCLUDE` to stop them counting;
+- **saved into the library by another app** - what Photos shows as "Recently
+  Saved". That album is *not* exposed over CloudKit, but the signal behind it
+  is: every master record carries `importedBy` and
+  `importedByBundleIdentifierEnc` (`com.apple.camera`, `com.apple.MobileSMS`,
+  `net.whatsapp.WhatsApp`, `com.apple.sharingd`, ...), and anything whose
+  importer is not the device camera counts. `KEEP_ICLOUD_SAVED_FROM_APPS=0`
+  turns it off - worth knowing that on a library fed by Messages or WhatsApp
+  this rule alone can keep most of it;
+- **added to the library within `KEEP_ICLOUD_ADDED_DAYS`** (default 30). The
+  older `KEEP_ICLOUD_DAYS` floor reads the *capture* date, which says nothing
+  about how long the asset has been here: a photo re-imported from Google
+  Photos arrives with a years-old capture date and is past any capture-date
+  floor on its first day.
+
+**A read that fails keeps the asset**, and says which read: an album listing
+that raises, an importer lookup that errors, a record with no `isFavorite` or
+no `addedDate`. The direction of every doubt here is "leave it in iCloud".
 
 iCloud keeps a deleted asset in Recently Deleted for 30 days, where it still
 counts against the quota until it expires or the album is emptied by hand.
@@ -576,6 +626,8 @@ first place.
 | `GPHOTOS_IPA_URL` / `GPHOTOS_IPA_SHA256` | this repo's release asset | The IPA to install and the hash it must have. |
 | `IPA_INSTALL` | `ipa-install-on-mac` | The converter; fetched at a pinned revision when not on PATH. |
 | `MAC_INBOX_MAX` | `300` | Files waiting in the upload folder at once (the engine keeps a second copy of each while it uploads). |
+| `PRESENCE_CHECK` | `1` | Look a staged file up in Google Photos' own database before uploading it. 0 uploads everything as before. |
+| `PRESENCE_BUDGET` | `300` | Seconds per run spent on that lookup (it reads each candidate's bytes). Whatever it does not reach is handed over as usual. |
 | `AVD_NAME` | `gphotos-tablet` | The emulator's name. |
 | `AVD_SDK_ROOT` | `~/.local/share/android-avd-sdk` | The pipeline's own writable SDK root (its `ANDROID_HOME`). |
 | `AVD_ABI` / `AVD_TAG` / `AVD_DEVICE` | `arm64-v8a` on arm64, `x86_64` otherwise / `google_apis` / `pixel_tablet` | Image selection. `google_apis_playstore` is deliberately unusable here. |
@@ -590,6 +642,9 @@ first place.
 | `ADB_TIMEOUT` / `RECLAIM_TIMEOUT` | `120` / `1800` | Wall-clock bounds. |
 | `DELETE_FROM_ICLOUD` | `1` | 0 makes this a one-way copier. |
 | `KEEP_ICLOUD_DAYS` | `7` | Never delete anything newer than N days. 0 (or empty) reclaims as soon as a photo is confirmed. |
+| `KEEP_ICLOUD_ADDED_DAYS` | `30` | Never delete an asset ADDED to the library within N days (`addedDate`, not the capture date). 0 turns it off. |
+| `KEEP_ICLOUD_ALBUMS_EXCLUDE` | (empty) | Album names that are not a reason to keep their members, one per line or comma-separated. |
+| `KEEP_ICLOUD_SAVED_FROM_APPS` | `1` | Keep anything another app saved into the library (Photos' "Recently Saved"). 0 turns it off. |
 | `PRUNE_DEVICE_AFTER_UPLOAD` | `1` | Drop confirmed copies from the emulator. |
 | `STOP_EMULATOR_WHEN_IDLE` | `1` | Stop the VM once drained and confirmed. |
 | `GITHUB_TOKEN` | (unset) | Raises the release-lookup rate limit. Optional. |
@@ -625,7 +680,9 @@ All under `~/.cache/avd-photos` (`AVD_PHOTOS_STATE_DIR`):
 | File | What it holds |
 | --- | --- |
 | `pushed.list` | The ledger: staging-relative paths already pushed. Keyed on the relative path, so a staging move does not confuse it. |
-| `reclaim-pending.list` | Confirmed by Google Photos, not yet deleted from iCloud. Fed ONLY by the prune step. |
+| `reclaim-pending.list` | Confirmed by Google Photos, not yet deleted from iCloud. Fed by the prune step and by the presence check. |
+| `mac-present.tsv` | `<staged path>\t<media key>\t<when>` for every file the presence check found Google already had. Kept out of `mac-state.tsv`, which the menu bar reads and the logs quote. |
+| `keep-set.tsv` | The last reclaim's keep set: record id, the rule that kept it, the staged path. Rewritten each run, dry runs included. |
 | `reclaimed.list` | Deleted from iCloud, or found already gone. |
 | `last-upload-confirmed` | Unix time of the last clean verify. **Its presence gates every iCloud deletion.** |
 | `upload-status` | `<uploaded> <on-device> <failed> <written-at>` for the menu bar. |
@@ -709,6 +766,10 @@ bin/     gphotos-mac-setup     install and update Google Photos for Mac (Apple s
          avd-photos-check      report every version, change nothing
          avd-start avd-stop avd-signin
 lib/     config.sh  log.sh  proc.sh  fs.sh  mac.sh (the Mac backend of the sync)
+         presence.sh  is this file already in Google Photos? (gp_present)
+test/    mac.sh       the Mac backend's bookkeeping, on a scratch state
+         presence.sh  the presence check, on a fixture database
+         keep.py      the reclaim's keep list, on fixtures
 ios/     gp-bridge.m  the folder-to-GoToHP bridge linked into Google Photos for Mac
 Sources/ main.swift (the menu-bar app)  icon.swift (its artwork, drawn at build time)
 build.sh          builds Photo Sync.app with swiftc; no Xcode project

@@ -323,6 +323,15 @@ ICLOUD_USERNAME=
 # Files waiting in the upload folder at once. The engine keeps its own copy of
 # each file while it uploads, so a backlog costs its size twice over.
 #MAC_INBOX_MAX=300
+# Ask Google Photos' own database whether it already holds a file before
+# uploading it. A library the phone backed up years ago is already there, and
+# this backend cannot tell on its own: its confirmation is the reply to its own
+# upload. 0 uploads everything as before.
+#PRESENCE_CHECK=1
+# Seconds per run spent on that check. It reads each candidate's bytes, so a
+# first run against a large library is bounded rather than endless; whatever it
+# does not reach is handed over the way it always was.
+#PRESENCE_BUDGET=300
 # The upload folder itself is NOT configurable: the bridge inside the app
 # hardcodes ~/Pictures/Google Photos Upload, which is all its sandbox reaches.
 
@@ -363,6 +372,23 @@ ICLOUD_USERNAME=
 # staging path or a half-finished sign-in shows up. 0 reclaims a photo as soon
 # as it is confirmed.
 #KEEP_ICLOUD_DAYS=7
+# THE KEEP LIST: what stays in iCloud however well confirmed it is. Favourites
+# and members of albums you made are always kept; these three tune the rest.
+#
+# Never delete an asset ADDED to the library within N days. Not the same as the
+# floor above, which reads the capture date: a photo re-imported from Google
+# Photos arrives with a years-old capture date and is past that floor on its
+# first day here. 0 turns it off.
+#KEEP_ICLOUD_ADDED_DAYS=30
+# Album names that are NOT a reason to keep their members, one per line or
+# comma-separated. Empty by default. The smart albums (Favorites, Live, Videos,
+# Screenshots, Bursts, ...) are never part of the album rule at all.
+#KEEP_ICLOUD_ALBUMS_EXCLUDE=
+# Keep anything another app saved into the library -- what Photos shows as
+# "Recently Saved" (Messages, WhatsApp, AirDrop, a browser). On a library that
+# receives a lot that way this rule alone can keep most of it; 0 turns it off
+# and leaves those assets to the other rules.
+#KEEP_ICLOUD_SAVED_FROM_APPS=1
 
 # ── Optional ────────────────────────────────────────────────────────────────
 # Raises the GitHub API's 60-per-hour unauthenticated limit for the release
