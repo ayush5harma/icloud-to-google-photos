@@ -218,6 +218,14 @@ msg_state_add() {  # <guid> <sha1> <state> <rel> <chat> <handle> <date> <bytes> 
 # routinely hold "IMG_0001.HEIC" -- and it is also the id the cleanup report
 # quotes, so a line in the report can be tied back to a staged file without the
 # report ever carrying a file name.
+#
+# TWO ATTACHMENTS CAN LAND ON ONE PATH, and that is the intended outcome: the
+# same photo forwarded into another conversation keeps its name and its bytes,
+# so it has the same hash and the same month (4 of 1,161 here, 2026-09-20).
+# One copy is staged, both ledger rows point at it, and both are confirmed
+# together -- Google would dedup the second upload anyway. The cleanup report
+# still counts both, because Messages does keep a file per attachment and
+# deleting both is what frees both.
 msg_rel() {  # <sha1> <original path> <unix date>
   local base name
   base="$(basename -- "$2")"
