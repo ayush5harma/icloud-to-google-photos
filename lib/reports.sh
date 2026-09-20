@@ -20,6 +20,9 @@
 # SHA-1, which is also the prefix of its staged file name -- enough to find it
 # in a conversation, and nothing about what is in it.
 
+# Sourced AFTER lib/messages.sh, whose MSG_STATE (the ledger these read) and
+# msg_sqlite (the sqlite3 the fleet's PATH may not put first) belong to it.
+#
 # Where the reports go when MESSAGES_REPORT_DIR is empty, under the Drive this
 # host declares. The fleet's paths file is READ, never sourced: it is data, and
 # a config file that can run commands is a config file that will.
@@ -69,9 +72,8 @@ msg_cleanup_report() {  # <destination file>
       close(conffile)
     }
     {
-      guid = $1; sha = $2; state = $3; rel = $5; chat = $6; handle = $7
+      sha = $2; state = $3; rel = $5; chat = $6; handle = $7
       day = $8; bytes = $9 + 0; kind = $10
-      seen++
       done = (state == "present") || (state == "staged" && (rel in confirmed))
       if (!done) { waiting++; waitbytes += bytes; next }
       key = chat SUBSEP handle
@@ -80,7 +82,6 @@ msg_cleanup_report() {  # <destination file>
       if (kind == "video") {
         vids[key]++; vbytes[key] += bytes
         vline[key] = vline[key] sprintf("| %s | %s | `%s` |\n", day, mb(bytes), substr(sha, 1, 8))
-        vsort[key] = vsort[key] day "\n"
       } else {
         m = substr(day, 1, 7)
         mk = key SUBSEP m
