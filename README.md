@@ -389,6 +389,75 @@ the right photos", and a lot of `NOT FOUND` lines mean the staged-path rebuild
 does not match your library, which is worth understanding before anything is
 deleted for real.
 
+### Messages as a second source (off by default)
+
+iCloud Photos is not the only place originals pile up. On the Mac this was built
+for, `~/Library/Messages/Attachments` held 1,435 attachment rows and 3.17 GB by
+the database's own sizes; the first real scan, on 2026-09-20, took the media
+among them: **1,171 image and video attachments, 1.96 GB on disk, of which 97
+videos carried 1.24 GB** -- 8 % of the files and 63 % of the bytes. Of those
+1,161 new attachments, **19 were already in Google Photos** and the other 1,142
+were backed up nowhere at all, so deleting a conversation took them with it.
+
+`MESSAGES_SOURCE=1` turns on a scan that runs between the iCloud download and
+the upload backend, so what it stages goes up in the same tick:
+
+1. **Read a copy of `chat.db`**, taken with its `-wal` and `-shm` together. The
+   live file is never opened: Messages holds it open in WAL mode, so the `.db`
+   alone is a stale view, and a writer-shaped open of the live file is how a
+   Messages database gets corrupted. Only ids are read -- `attachment.guid`, the
+   file path, the date, `chat.ROWID` and `chat.chat_identifier`. Never
+   `message.text`, never `chat.display_name`.
+2. **Take images and videos only**, by extension (`heic heif jpg jpeg png gif
+   webp mov mp4 m4v`). `pluginPayloadAttachment` (219 files here: rich links and
+   stickers), `.caf` audio and documents are skipped by name.
+3. **Hash each new file and ask `gp_present` first.** An attachment Google Photos
+   already holds -- usually the same photo, sent from the phone that also backs
+   it up -- is recorded as confirmed and never staged, so the common case costs
+   one hash and no bytes.
+4. **Stage the rest** at `<staging>/messages/YYYY/MM/<8 hex of sha1>-<its own
+   name>`, where the normal upload path finds them with no other change. The
+   `messages/` prefix also keeps them out of the iCloud reclaim's reach: it
+   rebuilds candidate paths as `YYYY/MM/<name>`, which no `messages/...` path can
+   equal, so a Messages attachment can never cause an iCloud deletion.
+
+The ledger is `messages-state.tsv`, keyed by the attachment's GUID **and** the
+SHA-1 of its bytes, so a re-scan never re-stages; it carries the size too, so a
+15-minute tick skips a known attachment before reading it rather than hashing
+2 GB again. `MESSAGES_BUDGET` (300 s) bounds what one tick spends on the files
+it does not yet know -- the first scan of a large Messages library takes as
+many ticks as it needs, and a file is only ever recorded once it is dealt
+with.
+
+**Full Disk Access is the prerequisite**, and a process without it gets EPERM on
+the folder itself -- which is indistinguishable from "no such folder" unless you
+keep stderr, which this does. An unreadable folder logs one line and the tick
+carries on: a Messages source that failed a photo sync would be a bad trade.
+
+**Nothing in Messages is ever modified or deleted by this.**
+
+### The two reports
+
+Both are rewritten on every tick into `MESSAGES_REPORT_DIR` (or, where
+`/etc/system-config/paths.env` exists, that host's own Drive under
+`[01] Personal/[05] Media & Chats/Messages Backup`; where neither resolves, the
+reports are skipped with one log line rather than a folder being invented).
+
+| Report | What it is for |
+| --- | --- |
+| `messages-cleanup-report.md` | Per conversation, the attachments CONFIRMED in Google Photos, videos listed one by one with their dates and photos summarised per month -- the list to work through by hand in Messages. A staged-but-unconfirmed attachment is named as waiting, never as deletable. |
+| `gphotos-duplicates-report.md` | The account's own library grouped by `localDedupKey` (`base64url(SHA-1(bytes))`, Google's content fingerprint): groups with two or more copies, the excess copies and what they cost, by month -- the list to work through by hand in Google Photos. 8,186 groups and 11,599 excess copies on the account this was measured against. |
+
+Neither deletion has a safe programmatic path -- Apple ships no supported way to
+delete a Messages attachment, and this pipeline has no Google Photos deletion
+path at all -- so both reports exist to be acted on by a human, and both say so
+in their own first paragraph.
+
+**Identifiers only**, because these land in a synced folder: a chat id, a handle
+id (a phone number, an email or a group id), a date, a size and eight hex
+characters of a content hash. No contact name, no message text and no file name;
+a file staged as `<hash>-<its own name>` is reported by its hash alone.
+
 ### Staging
 
 `STAGING` is where downloaded originals land and where they stay until Google
@@ -663,6 +732,11 @@ first place.
 | `PRUNE_DEVICE_AFTER_UPLOAD` | `1` | Drop confirmed copies from the emulator. |
 | `STOP_EMULATOR_WHEN_IDLE` | `1` | Stop the VM once drained and confirmed. |
 | `GITHUB_TOKEN` | (unset) | Raises the release-lookup rate limit. Optional. |
+| `MESSAGES_SOURCE` | `0` | 1 scans Messages attachments and stages new images and videos (needs Full Disk Access). |
+| `MESSAGES_DIR` / `MESSAGES_DB` | `~/Library/Messages/Attachments` / `~/Library/Messages/chat.db` | What that scan reads. The database is always copied, with its `-wal` and `-shm`, and never opened in place. |
+| `MESSAGES_BUDGET` | `300` | Seconds the scan may spend reading new attachments per tick; what it does not reach waits for the next one. 0 removes the bound. |
+| `MESSAGES_REPORT_DIR` | (unset) | Where the two reports go. Empty follows `SC_PATHS_ENV`'s `SC_MY_DRIVE`, and skips the reports when that resolves to nothing. |
+| `SC_PATHS_ENV` | `/etc/system-config/paths.env` | A declared-paths file to read `SC_MY_DRIVE` from. Read as data, never sourced. |
 
 Also read from the environment, never from the config: `AVD_RECREATE=1` (recreate
 the emulator onto a newer API), `AVD_REROOT=1` (re-patch the ramdisk),
@@ -703,6 +777,7 @@ All under `~/.cache/avd-photos` (`AVD_PHOTOS_STATE_DIR`):
 | `upload-status` | `<uploaded> <on-device> <failed> <written-at>` for the menu bar. |
 | `device.id` | The emulator's `android_id`; a change resets the ledger. |
 | `device-busy` | A batch is on the device between push and confirmation. |
+| `messages-state.tsv` | The Messages source's ledger: guid, sha1, state (`staged`/`present`), stamp, staged path, chat id, handle id, date, bytes, kind. Keyed by guid+sha1. |
 | `phase` | The running step, or `failed: <why>` from the last run. Removed on a clean exit. |
 | `sync.lock/pid`, `setup.lock/pid` | Single-flight locks (mkdir is the atomic test-and-set; macOS has no `flock`). |
 | `setup-complete` | Written only after the LAST setup phase succeeds. The login bootstrap keys on this. |
@@ -782,9 +857,12 @@ bin/     gphotos-mac-setup     install and update Google Photos for Mac (Apple s
          avd-start avd-stop avd-signin
 lib/     config.sh  log.sh  proc.sh  fs.sh  mac.sh (the Mac backend of the sync)
          presence.sh  is this file already in Google Photos? (gp_present)
+         messages.sh  the Messages source     reports.sh  the two reports
 test/    mac.sh       the Mac backend's bookkeeping, on a scratch state
          presence.sh  the presence check, on a fixture database
          keep.py      the reclaim's keep list, on fixtures
+         messages.sh  the Messages source, on a fixture chat.db
+         reports.sh   the two reports, on a fixture ledger and database
 ios/     gp-bridge.m  the folder-to-GoToHP bridge linked into Google Photos for Mac
 Sources/ main.swift (the menu-bar app)  icon.swift (its artwork, drawn at build time)
 build.sh          builds Photo Sync.app with swiftc; no Xcode project

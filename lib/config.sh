@@ -45,7 +45,9 @@ AP_KEYS="ICLOUD_USERNAME ICLOUDPD STAGING ICLOUD_DIR SHARED_CACHE_DIR
          DELETE_FROM_ICLOUD KEEP_ICLOUD_DAYS KEEP_ICLOUD_ADDED_DAYS
          KEEP_ICLOUD_ALBUMS_EXCLUDE KEEP_ICLOUD_SAVED_FROM_APPS
          PRUNE_DEVICE_AFTER_UPLOAD
-         STOP_EMULATOR_WHEN_IDLE DEST_DCIM GITHUB_TOKEN"
+         STOP_EMULATOR_WHEN_IDLE DEST_DCIM GITHUB_TOKEN
+         MESSAGES_SOURCE MESSAGES_DIR MESSAGES_DB MESSAGES_BUDGET MESSAGES_REPORT_DIR
+         SC_PATHS_ENV"
 
 ap_defaults() {
   # ── Identity and sources ───────────────────────────────────────────────────
@@ -150,6 +152,31 @@ ap_defaults() {
   # a tidy DCIM/iCloudImport looks perfect at every measurable layer -- file on
   # device, row in MediaStore -- while Photos uploads nothing.
   DEST_DCIM="${DEST_DCIM:-/sdcard/DCIM/Camera}"
+
+  # ── Messages as a second source of media ───────────────────────────────────
+  # OFF by default, and deliberately: reading ~/Library/Messages needs Full Disk
+  # Access, the attachments are other people's photos as much as one's own, and
+  # a pipeline whose whole promise is "nothing leaves iCloud until Google has
+  # it" should not quietly start uploading a second library. 1 turns the scan
+  # on; it stages new images and videos from Messages into STAGING/messages and
+  # the normal upload path takes them from there.
+  MESSAGES_SOURCE="${MESSAGES_SOURCE:-0}"
+  MESSAGES_DIR="${MESSAGES_DIR:-$HOME/Library/Messages/Attachments}"
+  MESSAGES_DB="${MESSAGES_DB:-$HOME/Library/Messages/chat.db}"
+  # SECONDS PER TICK, the same lever PRESENCE_BUDGET is and for the same
+  # reason: the scan reads every new attachment's bytes, so a first run against
+  # a large Messages library would otherwise own the tick (1,161 attachments
+  # and 1.96 GB took 92 s here, 2026-09-20). What it does not reach carries to
+  # the next tick, because a file is only ever recorded once it is dealt with.
+  # 0 means no bound.
+  MESSAGES_BUDGET="${MESSAGES_BUDGET:-300}"
+  # Where the two reports are written. Empty means "work it out": on a machine
+  # carrying /etc/system-config/paths.env (this fleet's declared-paths file) the
+  # reports go to that host's own Drive under the media area below, and
+  # everywhere else the reports are skipped with one line rather than inventing
+  # a folder. A deployment that wants them somewhere else sets this key.
+  MESSAGES_REPORT_DIR="${MESSAGES_REPORT_DIR-}"
+  SC_PATHS_ENV="${SC_PATHS_ENV:-/etc/system-config/paths.env}"
 
   # ── Pacing ─────────────────────────────────────────────────────────────────
   RECENT="${RECENT:-2000}"          # how many of the newest iCloud items a run walks
@@ -355,6 +382,23 @@ ICLOUD_USERNAME=
 # The Google account the emulator signs in as. Only ever printed, as a reminder
 # of which account to register the device under.
 #GOOGLE_ACCOUNT=
+
+# ── Messages as a second source of media ────────────────────────────────────
+# 1 scans ~/Library/Messages/Attachments for images and videos and stages the
+# new ones for upload, exactly like an iCloud original. OFF by default: it
+# needs Full Disk Access, and it is a second library's worth of other people's
+# photos. Nothing in Messages is ever modified or deleted, and the live chat.db
+# is never opened -- every read is from a copy taken with its -wal and -shm.
+#MESSAGES_SOURCE=0
+#MESSAGES_DIR="$HOME/Library/Messages/Attachments"
+#MESSAGES_DB="$HOME/Library/Messages/chat.db"
+# Seconds the scan may spend per tick; what it does not reach waits for the
+# next one. 0 removes the bound.
+#MESSAGES_BUDGET=300
+# Where the two reports go (the conversation cleanup list and the Google Photos
+# duplicate groups). Left empty they follow /etc/system-config/paths.env when
+# that file exists, and are skipped otherwise.
+#MESSAGES_REPORT_DIR=
 
 # ── Pacing ──────────────────────────────────────────────────────────────────
 #RECENT=2000          # newest iCloud items each run walks
