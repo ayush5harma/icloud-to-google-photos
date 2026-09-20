@@ -75,6 +75,15 @@ check "confirmed and present count, exists and queued do not" \
 printf 'messages/2025/08/sha1dddd-p2.HEIC\tn\tpresent\t0\t0\talready_in_google_photos\n' >> "$MAC_STATE"
 check "a present row is taken as Google holding the bytes" \
   test "$(msg_confirmed_rels | grep -c 'sha1dddd')" = 2
+# The emulator backend keeps no such ledger: its confirmations are the reclaim
+# list the verify step feeds.
+RECLAIM_PENDING="$T/state/reclaim-pending.list"
+# shellcheck disable=SC2034  # read by msg_confirmed_rels in lib/reports.sh
+RECLAIMED="$T/state/reclaimed.list"
+printf 'messages/2025/07/sha1eeee-from-the-emulator.HEIC\n' > "$RECLAIM_PENDING"
+check "the emulator backend's reclaim list counts as confirmation too" \
+  test "$(msg_confirmed_rels | grep -c 'from-the-emulator')" = 1
+rm -f "$RECLAIM_PENDING"
 
 # The app database: three dedup groups, one of them a triple.
 GPDB="$T/gpstore/photos-1234567890.db"

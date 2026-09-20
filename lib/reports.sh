@@ -47,9 +47,18 @@ msg_report_dir() {
 # `exists` deliberately does not: it means a Live Photo component matched by
 # hash and WHICH half is not reported, so those stay in both places -- and a
 # report that says "delete this" must never be the place that guess is made.
+# On the emulator backend there is no such ledger at all: its evidence is the
+# reclaim list, which the verify step feeds with exactly the device files
+# Google Photos' own database confirmed, and the reclaimed list it drains into.
+# Reading both is what makes this report work on an Intel Mac; on the Mac
+# backend they hold the same paths again and cost one sort.
 msg_confirmed_rels() {
-  [ -r "${MAC_STATE:-}" ] || return 0
-  awk -F'\t' '$3 == "confirmed" || $3 == "present" { print $1 }' "$MAC_STATE"
+  if [ -r "${MAC_STATE:-}" ]; then
+    awk -F'\t' '$3 == "confirmed" || $3 == "present" { print $1 }' "$MAC_STATE"
+  fi
+  [ -r "${RECLAIM_PENDING:-}" ] && cat "$RECLAIM_PENDING"
+  [ -r "${RECLAIMED:-}" ] && cat "$RECLAIMED"
+  return 0
 }
 
 # Written through a temporary file and renamed: the reports live in a synced
