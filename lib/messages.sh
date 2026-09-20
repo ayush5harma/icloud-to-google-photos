@@ -78,7 +78,17 @@ msg_elapsed() { echo $(( $(date +%s) - MSG_T0 )); }
 # launchd-seeded PATH can put a GNU build first, and GNU shasum is not the one
 # whose output this parses.
 msg_sqlite() { if [ -x /usr/bin/sqlite3 ]; then /usr/bin/sqlite3 "$@"; else sqlite3 "$@"; fi; }
-msg_sha1() { if [ -x /usr/bin/shasum ]; then /usr/bin/shasum -a 1 "$1"; else shasum -a 1 "$1"; fi 2>/dev/null | cut -d' ' -f1; }
+# THE FILE ON STDIN, NEVER AS AN ARGUMENT. Given a name, shasum ESCAPES it --
+# `shasum -a 1 'back\slash.jpg'` answers "\11f6ad8e…  back\\slash.jpg", a line
+# whose first field is a backslash followed by 40 hex, and this used to store
+# that as the file's "SHA-1": 41 characters, a leading backslash in the staged
+# name, and a rel that `awk -v` then turns into control characters -- so the
+# file never matched the staging listing and was re-staged on every tick, for
+# ever. Raw Messages names are exactly where such a name comes from. On stdin
+# there is no name to escape, and the second field is "-".
+msg_sha1() {
+  if [ -x /usr/bin/shasum ]; then /usr/bin/shasum -a 1; else shasum -a 1; fi < "$1" 2>/dev/null | cut -d' ' -f1
+}
 
 # image | video | "" (not media), from the extension alone, case-insensitively.
 msg_kind() {
@@ -98,10 +108,20 @@ msg_readable() {
   local err
   err="$(/bin/ls -1 "$MESSAGES_DIR" 2>&1 >/dev/null)"
   if [ -n "$err" ]; then MSG_UNREADABLE="${err##*: }"; return 1; fi
-  err="$(/usr/bin/head -c 16 "$MESSAGES_DB" 2>&1 >/dev/null)"
+  # The DATABASE is probed with a stat, not a read: TCC refuses both, so `ls`
+  # answers the question, and "the live chat.db is never opened" stays true
+  # without a footnote.
+  err="$(/bin/ls -ld "$MESSAGES_DB" 2>&1 >/dev/null)"
   if [ -n "$err" ]; then MSG_UNREADABLE="${err##*: }"; return 1; fi
   return 0
 }
+
+# THE COPY HOLDS THE WHOLE MESSAGE HISTORY, so where it is is not private
+# bookkeeping: the tick's own exit trap removes MSG_SNAP, which is the only way
+# a run killed mid-scan does not leave every message anyone ever sent in
+# TMPDIR until the Mac reboots.
+MSG_SNAP=""
+msg_cleanup_snapshot() { [ -n "$MSG_SNAP" ] && rm -rf "$MSG_SNAP"; MSG_SNAP=""; return 0; }
 
 # A COPY, WITH ITS -wal AND -shm. The live chat.db is never opened: Messages
 # holds it open with WAL journalling, so a reader that takes the .db alone sees
@@ -137,7 +157,13 @@ msg_db_snapshot() {  # <destination directory> -> <destination>/chat.db
 # handle beyond the identifier the report is allowed to print. A filename
 # carrying a tab or a newline is excluded rather than parsed, because it would
 # split this tab-separated stream into fields that no longer line up.
+# MSG_ROWS_ERR carries sqlite's own complaint: a missing sqlite3, a schema that
+# moved and a -wal copied a checkpoint apart all produce NO ROWS, and reporting
+# that as "nothing to back up" is the invisible-failure shape this pipeline
+# keeps relearning.
+MSG_ROWS_ERR=""
 msg_rows() {  # <db copy>
+  local err; err="$(mktemp)"; MSG_ROWS_ERR=""
   msg_sqlite -batch -noheader -separator "$(printf '\t')" "$1" "
     SELECT a.guid,
            a.filename,
@@ -156,7 +182,10 @@ msg_rows() {  # <db copy>
     WHERE a.filename IS NOT NULL AND a.filename <> ''
       AND instr(a.filename, char(10)) = 0
       AND instr(a.filename, char(9)) = 0
-    ORDER BY a.ROWID;" 2>/dev/null
+    ORDER BY a.ROWID;" 2>"$err"
+  [ -s "$err" ] && MSG_ROWS_ERR="$(head -1 "$err")"
+  rm -f "$err"
+  return 0
 }
 
 # THE CHEAP RE-SCAN, and the reason the ledger carries the byte size. A tick
@@ -193,9 +222,12 @@ msg_rel() {  # <sha1> <original path> <unix date>
   local base name
   base="$(basename -- "$2")"
   # Control characters cannot reach a path this pipeline builds: they break
-  # every ledger that is read back with awk -F'\t'.
-  name="$(printf '%s' "$base" | tr -d '\000-\037')"
-  printf '%s/%s/%s-%s\n' "$MSG_PREFIX" "$(date -r "$3" +%Y/%m 2>/dev/null || echo "0000/00")" "${1:0:8}" "$name"
+  # every ledger that is read back with awk -F'\t'. Nor can a BACKSLASH: the
+  # Mac backend's ledger is rewritten with `awk -v r="$rel"`, which reads \7 as
+  # a bell and \s as an s, so a staged path carrying one comes back out of that
+  # file as a different path and never matches the tree again.
+  name="$(printf '%s' "$base" | tr -d '\000-\037\\')"
+  printf '%s/%s/%s-%s\n' "$MSG_PREFIX" "$(/bin/date -r "$3" +%Y/%m 2>/dev/null || echo "0000/00")" "${1:0:8}" "$name"
 }
 
 # Copy into staging through a name the staging enumeration cannot match, then
@@ -229,6 +261,9 @@ msg_stage() {  # <source file> <staging-relative destination>
 # this ledger is quoted in a report that goes to a cloud folder), 1 = absent,
 # anything else = could not tell.
 msg_present() {  # <file> -> 0 present, 1 absent, 2 unknown
+  # PRESENCE_CHECK is the switch for the whole idea, not for one caller: with
+  # it off, nothing here opens the app's database or hashes a file for it.
+  case "${PRESENCE_CHECK:-0}" in 1|yes|true) ;; *) return 2 ;; esac
   command -v gp_present >/dev/null 2>&1 || return 2
   gp_present "$1" >/dev/null 2>&1
   case $? in 0) return 0 ;; 1) return 1 ;; *) return 2 ;; esac
@@ -247,9 +282,10 @@ msg_scan() {
     return 0
   fi
   snap="$(mktemp -d)" || return 0
+  MSG_SNAP="$snap"
   if ! msg_db_snapshot "$snap"; then
     log "Messages source skipped: could not copy $MESSAGES_DB (with its -wal and -shm) — nothing was read"
-    rm -rf "$snap"; return 0
+    msg_cleanup_snapshot; return 0
   fi
   # Whatever a killed run left half-copied. Named, not globbed by extension,
   # because this must never remove a staged file.
@@ -257,8 +293,12 @@ msg_scan() {
   rows="$(mktemp)"
   msg_rows "$snap/chat.db" > "$rows"
   if [ ! -s "$rows" ]; then
-    log "Messages source: no attachment rows in the chat.db copy — nothing to do"
-    rm -rf "$snap" "$rows"; return 0
+    if [ -n "$MSG_ROWS_ERR" ]; then
+      log "Messages source skipped: the chat.db copy could not be queried ($MSG_ROWS_ERR)"
+    else
+      log "Messages source: no attachment rows in the chat.db copy — nothing to do"
+    fi
+    msg_cleanup_snapshot; rm -f "$rows"; return 0
   fi
   phase "scanning Messages attachments"
   total="$(grep -c . "$rows")"
@@ -297,14 +337,14 @@ msg_scan() {
     [ "$when" = 0 ] && when="$(/usr/bin/stat -f %m "$path" 2>/dev/null || echo 0)"
     if msg_present "$path"; then
       msg_state_add "$guid" "$sha" present "-" "$chat" "$handle" \
-        "$(date -r "$when" +%Y-%m-%d 2>/dev/null || echo 0000-00-00)" "$size" "$kind"
+        "$(/bin/date -r "$when" +%Y-%m-%d 2>/dev/null || echo 0000-00-00)" "$size" "$kind"
       MSG_PRESENT=$((MSG_PRESENT + 1))
       continue
     fi
     rel="$(msg_rel "$sha" "$path" "$when")"
     if msg_stage "$path" "$rel"; then
       msg_state_add "$guid" "$sha" staged "$rel" "$chat" "$handle" \
-        "$(date -r "$when" +%Y-%m-%d 2>/dev/null || echo 0000-00-00)" "$size" "$kind"
+        "$(/bin/date -r "$when" +%Y-%m-%d 2>/dev/null || echo 0000-00-00)" "$size" "$kind"
       MSG_STAGED=$((MSG_STAGED + 1))
     else
       # No ledger row: an unstaged file must be tried again next tick.
@@ -314,6 +354,6 @@ msg_scan() {
   secs="$(msg_elapsed)"
   log "Messages source: $MSG_SEEN media attachment(s) seen, $MSG_NEW new, $MSG_STAGED staged, $MSG_PRESENT already in Google Photos, $gone with no bytes on disk, $MSG_SKIPPED not media, $failed not staged, ${secs}s"
   [ "$over" -gt 0 ] && log "  stopped at the ${MESSAGES_BUDGET}s budget with $over row(s) not looked at; the next tick continues where this one stopped"
-  rm -rf "$snap" "$rows"
+  msg_cleanup_snapshot; rm -f "$rows"
   return 0
 }

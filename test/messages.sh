@@ -171,6 +171,51 @@ msg_scan
 check "a different attachment with the same bytes is its own row (the key is guid AND sha1)" \
   test "$(field guid-fwd 3)" = staged -a "$(field guid-fwd 2)" = "$(field guid-new 2)"
 
+echo "a name shasum would escape"
+# shasum given a NAME escapes it: a backslash in the name makes it print
+# "\<40 hex>  <name with doubled backslashes>", so reading "the first field is
+# the hash" yields a 41-character "sha1" starting with a backslash -- and a
+# staged path carrying one comes back out of the Mac backend's awk-rewritten
+# ledger as a different path, so the file would be re-staged on every tick.
+LOGGED=""
+mkfile "$A/11/back\\slash.JPG" "bytes behind an awkward name"
+sqlite "$DB" "INSERT INTO message VALUES (12, $(ns $AUG), NULL);
+              INSERT INTO attachment VALUES (12, 'guid-slash', '$A/11/back\slash.JPG', 28, 'image/jpeg', $(ns $AUG), 0);
+              INSERT INTO message_attachment_join VALUES (12,12);
+              INSERT INTO chat_message_join VALUES (1,12);"
+msg_scan
+check "the hash is 40 hex characters, whatever the file is called" \
+  test "$(field guid-slash 2 | wc -c | tr -d ' ')" = 41
+check "and no backslash reaches the staged path" \
+  test "$(field guid-slash 5 | tr -cd '\\' | wc -c | tr -d ' ')" = 0
+check "the staged file is where the ledger says it is" test -f "$STAGING/$(field guid-slash 5)"
+LOGGED=""; msg_scan
+check "so the next scan does not stage it again" test "$MSG_STAGED" = 0
+
+echo "the presence check turned off"
+LOGGED=""
+mkfile "$A/12/nopresence.JPG" "bytes of a photo Google already has"
+sqlite "$DB" "INSERT INTO message VALUES (13, $(ns $AUG), NULL);
+              INSERT INTO attachment VALUES (13, 'guid-nopres', '$A/12/nopresence.JPG', 5, 'image/jpeg', $(ns $AUG), 0);
+              INSERT INTO message_attachment_join VALUES (13,13);
+              INSERT INTO chat_message_join VALUES (1,13);"
+# This one would answer "present" for every file; with the check off it must
+# never be asked at all.
+gp_present() { printf 'AF1QipFAKE\n'; return 0; }
+PRESENCE_CHECK=0 msg_scan
+check "PRESENCE_CHECK=0 asks nothing, and the file is staged as before" \
+  test "$(field guid-nopres 3)" = staged
+gp_present() { case "$1" in *"/02/photo.heic") printf 'AF1QipFAKEKEY\n'; return 0 ;; esac; return 1; }
+
+echo "a chat.db that cannot be queried"
+LOGGED=""; SAVED_DB="$MESSAGES_DB"; MESSAGES_DB="$T/messages/broken.db"
+printf 'this is not a database\n' > "$MESSAGES_DB"
+msg_scan; rc=$?
+check "an unreadable database is not reported as an empty one" \
+  test "$rc" = 0 && grep -q 'could not be queried' <<<"$LOGGED"
+check "and no copy of anyone's messages is left behind" test -z "$MSG_SNAP"
+MESSAGES_DB="$SAVED_DB"
+
 echo "the per-tick budget"
 LOGGED=""
 mkfile "$A/10/budget.JPG" "a photo arriving after the budget is spent"
@@ -183,7 +228,7 @@ sqlite "$DB" "INSERT INTO message VALUES (11, $(ns $AUG), NULL);
 msg_elapsed() { echo 9999; }
 msg_scan
 check "a spent budget stops the scan before any file is read" test "$MSG_STAGED" = 0
-check "and says how much is left for the next tick" grep -q 'stopped at the 300s budget with 1 row(s) not looked at' <<<"$LOGGED"
+check "and says how much is left for the next tick" grep -qE 'stopped at the 300s budget with [0-9]+ row\(s\) not looked at' <<<"$LOGGED"
 check "nothing it did not reach is recorded" test "$(field guid-budget 3)" = ""
 unset -f msg_elapsed
 msg_elapsed() { echo $(( $(date +%s) - MSG_T0 )); }
