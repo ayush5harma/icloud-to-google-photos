@@ -104,6 +104,40 @@ check("album before saved-from-app",
 check("saved-from-app before the added grace",
       reason(Photo(added_days_ago=1), importers={"M1": "net.whatsapp.WhatsApp"}), "saved_from_app")
 
+print("albums: the folder list, not pyicloud's name-keyed dict")
+# MEASURED ON THE REAL LIBRARY 2026-09-20: five albums on the server, two of
+# them both called "App Icons". pyicloud keys its album dict by NAME, so it
+# held four and one album's members were invisible -- and an invisible album
+# means its members silently lose their "in an album you made" protection.
+
+
+def folder(rn, name, deleted=False):
+    import base64
+    f = {"recordName": rn, "fields": {}}
+    if name is not None:
+        f["fields"]["albumNameEnc"] = {"value": base64.b64encode(name.encode()).decode()}
+    if deleted:
+        f["fields"]["isDeleted"] = {"value": 1}
+    return f
+
+
+recs = [
+    folder("----Root-Folder----", None),
+    folder("----Project-Root-Folder----", None),
+    folder("A", "WhatsApp"),
+    folder("B", "App Icons"),
+    folder("C", "App Icons"),
+    folder("D", "Old", deleted=True),
+]
+check("both albums of one name survive", reclaim.album_folders(recs),
+      [("WhatsApp", "A"), ("App Icons", "B"), ("App Icons", "C")])
+check("the root containers are not albums", [n for n, _ in reclaim.album_folders(recs)].count("WhatsApp"), 1)
+try:
+    reclaim.album_folders([folder("E", None)])
+    check("an unreadable album name raises rather than vanishing", "did not raise", "raised")
+except RuntimeError:
+    check("an unreadable album name raises rather than vanishing", "raised", "raised")
+
 print("the *Enc decoder")
 check("base64 of utf-8 decodes", reclaim._dec("bmV0LndoYXRzYXBwLldoYXRzQXBw"), "net.whatsapp.WhatsApp")
 check("nothing decodes to nothing", reclaim._dec(None), None)

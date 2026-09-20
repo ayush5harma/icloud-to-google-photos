@@ -170,8 +170,19 @@ pipeline becomes a one-way copier.
    keyed by `localDedupKey` = `base64url(sha1(the file's bytes))` without
    padding, 27 characters. A file with a row is **already backed up**: it is
    recorded with that media key, put on the reclaim list and never uploaded.
+   A row carrying a **tombstone** does not count: a photo deleted in Google
+   Photos keeps its `ServerPhotos` row, and without that exclusion the file
+   would answer "present" and its iCloud original would be deleted too -- gone
+   from both sides. More than one account database on the Mac is an unknown
+   rather than a choice, since nothing local says which account the app is
+   signed into now.
    A Live Photo is one item at Google, keyed by the still's bytes, so only the
-   still is hashed and its answer carries the `.MOV` beside it.
+   still is hashed and its answer carries the `.MOV` beside it: for
+   `IMG_1234_HEVC.MOV`, icloudpd's own Live Photo name, the stem is the
+   evidence; for a bare `IMG_1234.MOV`, which is also what a standalone video
+   is called, the two files must share an mtime as well, because iPhone
+   filenames recycle and a stem match alone would pair a video with an
+   unrelated photo.
    This matters most for a library some other device already backed up: this
    backend confirms from the reply to its own upload, so without the check it
    cannot tell, and hands the whole library over again for Google to discard
@@ -340,9 +351,13 @@ them keeps it, and the reason is logged and written to
 each run, dry runs included, for the reports to read):
 
 - **a favourite** - `isFavorite` on the CloudKit asset record;
-- **in an album you made** - every album the server returns that is not one of
-  pyicloud's smart albums (Favorites, Live, Videos, Screenshots, Bursts,
-  Panoramas, Slo-mo, Time-lapse, Hidden, Recently Deleted). Name albums in
+- **in an album you made** - read from the server's own folder list rather than
+  from pyicloud's album dict, which is keyed by NAME: two albums called the
+  same thing collapse to one entry there and the shadowed album's members lose
+  this protection silently (measured on a real library: five albums, two of
+  them both "App Icons", four entries in the dict). Smart albums (Favorites,
+  Live, Videos, Screenshots, Bursts, Panoramas, Slo-mo, Time-lapse, Hidden,
+  Recently Deleted) are not part of the rule at all. Name albums in
   `KEEP_ICLOUD_ALBUMS_EXCLUDE` to stop them counting;
 - **saved into the library by another app** - what Photos shows as "Recently
   Saved". That album is *not* exposed over CloudKit, but the signal behind it

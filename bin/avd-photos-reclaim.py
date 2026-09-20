@@ -116,6 +116,63 @@ def _dec(v):
         return None
 
 
+def user_albums(library):
+    """Every album a human made, as (name, PhotoAlbum) pairs. A LIST, not a dict.
+
+    pyicloud's own `library.albums` is keyed by NAME (photos.py:
+    `albums[folder_name] = album`), so two albums called the same thing collapse
+    to one entry and the shadowed one's members are invisible -- which here
+    would mean they silently lose their "in an album you made" protection and
+    could be deleted from iCloud. Measured on the real library 2026-09-20: five
+    albums on the server, two of them both named "App Icons", and the dict held
+    four. The same naming also lets a user album called "Videos" or "Favorites"
+    replace the smart album of that name.
+
+    So the folder list is read directly and each album is built the way
+    pyicloud builds it, in the same order, skipping the two root containers and
+    anything deleted. Smart albums are not in this list at all: membership of
+    them is automatic and would keep the whole library.
+    """
+    from pyicloud_ipd.services.photos import PhotoAlbum
+
+    out = []
+    for name, folder_id in album_folders(library._fetch_folders()):
+        out.append((name, PhotoAlbum(
+            library.params, library.session, library.service_endpoint, name,
+            "CPLContainerRelationLiveByAssetDate",
+            f"CPLContainerRelationNotDeletedByAssetDate:{folder_id}",
+            [{"fieldName": "parentId", "comparator": "EQUALS",
+              "fieldValue": {"type": "STRING", "value": folder_id}}],
+            zone_id=library.zone_id,
+        )))
+    return out
+
+
+def album_folders(records):
+    """(name, recordName) for every real album in a CPLAlbumByPositionLive list.
+
+    The pure half of user_albums, so the filtering can be tested without an
+    iCloud session: the two root containers and anything deleted are dropped,
+    and a duplicated NAME is kept as its own entry -- that is the whole point.
+    """
+    out = []
+    for folder in records:
+        if folder.get("recordName") in ("----Root-Folder----", "----Project-Root-Folder----"):
+            continue
+        fields = folder.get("fields", {})
+        if fields.get("isDeleted") and fields["isDeleted"].get("value"):
+            continue
+        enc = fields.get("albumNameEnc", {}).get("value")
+        name = _dec(enc)
+        if name is None:
+            # A folder whose name cannot be read is still an album, and its
+            # members still deserve keeping: raise rather than skip it, so the
+            # caller records album_listing_failed and keeps everything.
+            raise RuntimeError("an album's name could not be decoded: %r" % (folder.get("recordName"),))
+        out.append((name, folder["recordName"]))
+    return out
+
+
 def keep_reason(
     photo,
     album_members,
@@ -328,11 +385,9 @@ def main() -> int:
     excluded = {n.strip() for n in a.keep_album_exclude if n.strip()}
     if matched:
         try:
-            from pyicloud_ipd.services.photos import PhotoLibrary
-            smart = set(PhotoLibrary.SMART_FOLDERS.keys())
             album_members = set()
-            for name, album in library.albums.items():
-                if name in smart or name in excluded:
+            for name, album in user_albums(library):
+                if name in excluded:
                     continue
                 n_before = len(album_members)
                 for member in album:
@@ -403,6 +458,25 @@ def main() -> int:
     stats["kept_by"] = kept_by
     stats["would_delete"] = len(to_delete)
 
+    # THE KEEP SET IS WRITTEN BEFORE THE FIRST DELETION, not after the last:
+    # the caller kills this process at RECLAIM_TIMEOUT, pass 3 is the long part,
+    # and the record of what was deliberately kept must survive that kill -- it
+    # is what avd-photos-status reports from. Rewritten whole through a
+    # temporary file so a reader never sees half of it. A DRY RUN WRITES IT
+    # TOO: it records what would have been kept and cannot make anything look
+    # reclaimed, which is the only thing --out is guarded against.
+    if a.keep_state:
+        try:
+            tmp = a.keep_state + ".tmp"
+            with open(tmp, "w") as f:
+                f.write("# recordName\treason\tstagedPath  (run %d, dry_run=%d)\n"
+                        % (int(now.timestamp()), 1 if a.dry_run else 0))
+                for rn, reason, rel in keep_set:
+                    f.write("%s\t%s\t%s\n" % (rn, reason, rel))
+            os.replace(tmp, a.keep_state)
+        except OSError as e:
+            log.error("could not write the keep set to %s: %s", a.keep_state, e)
+
     # ── Pass 3: the deletions, and only what pass 2 left.
     for photo, hit, companions in to_delete:
         try:
@@ -417,22 +491,6 @@ def main() -> int:
         except Exception as e:
             stats["errors"] += 1
             log.error("delete failed for %s: %s", hit, e)
-
-    # The run's keep set, rewritten whole through a temporary file so a reader
-    # never sees half of it. A DRY RUN WRITES THIS ONE: it records what would
-    # have been kept and cannot make anything look reclaimed, which is the only
-    # thing --out is guarded against.
-    if a.keep_state:
-        try:
-            tmp = a.keep_state + ".tmp"
-            with open(tmp, "w") as f:
-                f.write("# recordName\treason\tstagedPath  (run %d, dry_run=%d)\n"
-                        % (int(now.timestamp()), 1 if a.dry_run else 0))
-                for rn, reason, rel in keep_set:
-                    f.write("%s\t%s\t%s\n" % (rn, reason, rel))
-            os.replace(tmp, a.keep_state)
-        except OSError as e:
-            log.error("could not write the keep set to %s: %s", a.keep_state, e)
 
     # What the walk never met is not in the library: nothing left to reclaim. A
     # small "walked" count is a small library, not a truncated walk -- one run
