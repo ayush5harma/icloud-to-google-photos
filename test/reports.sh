@@ -184,6 +184,21 @@ check "the duplicates report is about the account, so it is written anyway" \
   test -s "$T/out/gphotos-duplicates-report.md"
 MSG_STATE="$SAVED_MSG"
 
+echo "two account databases"
+# lib/presence.sh refuses to choose between two accounts' libraries, because a
+# row in the wrong one would authorise deleting an iCloud original. This report
+# must not quietly answer that question differently -- and it must not define a
+# gp_db_path of its own, which would REPLACE the presence check's, this file
+# being sourced after it.
+check "no second definition of the presence check's own function" \
+  none grep -qE '^gp_db_path\(\)' "$HERE/../lib/reports.sh"
+LOGGED=""
+cp "$GPDB" "$T/gpstore/photos-9999999999.db"
+gp_duplicates_report "$T/out/ambiguous.md"
+check "two account databases is a refusal, not a pick" \
+  test ! -e "$T/out/ambiguous.md" && grep -q 'more than one account database' <<<"$LOGGED"
+rm -f "$T/gpstore/photos-9999999999.db"
+
 echo "no Google Photos database"
 LOGGED=""; GP_STORE_DIR="$T/empty-store"; mkdir -p "$GP_STORE_DIR"
 gp_duplicates_report "$T/out/none.md"

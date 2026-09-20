@@ -185,28 +185,40 @@ msg_cleanup_report() {  # <destination file>
 
 # ── The Google Photos duplicate groups ───────────────────────────────────────
 
-# The newest account database in the app's container: one photos-<accountId>.db
-# per signed-in account, and photos-shared.db (which holds no library) is not
-# one of them. The FOLDER is GP_STORE_DIR, lib/presence.sh's: the presence
-# check and this report read the same database, so it is named once and not
-# twice. The default below is for a caller that loaded this file without that
-# one; the tick always has both.
-gp_db_path() {
-  local f newest="" nt=0 t store
+# WHICH DATABASE THIS REPORT READS, and deliberately NOT a function called
+# gp_db_path: lib/presence.sh defines one, this file is sourced after it, and a
+# second definition of that name would silently replace the one gp_present
+# calls -- putting the report's rule on the path that decides whether a
+# photograph may leave iCloud. This asks that function instead, and only falls
+# back to its own copy of the rule for a caller that loaded this file alone.
+#
+# TWO ACCOUNT DATABASES IS A REFUSAL, not a choice between them: a Mac that has
+# had a second Google account keeps that account's file, and nothing here can
+# tell which one the app is signed into now. Exit codes are presence.sh's, so
+# the two agree: 0 = the path is on stdout, 1 = none, 2 = more than one.
+msg_gp_db_path() {
+  if command -v gp_db_path >/dev/null 2>&1; then gp_db_path; return $?; fi
+  local store found="" n=0 f
   store="${GP_STORE_DIR:-$HOME/Library/Containers/com.google.photos/Data/Library/Application Support/store}"
+  [ -d "$store" ] || return 1
   for f in "$store"/photos-*.db; do
+    case "$f" in *'*'*|*/photos-shared.db) continue ;; esac
     [ -f "$f" ] || continue
-    case "$f" in *photos-shared.db) continue ;; esac
-    t="$(/usr/bin/stat -f %m "$f" 2>/dev/null || echo 0)"
-    [ "$t" -gt "$nt" ] && { nt="$t"; newest="$f"; }
+    n=$((n + 1)); found="$f"
   done
-  [ -n "$newest" ] || return 1
-  printf '%s\n' "$newest"
+  [ "$n" -gt 1 ] && return 2
+  [ "$n" -eq 1 ] || return 1
+  printf '%s\n' "$found"
 }
 
 gp_duplicates_report() {  # <destination file>
   local src snap groups totals
-  src="$(gp_db_path)" || { log "duplicates report skipped: no Google Photos database in the app's own store"; return 0; }
+  src="$(msg_gp_db_path)"
+  case $? in
+    0) ;;
+    2) log "duplicates report skipped: the app's store holds more than one account database, and which one it is signed into is not knowable from here"; return 0 ;;
+    *) log "duplicates report skipped: no Google Photos database in the app's own store"; return 0 ;;
+  esac
   snap="$(mktemp -d)" || return 0
   # db + -wal + -shm together, and opened read-write, for the same reasons the
   # Messages copy is (lib/messages.sh): the WAL holds everything since the last
