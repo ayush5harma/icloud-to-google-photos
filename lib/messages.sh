@@ -191,15 +191,20 @@ msg_rel() {  # <sha1> <original path> <unix date>
   printf '%s/%s/%s-%s\n' "$MSG_PREFIX" "$(date -r "$3" +%Y/%m 2>/dev/null || echo "0000/00")" "${1:0:8}" "$name"
 }
 
-# Copy into staging through a dot-name, then rename: the same tick enumerates
-# the staging tree a moment later and hands what it finds to Google Photos, so
-# a half-copied file must not be visible under its final name. The size is
-# checked before the rename for the same reason mac_handoff checks it.
+# Copy into staging through a name the staging enumeration cannot match, then
+# rename: the same tick lists the tree a moment later and hands what it finds
+# to Google Photos, so a half-copied file must be invisible to that listing
+# until it is whole. A DOT-NAME IS NOT ENOUGH for that -- enumerate_staging
+# selects on the extension alone and would happily hand over
+# ".incoming-<name>.MOV" -- so the partial file ends in ".part" as well, which
+# also makes a leftover from a killed run sweepable by name (msg_scan does it).
+# The size is checked before the rename for the same reason mac_handoff checks
+# it: a short copy that is renamed is a truncated photo with a media key.
 msg_stage() {  # <source file> <staging-relative destination>
   local dst="$STAGING/$2" dir tmp src_sz dst_sz
   dir="$(dirname "$dst")"
   mkdir -p "$dir" 2>/dev/null || return 1
-  tmp="$dir/.incoming-$(basename -- "$2")"
+  tmp="$dir/.incoming-$(basename -- "$2").part"
   src_sz="$(/usr/bin/stat -f %z "$1" 2>/dev/null || echo 0)"
   if /bin/cp -p "$1" "$tmp" 2>/dev/null; then
     dst_sz="$(/usr/bin/stat -f %z "$tmp" 2>/dev/null || echo 0)"
@@ -238,6 +243,9 @@ msg_scan() {
     log "Messages source skipped: could not copy $MESSAGES_DB (with its -wal and -shm) — nothing was read"
     rm -rf "$snap"; return 0
   fi
+  # Whatever a killed run left half-copied. Named, not globbed by extension,
+  # because this must never remove a staged file.
+  find "$STAGING/$MSG_PREFIX" -type f -name '.incoming-*.part' -delete 2>/dev/null
   rows="$(mktemp)"
   msg_rows "$snap/chat.db" > "$rows"
   if [ ! -s "$rows" ]; then
@@ -267,6 +275,10 @@ msg_scan() {
     msg_known_key "$guid" "$sha" && continue
     MSG_NEW=$((MSG_NEW + 1))
     when="${when:-0}"; case "$when" in ''|*[!0-9]*) when=0 ;; esac
+    # An attachment with neither its own date nor a dated message would file
+    # itself under 1970/01; the file's own mtime is a better answer and is the
+    # date Messages itself shows for it.
+    [ "$when" = 0 ] && when="$(/usr/bin/stat -f %m "$path" 2>/dev/null || echo 0)"
     if msg_present "$path"; then
       msg_state_add "$guid" "$sha" present "-" "$chat" "$handle" \
         "$(date -r "$when" +%Y-%m-%d 2>/dev/null || echo 0000-00-00)" "$size" "$kind"

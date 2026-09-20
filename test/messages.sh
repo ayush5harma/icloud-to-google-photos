@@ -130,6 +130,17 @@ check "the staged path carries the date's year and month" \
 check "the log says what it did" grep -qE 'Messages source: 5 media attachment\(s\) seen, 4 new, 3 staged, 1 already in Google Photos, 1 with no bytes' <<<"$LOGGED"
 check "the counters agree with it" test "$MSG_STAGED/$MSG_PRESENT/$MSG_SEEN" = "3/1/5"
 
+echo "a half-copied file"
+# The staging enumeration selects on the extension alone, so a partial copy
+# must not carry one: a leftover from a killed run would otherwise be handed to
+# Google Photos as a truncated photo, and confirmed.
+STALE="$STAGING/messages/$(date -r $JUL +%Y/%m)/.incoming-deadbeef-half.HEIC.part"
+printf 'half' > "$STALE"
+check "a partial copy cannot end in a media extension" \
+  test "$(find "$STAGING" -type f | grep -icE '\.(heic|mov|png|jpg)$' | tr -d ' ')" = 3
+msg_scan
+check "and a leftover is swept by the next scan" test ! -e "$STALE"
+
 echo "a second scan"
 BEFORE="$(rows)"; LOGGED=""
 msg_scan
