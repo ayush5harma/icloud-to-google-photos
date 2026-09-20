@@ -14,6 +14,12 @@
 #       dedup_key appears in Photos' own remote_media -> the emulator copy is
 #       pruned -> the CONFIRMED items leave iCloud. Steps 2-5 below.
 #
+# A SECOND SOURCE, off by default (MESSAGES_SOURCE=1, lib/messages.sh): the
+# images and videos in ~/Library/Messages/Attachments are staged into
+# STAGING/messages and travel the same path from there. It runs between the
+# download and the backend so the same tick uploads them, and it can only ever
+# skip itself -- never fail the run.
+#
 # WHY A LEDGER AND NOT `find -mtime`: icloudpd stamps each file with the PHOTO's
 # creation date, not the download time, so "what changed in the last two days"
 # skips almost the whole library while the job looks healthy. Keyed on the path
@@ -41,6 +47,12 @@ ap_load_config
 # After the config: the Mac backend's paths are config keys.
 # shellcheck disable=SC1091
 . "$LIB_DIR/mac.sh"
+# The Messages source and the two reports it feeds. Both are no-ops unless
+# MESSAGES_SOURCE=1, and neither can fail the tick.
+# shellcheck disable=SC1091
+. "$LIB_DIR/messages.sh"
+# shellcheck disable=SC1091
+. "$LIB_DIR/reports.sh"
 
 LEDGER="$STATE_DIR/pushed.list"
 # Staged paths Google Photos has confirmed (fed ONLY by the prune step), and the
@@ -420,6 +432,14 @@ else
   log "icloudpd rc=$rc (often just 'no new items' or needs re-auth) — continuing"
 fi
 
+# ── 1b. Messages: stage new attachments into the same tree ───────────────────
+# AFTER icloudpd AND BEFORE the backend, so anything staged here is handed to
+# Google Photos by the same run rather than waiting 15 minutes for the next
+# one. Off unless MESSAGES_SOURCE=1, and it never fails the tick: an
+# Attachments folder this process may not read (Full Disk Access) costs one
+# log line.
+msg_scan
+
 # ── 2-5 on Apple silicon: Google Photos for Mac ──────────────────────────────
 # The quiet-tick gate lives INSIDE mac_sync rather than here, because it needs
 # the bridge's ledger taken in first: a tick with nothing new and nothing
@@ -428,6 +448,8 @@ fi
 if [ "$PHOTOS_BACKEND" = mac ]; then
   mac_sync
   if [ "$DELETE_FROM_ICLOUD" = "1" ] && [ -s "$RECLAIM_PENDING" ]; then reclaim_icloud; fi
+  # LAST, so the conversation report counts what this run confirmed.
+  msg_reports
   log "done ($MAC_HANDED handed to Google Photos this run)"
   exit 0
 fi
@@ -875,6 +897,7 @@ if [ "$STOP_EMULATOR_WHEN_IDLE" = "1" ] && [ ! -f "$DEVICE_BUSY" ] && [ -f "$STA
   if pgrep -f "qemu-system.*$AVD_NAME" >/dev/null 2>&1; then log "WARNING: the emulator did not stop within 60 s"; else log "emulator stopped: device drained, batch confirmed"; fi
 fi
 
+msg_reports
 rm -f "$pushedpaths"
 log "done ($pushed pushed this run)"
 exit 0
