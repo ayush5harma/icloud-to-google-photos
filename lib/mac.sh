@@ -35,6 +35,14 @@
 #                      Neither confirmed nor retried: which component matched
 #                      is not reported, so the pair stays in iCloud -- the
 #                      safe direction.
+#           present    Google Photos' OWN database already holds this file's
+#                      bytes (lib/presence.sh), so it was never handed over.
+#                      Its own state and not "confirmed", because the evidence
+#                      is different: a confirmation is Google's reply to THIS
+#                      pipeline's upload, a presence is a row in the app's
+#                      library that some other device may have put there. Both
+#                      mean the bytes are at Google and both feed the reclaim;
+#                      only this one can be wrong about WHICH upload did it.
 #           failed     the engine gave up, or the bridge never took it
 #   stamp   epoch of the last transition (a queued row's handoff time)
 #   tries   failures so far, against MAC_RETRIES
@@ -42,6 +50,13 @@
 #           Never a media key and never an account: this file is read by the
 #           menu bar and quoted in logs.
 MAC_STATE="$STATE_DIR/mac-state.tsv"
+# The media key of every file the presence check found, kept OUT of the state
+# file above on purpose: that one is read by the menu bar and quoted in logs,
+# and a media key is an account-scoped identifier for a photograph. One row per
+# staged path, "<rel>\t<media key>\t<epoch>", append-only, nothing else reads
+# it -- it is the evidence trail for a reclaim that was decided without an
+# upload of our own.
+MAC_PRESENT="$STATE_DIR/mac-present.tsv"
 MAC_RETRIES=3                                  # handoffs per file before it is left alone
 # A handoff the bridge has NO ENTRY for this long after the copy was lost on
 # the way (a copy that never settled, a folder emptied by hand): it counts as
@@ -59,7 +74,14 @@ MAC_INBOX="$HOME/Pictures/Google Photos Upload"
 MAC_BRIDGE="$MAC_INBOX/.bridge"
 MAC_HANDED=0                                   # handed over this run, for the "done" line
 MAC_DONE=0                                     # confirmed this run
+MAC_PRESENT_N=0                                # found already in Google Photos this run
 MAC_FAILURES=0                                 # failures this run, and the gate on the confirmation stamp
+
+# The presence check lives beside this file and is sourced from here rather
+# than from avd-photos-sync, so every consumer of lib/mac.sh (the status
+# command, the tests) has it too.
+# shellcheck disable=SC1091
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/presence.sh"
 
 # /usr/bin/jq ships with macOS since 15; a jq on PATH does as well.
 mac_jq() {
@@ -312,6 +334,101 @@ mac_expire() {
   rm -f "$seen"
 }
 
+# ── What Google Photos already has ───────────────────────────────────────────
+# This backend's confirmation is the reply to its OWN upload call, so it can
+# only ever recognise what it uploaded itself: a library the phone's Google
+# Photos backed up years ago is handed over again, file by file, and Google
+# discards every one of them as a duplicate after the copy, the read and the
+# upload. lib/presence.sh asks the app's own database instead, and a file it
+# finds there is confirmed without being uploaded at all.
+#
+# THE SAME EVIDENCE THE RECLAIM ALREADY TRUSTS, from the other end: a row in
+# ServerPhotos IS Google holding those bytes. What it does not say is who put
+# them there, which is why the row is "present" and not "confirmed".
+
+# One staged path's answer, cached in a file so a still that several callers
+# ask about is hashed once. Echoes the media key on stdout when present; the
+# exit code is gp_present's (0 present, 1 absent, 2 unknown).
+mac_presence_of() {  # <rel> <cache file>
+  local rel="$1" cache="$2" rc key
+  # Two fields, read with IFS rather than picked apart with a literal tab in a
+  # parameter expansion -- an invisible character is not something the next
+  # reader of this file should have to trust.
+  IFS="$(printf '\t')" read -r rc key < <(awk -F'\t' -v r="$rel" '$1 == r { print $2 "\t" $3; exit }' "$cache" 2>/dev/null)
+  if [ -n "${rc:-}" ]; then
+    [ "$rc" = 0 ] && printf '%s\n' "$key"
+    return "$rc"
+  fi
+  key="$(gp_present "$STAGING/$rel")"; rc=$?
+  printf '%s\t%s\t%s\n' "$rel" "$rc" "$key" >> "$cache"
+  [ "$rc" = 0 ] && printf '%s\n' "$key"
+  return "$rc"
+}
+
+# A staged path Google already holds: its own row, its media key beside it, and
+# the reclaim list -- the same three things mac_collect does for a confirmed
+# upload, minus the upload.
+mac_present_confirm() {  # <rel> <media key>
+  mac_state_to "$1" "${1//\//_}" present already_in_google_photos
+  printf '%s\t%s\t%s\n' "$1" "$2" "$(date +%s)" >> "$MAC_PRESENT"
+  grep -qxF "$1" "$RECLAIM_PENDING" 2>/dev/null || printf '%s\n' "$1" >> "$RECLAIM_PENDING"
+  MAC_PRESENT_N=$((MAC_PRESENT_N + 1))
+}
+
+# Decides each new staged path against the app's database and REWRITES the list
+# it is given with only the ones that still have to be uploaded.
+#
+# BOUNDED BY WALL CLOCK, not by file count: the cost is dominated by reading
+# every candidate's bytes (measured 2026-09-20 over this fleet's own staging
+# tree: 2,404 files, 16.2 GB, 87 s -- 36 ms per file), so a first run against a
+# large library would otherwise spend the whole tick hashing. Whatever the
+# budget does not reach is handed over the way it always was, which is the old
+# behaviour and never a deletion.
+#
+# ONE DATABASE COPY FOR THE WHOLE PASS (gp_db_open is idempotent): 1.4 s for
+# the 100 MB copy and the 53,150-row key dump, against 36 ms per file after it.
+mac_presence_pass() {  # <file of new staged paths>
+  local newf="$1" cache out rel still key rc deadline
+  local n_present=0 n_absent=0 n_unknown=0 n_pair=0 n_skipped=0 checked=0
+  case "$PRESENCE_CHECK" in 1|yes|true) ;; *) return 0 ;; esac
+  if ! gp_db_open; then
+    log "  Google Photos' own library is not readable ($GP_DB_REASON): every new file is handed over as before"
+    return 0
+  fi
+  cache="$(mktemp)"; out="$(mktemp)"
+  deadline=$((SECONDS + PRESENCE_BUDGET))
+  phase "checking what Google Photos already has"
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      n_skipped=$((n_skipped + 1)); printf '%s\n' "$rel" >> "$out"; continue
+    fi
+    # A Live Photo is ONE item at Google, keyed by the still's bytes, so the
+    # motion component is asked about through its still. gp_still_of answers
+    # only for a video that has a still beside it in the staging tree.
+    still="$(gp_still_of "$STAGING" "$rel")" || still="$rel"
+    key="$(mac_presence_of "$still" "$cache")"; rc=$?
+    checked=$((checked + 1))
+    case "$rc" in
+      0) mac_present_confirm "$rel" "$key"
+         n_present=$((n_present + 1))
+         [ "$still" = "$rel" ] || n_pair=$((n_pair + 1)) ;;
+      1) n_absent=$((n_absent + 1)); printf '%s\n' "$rel" >> "$out" ;;
+      # UNKNOWN IS UPLOADED. An unreadable database, a missing sha1 or a file
+      # whose bytes the cloud folder has not materialised all land here, and
+      # each of them must cost a duplicate upload rather than a deletion.
+      *) n_unknown=$((n_unknown + 1)); printf '%s\n' "$rel" >> "$out" ;;
+    esac
+    [ $((checked % 50)) -eq 0 ] && phase "checking what Google Photos already has: $checked"
+  done < "$newf"
+  mv -f "$out" "$newf"
+  rm -f "$cache"
+  log "already in Google Photos: $n_present of $((n_present + n_absent + n_unknown)) checked (of which $n_pair Live Photo component(s) by their still); to upload: $n_absent; undecidable, so uploaded anyway: $n_unknown"
+  [ "$n_skipped" -gt 0 ] \
+    && log "  the ${PRESENCE_BUDGET}s presence budget ran out with $n_skipped file(s) unchecked; they are handed over as usual"
+  return 0
+}
+
 # ── The handoff ──────────────────────────────────────────────────────────────
 
 # The staged files not handled yet, sorted, into $1; MAC_STAGED holds the
@@ -340,11 +457,20 @@ mac_list_new() {
 # and waits out any file whose inode changed in the last five seconds) sees a
 # Live Photo's still and video together. cp -p keeps the photo's own date,
 # which the engine turns into the item's timestamp.
-mac_handoff() {
-  local newf batch rel name src_sz dst_sz room cap target evicted=0 empty=0 short=0 total_new clash
-  newf="$(mktemp)"; batch="$(mktemp)"
+# <list> is the new staged paths, already listed and already put past the
+# presence check by the caller. Without it this does both itself, so a call
+# from anywhere else is still complete.
+mac_handoff() {  # [file of new staged paths]
+  local newf batch rel name src_sz dst_sz room cap target evicted=0 empty=0 short=0 total_new clash own=0
+  batch="$(mktemp)"
   rm -f "$MAC_INBOX"/.incoming-* 2>/dev/null
-  mac_list_new "$newf"
+  if [ $# -ge 1 ] && [ -n "$1" ]; then
+    newf="$1"
+  else
+    newf="$(mktemp)"; own=1
+    mac_list_new "$newf"
+    mac_presence_pass "$newf"
+  fi
   total_new="$(count_lines "$newf")"
   room=$((MAC_INBOX_MAX - $(mac_outstanding | mac_count)))
   cap="$PUSH_CAP"; [ "$room" -lt "$cap" ] && cap="$room"; [ "$cap" -lt 0 ] && cap=0
@@ -388,7 +514,8 @@ mac_handoff() {
   done < "$batch"
   log "staged $MAC_STAGED media file(s); new since last run: $total_new; handed to Google Photos $MAC_HANDED (cap $cap), short $short, evicted-skipped $evicted, empty-skipped $empty; given up after $MAC_RETRIES failures so far: $(mac_given_up | mac_count)"
   [ "$total_new" -gt "$MAC_HANDED" ] && log "$((total_new - MAC_HANDED)) left for the next run"
-  rm -f "$newf" "$batch"
+  [ "$own" -eq 1 ] && rm -f "$newf"
+  rm -f "$batch"
 }
 
 # Wait for Google's answers to the handoffs in flight, bounded by UPLOAD_WAIT
@@ -443,9 +570,18 @@ mac_sync() {
   mac_collect
   # A quiet tick is one listing and one read of the bridge's ledger: the app
   # is launched only when there is something to hand over or to wait for.
-  newf="$(mktemp)"; mac_list_new "$newf"; new="$(count_lines "$newf")"; rm -f "$newf"
+  newf="$(mktemp)"; mac_list_new "$newf"; new="$(count_lines "$newf")"
+  # THE PRESENCE CHECK COMES BEFORE THE LAUNCH, deliberately: a tick whose new
+  # files Google Photos already holds now confirms them from the database and
+  # ends without opening the app at all -- which is the whole point of asking
+  # before uploading rather than after.
+  if [ "$new" -gt 0 ]; then
+    mac_presence_pass "$newf"
+    new="$(count_lines "$newf")"
+  fi
   waiting="$(mac_outstanding | mac_count)"
   if [ "$new" -eq 0 ] && [ "$waiting" -eq 0 ]; then
+    rm -f "$newf"
     log "staged $MAC_STAGED media file(s); nothing new, nothing waiting for Google Photos"
     mac_stamp_if_clean
     return 0
@@ -456,7 +592,8 @@ mac_sync() {
   case "$(mac_alive engine)" in true|1) ;; *) fail "this Google Photos has no GoToHP engine (the IPA must carry the Gunshot tweak's GunshotJailed.dylib) — run gphotos-mac-setup" ;; esac
   [ "$(mac_alive account)" = true ] || fail "Google Photos is not signed in (open it and sign in once; the bridge reports no account)"
   mac_expire
-  [ "$new" -gt 0 ] && mac_handoff
+  [ "$new" -gt 0 ] && mac_handoff "$newf"
+  rm -f "$newf"
   waiting="$(mac_outstanding | mac_count)"
   if [ "$waiting" -eq 0 ]; then
     log "nothing waiting for Google Photos"

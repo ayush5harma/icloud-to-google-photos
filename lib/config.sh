@@ -41,7 +41,10 @@ AP_KEYS="ICLOUD_USERNAME ICLOUDPD STAGING ICLOUD_DIR SHARED_CACHE_DIR
          GPHOTOS_IPA_URL GPHOTOS_IPA_SHA256 IPA_INSTALL MAC_INBOX_MAX AVD_NAME AVD_SDK_ROOT AVD_ABI AVD_TAG AVD_DEVICE
          AVD_RES AVD_DPI AVD_RAM AVD_CORES AVD_DISK AVD_HEAP AVD_GPU AVD_SPOOF
          RECENT UNTIL_FOUND PUSH_CAP UPLOAD_WAIT ADB_TIMEOUT RECLAIM_TIMEOUT
-         DELETE_FROM_ICLOUD KEEP_ICLOUD_DAYS PRUNE_DEVICE_AFTER_UPLOAD
+         PRESENCE_CHECK PRESENCE_BUDGET
+         DELETE_FROM_ICLOUD KEEP_ICLOUD_DAYS KEEP_ICLOUD_ADDED_DAYS
+         KEEP_ICLOUD_ALBUMS_EXCLUDE KEEP_ICLOUD_SAVED_FROM_APPS
+         PRUNE_DEVICE_AFTER_UPLOAD
          STOP_EMULATOR_WHEN_IDLE DEST_DCIM GITHUB_TOKEN"
 
 ap_defaults() {
@@ -159,6 +162,19 @@ ap_defaults() {
   ADB_TIMEOUT="${ADB_TIMEOUT:-120}"
   RECLAIM_TIMEOUT="${RECLAIM_TIMEOUT:-1800}"
 
+  # ── Ask before uploading (the mac backend) ─────────────────────────────────
+  # Look each new staged file up in Google Photos' OWN database before handing
+  # it over (lib/presence.sh): a library the phone backed up years ago is
+  # already there, and this backend cannot tell on its own, because its
+  # confirmation is the reply to its own upload. 0 turns the check off and
+  # every file is uploaded as before.
+  PRESENCE_CHECK="${PRESENCE_CHECK:-1}"
+  # SECONDS PER TICK, not a file count: the check reads every candidate's bytes
+  # (measured 36 ms per file over this project's own staging tree, 2026-09-20),
+  # so a first run against a large library would otherwise spend the whole tick
+  # hashing. Whatever it does not reach is handed over the way it always was.
+  PRESENCE_BUDGET="${PRESENCE_BUDGET:-300}"
+
   # ── iCloud space reclaim ───────────────────────────────────────────────────
   # ON by default, because freeing the iCloud plan is what the pipeline is for,
   # and the gate is confirmation: an asset leaves iCloud only after Google
@@ -173,6 +189,32 @@ ap_defaults() {
   # means no floor -- the `-` form below substitutes only when it is UNSET, so a
   # config that clears it keeps it cleared.
   KEEP_ICLOUD_DAYS="${KEEP_ICLOUD_DAYS-7}"
+  # ── The keep list ──────────────────────────────────────────────────────────
+  # CONFIRMED IN GOOGLE PHOTOS IS NOT THE SAME AS "SAFE TO LOSE FROM iCLOUD".
+  # An asset can be confirmed and still be one a human would be upset to find
+  # only in Google Photos: a favourite, something they filed into an album by
+  # hand, something an app saved into the library last week. The reclaim keeps
+  # every one of those, whatever the pending list says.
+  #
+  # ADDED, NOT TAKEN. The floor above (KEEP_ICLOUD_DAYS) is measured from the
+  # capture date, which says nothing about how long the asset has been in the
+  # library: a photo re-imported from Google Photos carries its original
+  # capture date and is older than any floor the moment it arrives. This one is
+  # measured from the CloudKit record's addedDate. 0 turns it off.
+  KEEP_ICLOUD_ADDED_DAYS="${KEEP_ICLOUD_ADDED_DAYS:-30}"
+  # Album names NOT to treat as a reason to keep, one per line or separated by
+  # commas. Empty by default: every album a human made keeps its members. The
+  # smart albums (Favorites, Live, Videos, Screenshots, Bursts, Panoramas,
+  # Slo-mo, Time-lapse, Hidden, Recently Deleted) are never in this rule at
+  # all -- membership of them is automatic and would keep the whole library.
+  KEEP_ICLOUD_ALBUMS_EXCLUDE="${KEEP_ICLOUD_ALBUMS_EXCLUDE-}"
+  # Keep anything another app saved into the photo library -- what Photos shows
+  # as "Recently Saved" (measured 2026-09-20: the album itself is not exposed
+  # over CloudKit, but the CPLMaster record behind every asset carries the
+  # importer, so the set is resolvable). On a library that receives a lot from
+  # Messages or WhatsApp this rule alone can keep most of it; 0 turns it off
+  # and leaves those assets to the other rules.
+  KEEP_ICLOUD_SAVED_FROM_APPS="${KEEP_ICLOUD_SAVED_FROM_APPS:-1}"
   PRUNE_DEVICE_AFTER_UPLOAD="${PRUNE_DEVICE_AFTER_UPLOAD:-1}"
   STOP_EMULATOR_WHEN_IDLE="${STOP_EMULATOR_WHEN_IDLE:-1}"
 
