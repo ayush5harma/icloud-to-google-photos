@@ -274,9 +274,13 @@ msg_reports() {
     log "Messages reports skipped: cannot create $dir"
     return 0
   fi
-  [ -r "$MSG_STATE" ] || return 0
-  msg_cleanup_report "$dir/messages-cleanup-report.md" \
-    || log "WARNING: could not write $dir/messages-cleanup-report.md"
+  # The cleanup list needs the Messages ledger; the duplicates report is about
+  # the Google Photos account and is worth writing on a tick that staged
+  # nothing at all.
+  if [ -r "$MSG_STATE" ]; then
+    msg_cleanup_report "$dir/messages-cleanup-report.md" \
+      || log "WARNING: could not write $dir/messages-cleanup-report.md"
+  fi
   gp_duplicates_report "$dir/gphotos-duplicates-report.md" \
     || log "WARNING: could not write $dir/gphotos-duplicates-report.md"
   return 0

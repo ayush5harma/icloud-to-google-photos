@@ -151,6 +151,15 @@ check "a key with one row is not a group" none grep -q 'uniqueCC' "$D"
 check "photos-shared.db is not read as a library" none grep -q 'skipped' <<<"$LOGGED"
 check "it says plainly that it deleted nothing" grep -q 'nothing here deletes anything' "$D"
 
+echo "a tick that staged nothing"
+LOGGED=""
+SAVED_MSG="$MSG_STATE"; MSG_STATE="$T/state/no-such-ledger.tsv"
+rm -f "$T/out/gphotos-duplicates-report.md"
+msg_reports
+check "the duplicates report is about the account, so it is written anyway" \
+  test -s "$T/out/gphotos-duplicates-report.md"
+MSG_STATE="$SAVED_MSG"
+
 echo "no Google Photos database"
 LOGGED=""; GP_STORE_DIR="$T/empty-store"; mkdir -p "$GP_STORE_DIR"
 gp_duplicates_report "$T/out/none.md"
