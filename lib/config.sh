@@ -38,7 +38,7 @@ AP_LABEL_PREFIX="com.ayushsharma.icloud-to-google-photos"
 # it is the list the README documents.
 AP_KEYS="ICLOUD_USERNAME ICLOUDPD STAGING ICLOUD_DIR SHARED_CACHE_DIR
          GOOGLE_ACCOUNT PHOTOS_BACKEND GPHOTOS_APP
-         GPHOTOS_IPA_URL GPHOTOS_IPA_SHA256 IPA_INSTALL MAC_INBOX_MAX AVD_NAME AVD_SDK_ROOT AVD_ABI AVD_TAG AVD_DEVICE
+         GPHOTOS_IPA_URL GPHOTOS_IPA_SHA256 IPA_INSTALL MAC_INBOX_MAX MAC_HYDRATE_TIMEOUT MAC_HYDRATE_BUDGET AVD_NAME AVD_SDK_ROOT AVD_ABI AVD_TAG AVD_DEVICE
          AVD_RES AVD_DPI AVD_RAM AVD_CORES AVD_DISK AVD_HEAP AVD_GPU AVD_SPOOF
          RECENT UNTIL_FOUND PUSH_CAP UPLOAD_WAIT ADB_TIMEOUT RECLAIM_TIMEOUT
          PRESENCE_CHECK PRESENCE_BUDGET
@@ -104,6 +104,16 @@ ap_defaults() {
   # into the app's container while it uploads, so a backlog costs its size
   # twice over; a few hundred photos is a few GB.
   MAC_INBOX_MAX="${MAC_INBOX_MAX:-300}"
+  # AN ONLINE-ONLY STAGED FILE IS FETCHED BEFORE IT IS HANDED OVER, by a read
+  # bounded on wall clock (lib/fs.sh hydrate_bounded): on Drive's stream mode
+  # every staged file becomes such a stub once Drive has uploaded it, and
+  # skipping them handed nothing over at all (2026-09-26). Seconds per file,
+  # then seconds per run for all of them, so a provider that serves nothing
+  # costs one budget and not the run. The budget covers a full cap: 300 files
+  # at the 1.97 s one 68 KB stub took. MAC_HYDRATE_TIMEOUT=0 skips every stub
+  # unread, as before.
+  MAC_HYDRATE_TIMEOUT="${MAC_HYDRATE_TIMEOUT:-120}"
+  MAC_HYDRATE_BUDGET="${MAC_HYDRATE_BUDGET:-600}"
 
   # ── The emulator ───────────────────────────────────────────────────────────
   AVD_NAME="${AVD_NAME:-gphotos-tablet}"
@@ -350,6 +360,11 @@ ICLOUD_USERNAME=
 # Files waiting in the upload folder at once. The engine keeps its own copy of
 # each file while it uploads, so a backlog costs its size twice over.
 #MAC_INBOX_MAX=300
+# An online-only staged file (a cloud folder evicted its bytes) is fetched by a
+# bounded read before it is handed over: seconds per file, then seconds per run
+# for all of them. 0 as the per-file bound skips every such file unread.
+#MAC_HYDRATE_TIMEOUT=120
+#MAC_HYDRATE_BUDGET=600
 # Ask Google Photos' own database whether it already holds a file before
 # uploading it. A library the phone backed up years ago is already there, and
 # this backend cannot tell on its own: its confirmation is the reply to its own
