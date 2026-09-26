@@ -27,6 +27,7 @@ struct Stats {
     var reclaimed = 0        // deleted from iCloud after Google Photos confirmed them
     var reclaimPending = 0   // confirmed, not yet deleted from iCloud
     var phase = ""           // that run's current step, or "failed: <why>" from the last one
+    var messages: MessagesSource?   // the Messages attachments source, nil from an older collector
 
     // "Caught up" requires the sync job's confirmation stamp, not arithmetic:
     // the ledger can be full and upload-status left over from an older run while
