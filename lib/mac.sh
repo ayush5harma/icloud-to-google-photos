@@ -495,6 +495,10 @@ mac_handoff() {  # [file of new staged paths]
   case "${MAC_HYDRATE_BUDGET:-}" in ''|*[!0-9]*) MAC_HYDRATE_BUDGET=600 ;; *) MAC_HYDRATE_BUDGET=$((10#$MAC_HYDRATE_BUDGET)) ;; esac
   hyd_end=$((SECONDS + MAC_HYDRATE_BUDGET))
   batch="$(mktemp)"
+  # One file for every read's stderr this handoff, rather than a mktemp per
+  # stub read. Without it a refusal cannot be told from any other failure,
+  # which is how 2,667 refusals spent a whole budget, so its absence is said.
+  HYDRATE_ERRF="$(mktemp)" || { HYDRATE_ERRF=""; log "  WARNING: no temporary file for read errors; a refused read will not be recognised this run"; }
   rm -f "$MAC_INBOX"/.incoming-* 2>/dev/null
   if [ $# -ge 1 ] && [ -n "$1" ]; then
     newf="$1"
@@ -550,17 +554,16 @@ mac_handoff() {  # [file of new staged paths]
         124) hyd_tried=1; hyd_slow=$((hyd_slow + 1)); evicted=$((evicted + 1))
              log "  still online-only after ${hyd_secs}s of reading, left for the next run: $rel"; continue ;;
         2)   hyd_tried=1; hyd_err=$((hyd_err + 1)); evicted=$((evicted + 1))
-             # EPERM is TCC, which a Full Disk Access grant to the app this
-             # sync runs under fixes; EACCES is file modes, which it does not.
-             # Both refuse every file alike, so both stop the reading.
+             # EPERM is TCC refusing the PROCESS, fixed by a Full Disk Access
+             # grant to the app this sync runs under, and it refuses every
+             # file alike -- so it stops the reading. EACCES ("Permission
+             # denied") is ONE file's modes and stays per file: run-wide, a
+             # single unreadable file first in the list would block every
+             # read on every run.
              case "$HYDRATE_ERR" in
                *"Operation not permitted"*)
                  hyd_refused="$HYDRATE_ERR"
                  log "  online-only files cannot be read: $HYDRATE_ERR -- Full Disk Access is needed by whatever runs this sync (Photo Sync.app); the rest are not read this run (first: $rel)"
-                 continue ;;
-               *"Permission denied"*)
-                 hyd_refused="$HYDRATE_ERR"
-                 log "  online-only files cannot be read: $HYDRATE_ERR -- the file modes refuse this user; the rest are not read this run (first: $rel)"
                  continue ;;
              esac
              [ "$hyd_err" -eq 1 ] && log "  an online-only file could not be read (the first of this run): $rel"; continue ;;
@@ -599,7 +602,7 @@ mac_handoff() {  # [file of new staged paths]
   fi
   [ "$total_new" -gt "$MAC_HANDED" ] && log "$((total_new - MAC_HANDED)) left for the next run"
   [ "$own" -eq 1 ] && rm -f "$newf"
-  rm -f "$batch"
+  rm -f "$batch"; [ -n "$HYDRATE_ERRF" ] && rm -f "$HYDRATE_ERRF"; HYDRATE_ERRF=""
 }
 
 # Wait for Google's answers to the handoffs in flight, bounded by UPLOAD_WAIT

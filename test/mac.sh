@@ -234,8 +234,16 @@ LOGGED=""; MAC_HANDED=0
 printf 'hyd/U.JPG\n' > "$T/hyd.list"; mac_handoff "$T/hyd.list"
 check "a read that fails is counted apart from a stub that stays one" grep -q '0 still online-only after a full read, 1 unreadable' <<<"$LOGGED"
 chmod 600 "$STAGING/hyd/U.JPG"
-check "a file-mode refusal is recorded with macOS's words" \
-  test "$(cut -f2,3 "$MAC_ACCESS")" = "denied$(printf '\t')Permission denied"
+# EACCES is ONE file's modes, not the process: treated as run-wide, a single
+# chmod-000 file first in the list would block every read on every run, and
+# the menu would say "cannot read cloud files" for ever.
+check "a file-mode refusal is that file's, not the run's" test "$(cut -f2 "$MAC_ACCESS")" = ok
+printf 'x' > "$STAGING/hyd/U2.JPG"; chmod 000 "$STAGING/hyd/U2.JPG"; printf '%s\n' "$STAGING/hyd/U2.JPG" >> "$DATALESS"
+serves hyd/V.JPG
+LOGGED=""; MAC_HANDED=0
+printf 'hyd/U2.JPG\nhyd/V.JPG\n' > "$T/hyd.list"; mac_handoff "$T/hyd.list"
+check "so the files after it are still read and handed over" test "$(row hyd/V.JPG 3)" = queued
+chmod 600 "$STAGING/hyd/U2.JPG"
 
 echo "online-only files this process may not read"
 # Measured 2026-09-26 on Caraxes: the launchd-run sync (Photo Sync.app --sync,
