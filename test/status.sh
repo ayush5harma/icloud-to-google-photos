@@ -86,9 +86,15 @@ echo "reading the staging tree"
 rm -f "$T/state/staging-access"; run
 check "no handoff has read a stub yet: unknown" \
   test "$(get backup.staging_access)/$(get backup.staging_reason)" = "unknown/"
-printf '%s%sdenied%sOperation not permitted\n' "$(date +%s)" "$tab" "$tab" > "$T/state/staging-access"; run
+check "and no age" test "$(get backup.staging_age)" = -1
+printf '%s%sdenied%sOperation not permitted\n' "$(( $(date +%s) - 300 ))" "$tab" "$tab" > "$T/state/staging-access"; run
 check "a refused read: denied, with macOS's words" \
   test "$(get backup.staging_access)/$(get backup.staging_reason)" = "denied/Operation not permitted"
+sage="$(get backup.staging_age)"
+check "and its age, so a line nothing rewrote can look old" test "${sage:-0}" -ge 300 -a "${sage:-0}" -lt 360
+printf '%s%sdenied%sbad "quote" and \\ slash\n' "$(date +%s)" "$tab" "$tab" > "$T/state/staging-access"; run
+check "a reason JSON would choke on is cleaned and still parses" \
+  test "$(get backup.staging_reason)" = "bad quote and  slash" && parses
 printf '%s%sok%s\n' "$(date +%s)" "$tab" "$tab" > "$T/state/staging-access"; run
 check "an allowed one: ok" test "$(get backup.staging_access)" = ok
 printf 'nonsense\n' > "$T/state/staging-access"; run

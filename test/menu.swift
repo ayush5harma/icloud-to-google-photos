@@ -162,6 +162,10 @@ var denied2 = Stats(); denied2.stagingAccess = "denied"; denied2.stagingReason =
 check("a refused staging read has its own row on the Mac backend",
       value(ledgerRows(denied2, backend: .mac, haveStats: true), "Staging")
           == "cannot read cloud files: needs Full Disk Access")
+var agedDenial = denied2; agedDenial.stagingAge = 7200
+check("with the age of the run that was refused",
+      value(ledgerRows(agedDenial, backend: .mac, haveStats: true), "Staging")
+          == "cannot read cloud files: needs Full Disk Access · 2.0h ago")
 check("and offers the same Grant Full Disk Access action", offerFullDiskAccess(denied2))
 var modes = denied2; modes.stagingReason = "Permission denied"
 check("a file-mode refusal names itself and offers no grant",

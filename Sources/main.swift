@@ -372,6 +372,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         s.phase = b["phase"] as? String ?? ""
         s.stagingAccess = b["staging_access"] as? String ?? "unknown"
         s.stagingReason = b["staging_reason"] as? String ?? ""
+        s.stagingAge = b["staging_age"] as? Int ?? -1
         s.messages = messagesSource(root["messages"])
         return s
     }

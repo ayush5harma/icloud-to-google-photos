@@ -31,6 +31,9 @@ struct Stats {
     // Whether the last handoff that read an online-only staged file was let
     // read it: "ok", "denied" (with macOS's errno text), or "unknown".
     var stagingAccess = "unknown", stagingReason = ""
+    // Seconds since that handoff. The line is rewritten only by a run that
+    // reads a stub, so a refusal nothing has retried must look its age.
+    var stagingAge = -1
     // EPERM is TCC, fixed by granting this app Full Disk Access (the sync runs
     // as its child); EACCES is file modes, which that grant does not change.
     var stagingNeedsFullDiskAccess: Bool {
@@ -152,7 +155,8 @@ func ledgerRows(_ s: Stats, backend: Backend, haveStats: Bool) -> [(String, Stri
         if s.stagingAccess == "denied" {
             rows.append(("Staging", "cannot read cloud files: "
                 + (s.stagingNeedsFullDiskAccess ? "needs Full Disk Access"
-                   : (s.stagingReason.isEmpty ? "see sync.log" : s.stagingReason))))
+                   : (s.stagingReason.isEmpty ? "see sync.log" : s.stagingReason))
+                + (s.stagingAge >= 0 ? " · " + relAge(s.stagingAge) : "")))
         }
     case .avd:
         if s.emulator || s.onDevice > 0 {
