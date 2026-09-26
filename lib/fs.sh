@@ -41,3 +41,46 @@ has_local_bytes() {
     "$(/usr/bin/stat -f %z "$f" 2>/dev/null || echo 0)" \
     "$(/usr/bin/stat -f %b "$f" 2>/dev/null || echo 0)"
 }
+
+# is_dataless <path>: the flag alone, metadata only. The handoff's question is
+# narrower than has_local_bytes's: not "are the bytes here" but "would reading
+# this fault them in from the provider".
+is_dataless() {
+  case "$(/usr/bin/stat -f %Sf "$1" 2>/dev/null)" in *dataless*) return 0 ;; esac
+  return 1
+}
+
+# hydrate_bounded <path> <secs>: THE ONE SANCTIONED READ OF A STUB. Reads the
+# file whole to /dev/null so the provider materialises it, bounded on wall
+# clock, then asks the flag again. A stub is not always stuck: on Drive's stream
+# mode every staged file becomes one once Drive has uploaded it (measured
+# 2026-09-26: all 4,371 staged files dataless; a 68 KB one came back in 1.97 s
+# under a bounded read with its flag cleared, and a full cat after that took
+# 5 ms). Skipping them all on the metadata check alone handed nothing to Google
+# Photos for hours.
+#   0    the read finished and the file is no longer dataless
+#   1    the read failed, or finished and the file is still a stub
+#   124  the read was still going at <secs> and was killed
+# Polls every 0.1 s, because most reads take a second or two. After the kill it
+# waits at most a second for the reader to go: a read blocked in the kernel may
+# not die on SIGKILL, and a plain `wait` would then hang exactly the way the
+# bound exists to prevent. That reap sits in a stderr-silenced group, or bash
+# prints its "Killed: 9" job notice at the next command.
+hydrate_bounded() {
+  local f="$1" secs="$2" pid rc n=0
+  case "$secs" in ''|*[!0-9]*) secs=0 ;; esac
+  /bin/cat -- "$f" >/dev/null 2>&1 </dev/null & pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$n" -ge $((secs * 10)) ]; then
+      kill -9 "$pid" 2>/dev/null
+      { n=0; while kill -0 "$pid" && [ "$n" -lt 10 ]; do sleep 0.1; n=$((n + 1)); done
+        kill -0 "$pid" || wait "$pid"; } 2>/dev/null
+      return 124
+    fi
+    sleep 0.1; n=$((n + 1))
+  done
+  wait "$pid"; rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  is_dataless "$f" && return 1
+  return 0
+}

@@ -480,6 +480,12 @@ mac_list_new() {
 # from anywhere else is still complete.
 mac_handoff() {  # [file of new staged paths]
   local newf batch rel name src_sz dst_sz room cap target evicted=0 empty=0 short=0 total_new clash own=0
+  local hyd_end hyd_secs hydrated=0 hyd_slow=0 hyd_stub=0 hyd_untried=0
+  # A config file is a human's file (see mac_presence_pass): a bound that is not
+  # a number falls back to the default rather than aborting the run under set -u.
+  case "${MAC_HYDRATE_TIMEOUT:-}" in ''|*[!0-9]*) MAC_HYDRATE_TIMEOUT=120 ;; esac
+  case "${MAC_HYDRATE_BUDGET:-}" in ''|*[!0-9]*) MAC_HYDRATE_BUDGET=600 ;; esac
+  hyd_end=$((SECONDS + MAC_HYDRATE_BUDGET))
   batch="$(mktemp)"
   rm -f "$MAC_INBOX"/.incoming-* 2>/dev/null
   if [ $# -ge 1 ] && [ -n "$1" ]; then
@@ -497,22 +503,40 @@ mac_handoff() {  # [file of new staged paths]
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
     [ "$(count_lines "$batch")" -ge "$cap" ] && break
-    # An online-only stub can block forever when read: metadata only, skip it.
-    if /usr/bin/stat -f %Sf "$STAGING/$rel" 2>/dev/null | grep -q dataless; then evicted=$((evicted + 1)); continue; fi
-    src_sz="$(/usr/bin/stat -f %z "$STAGING/$rel" 2>/dev/null || echo 0)"
-    if [ "${src_sz:-0}" -eq 0 ]; then
-      empty=$((empty + 1)); log "  empty staged file skipped (delete it to let icloudpd fetch it again): $rel"; continue
-    fi
     # The flat name must map back to ONE staged path while it is in flight:
     # "a/b_c" and "a_b/c" both flatten to "a_b_c", and the second would be
     # confirmed and deleted from iCloud on the strength of the first's upload.
     # The second waits while the first is queued (or in this batch); once the
-    # first is no longer queued the name is free again.
+    # first is no longer queued the name is free again. Asked before the
+    # hydration below, so a file that waits anyway is not fetched for nothing.
     name="${rel//\//_}"
     clash="$(mac_state_rel_of_name "$name")"
     [ -z "$clash" ] && clash="$(awk -F'\t' -v n="$name" '$1 == n { print $2; exit }' "$batch")"
     if [ -n "$clash" ] && [ "$clash" != "$rel" ]; then
       log "  name clash with a file still uploading, waits for the next run: $rel"; continue
+    fi
+    # An online-only stub is fetched before it is copied, because cp would read
+    # it with no bound at all (lib/fs.sh). Only candidates that get this far are
+    # fetched, so a run reads at most its cap's worth, and every read is bounded
+    # twice: per file, and by what is left of the run's budget, so a Drive that
+    # serves nothing costs one budget per run and not the run.
+    if is_dataless "$STAGING/$rel"; then
+      hyd_secs=$((hyd_end - SECONDS))
+      [ "$hyd_secs" -gt "$MAC_HYDRATE_TIMEOUT" ] && hyd_secs="$MAC_HYDRATE_TIMEOUT"
+      if [ "$hyd_secs" -le 0 ]; then
+        hyd_untried=$((hyd_untried + 1)); evicted=$((evicted + 1)); continue
+      fi
+      [ "$hydrated" -eq 0 ] && phase "fetching online-only staged files from the cloud"
+      hydrate_bounded "$STAGING/$rel" "$hyd_secs"
+      case $? in
+        0)   hydrated=$((hydrated + 1)) ;;
+        124) hyd_slow=$((hyd_slow + 1)); evicted=$((evicted + 1)); continue ;;
+        *)   hyd_stub=$((hyd_stub + 1)); evicted=$((evicted + 1)); continue ;;
+      esac
+    fi
+    src_sz="$(/usr/bin/stat -f %z "$STAGING/$rel" 2>/dev/null || echo 0)"
+    if [ "${src_sz:-0}" -eq 0 ]; then
+      empty=$((empty + 1)); log "  empty staged file skipped (delete it to let icloudpd fetch it again): $rel"; continue
     fi
     if /bin/cp -p "$STAGING/$rel" "$MAC_INBOX/.incoming-$name" 2>/dev/null \
        && dst_sz="$(/usr/bin/stat -f %z "$MAC_INBOX/.incoming-$name" 2>/dev/null)" && [ "$dst_sz" = "$src_sz" ]; then
@@ -530,7 +554,9 @@ mac_handoff() {  # [file of new staged paths]
       MAC_HANDED=$((MAC_HANDED + 1))
     fi
   done < "$batch"
-  log "staged $MAC_STAGED media file(s); new since last run: $total_new; handed to Google Photos $MAC_HANDED (cap $cap), short $short, evicted-skipped $evicted, empty-skipped $empty; given up after $MAC_RETRIES failures so far: $(mac_given_up | mac_count)"
+  log "staged $MAC_STAGED media file(s); new since last run: $total_new; handed to Google Photos $MAC_HANDED (cap $cap), short $short, hydrated $hydrated, evicted-skipped $evicted, empty-skipped $empty; given up after $MAC_RETRIES failures so far: $(mac_given_up | mac_count)"
+  [ "$evicted" -gt 0 ] \
+    && log "  online-only files not handed over: $hyd_slow still blocked after the ${MAC_HYDRATE_TIMEOUT}s per-file bound, $hyd_stub still online-only after a full read, $hyd_untried not tried (the ${MAC_HYDRATE_BUDGET}s hydration budget was spent, or MAC_HYDRATE_TIMEOUT is 0)"
   [ "$total_new" -gt "$MAC_HANDED" ] && log "$((total_new - MAC_HANDED)) left for the next run"
   [ "$own" -eq 1 ] && rm -f "$newf"
   rm -f "$batch"
