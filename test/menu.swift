@@ -96,6 +96,7 @@ func iso(_ secondsAgo: Int) -> String {
     return f.string(from: now.addingTimeInterval(TimeInterval(-secondsAgo)))
 }
 func backup(_ json: String) -> MessagesBackup? { messagesBackup(Data(json.utf8)) }
+func offer(_ m: MessagesSource?) -> Bool { var x = Stats(); x.messages = m; return offerFullDiskAccess(x) }
 
 let fda = messagesSource(["state": "skipped", "reason": "Operation not permitted", "count": 0, "age": 30])
 check("the measured 2026-09-26 skip reads as needing Full Disk Access",
@@ -103,18 +104,18 @@ check("the measured 2026-09-26 skip reads as needing Full Disk Access",
 check("and its row says so, not macOS's words",
       value(messagesRows(source: fda, backup: nil, now: now), "Attachments") == "skipped: needs Full Disk Access · 30s ago")
 check("the Grant Full Disk Access action is offered for it",
-      offerFullDiskAccess(fda))
+      offer(fda))
 let denied = messagesSource(["state": "skipped", "reason": "Permission denied", "count": 4])
 check("another skip keeps its own reason and offers no Full Disk Access",
       value(messagesRows(source: denied, backup: nil, now: now), "Attachments") == "skipped: Permission denied"
-      && !offerFullDiskAccess(denied))
+      && !offer(denied))
 check("a skip with no reason still says it was skipped",
       value(messagesRows(source: messagesSource(["state": "skipped"]), backup: nil, now: now), "Attachments")
           == "skipped: see sync.log")
 let okSource = messagesSource(["state": "ok", "reason": "", "count": 1161, "age": 60])
 check("a scan that ran shows how many attachments are dealt with",
       value(messagesRows(source: okSource, backup: nil, now: now), "Attachments") == "1161 synced · 1m ago"
-      && !offerFullDiskAccess(okSource))
+      && !offer(okSource))
 check("the source off says off",
       value(messagesRows(source: messagesSource(["state": "off", "count": 0, "age": -1]), backup: nil, now: now),
             "Attachments") == "off")
@@ -149,9 +150,30 @@ check("an offset, fractional seconds and a missing time all read",
 check("a failure with no reason is still a failure",
       value(messagesRows(source: nil, backup: backup(#"{"ok":false}"#), now: now), "Backup") == "failed")
 check("the backup's own Full Disk Access trouble offers nothing: this app is not what runs it",
-      !offerFullDiskAccess(nil))
+      !offer(nil))
 check("the backup path is under the owner's ~/.local/state/system-config",
       messagesBackupPath(home: "/Users/u") == "/Users/u/.local/state/system-config/messages-backup.json")
+
+// ── Reading the staging tree ────────────────────────────────────────────────
+// 2026-09-26: the launchd-run sync had every read of the Drive staging tree
+// refused (no Full Disk Access) and handed nothing over, with nothing in the
+// menu to say why.
+var denied2 = Stats(); denied2.stagingAccess = "denied"; denied2.stagingReason = "Operation not permitted"
+check("a refused staging read has its own row on the Mac backend",
+      value(ledgerRows(denied2, backend: .mac, haveStats: true), "Staging")
+          == "cannot read cloud files: needs Full Disk Access")
+check("and offers the same Grant Full Disk Access action", offerFullDiskAccess(denied2))
+var modes = denied2; modes.stagingReason = "Permission denied"
+check("a file-mode refusal names itself and offers no grant",
+      value(ledgerRows(modes, backend: .mac, haveStats: true), "Staging") == "cannot read cloud files: Permission denied"
+      && !offerFullDiskAccess(modes))
+var allowed = denied2; allowed.stagingAccess = "ok"
+check("reads allowed, or never tried: no Staging row",
+      value(ledgerRows(allowed, backend: .mac, haveStats: true), "Staging") == nil
+      && value(ledgerRows(Stats(), backend: .mac, haveStats: true), "Staging") == nil
+      && !offerFullDiskAccess(allowed))
+check("the emulator backend never reads stubs, so never shows the row",
+      value(ledgerRows(denied2, backend: .avd, haveStats: true), "Staging") == nil)
 
 let msgRows = messagesRows(source: fda, backup: bad, now: now)
 check("the section is Attachments then Backup", labels(msgRows) == ["Attachments", "Backup"])

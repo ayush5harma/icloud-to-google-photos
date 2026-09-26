@@ -28,6 +28,14 @@ struct Stats {
     var reclaimPending = 0   // confirmed, not yet deleted from iCloud
     var phase = ""           // that run's current step, or "failed: <why>" from the last one
     var messages: MessagesSource?   // the Messages attachments source, nil from an older collector
+    // Whether the last handoff that read an online-only staged file was let
+    // read it: "ok", "denied" (with macOS's errno text), or "unknown".
+    var stagingAccess = "unknown", stagingReason = ""
+    // EPERM is TCC, fixed by granting this app Full Disk Access (the sync runs
+    // as its child); EACCES is file modes, which that grant does not change.
+    var stagingNeedsFullDiskAccess: Bool {
+        stagingAccess == "denied" && stagingReason.range(of: "Operation not permitted", options: .caseInsensitive) != nil
+    }
 
     // "Caught up" requires the sync job's confirmation stamp, not arithmetic:
     // the ledger can be full and upload-status left over from an older run while
@@ -139,6 +147,13 @@ func ledgerRows(_ s: Stats, backend: Backend, haveStats: Bool) -> [(String, Stri
         // until a human asks for them back, and a count nobody can act on is
         // worse than no row.
         if s.givenUp > 0 { rows.append(("Given up", "\(s.givenUp) — avd-photos-sync --retry-given-up")) }
+        // Only the Mac backend reads online-only stubs (mac_handoff), and a
+        // refusal there hands nothing over while every count looks ordinary.
+        if s.stagingAccess == "denied" {
+            rows.append(("Staging", "cannot read cloud files: "
+                + (s.stagingNeedsFullDiskAccess ? "needs Full Disk Access"
+                   : (s.stagingReason.isEmpty ? "see sync.log" : s.stagingReason))))
+        }
     case .avd:
         if s.emulator || s.onDevice > 0 {
             rows.append(("On device", "\(s.onDevice)\(s.queued > 0 ? " (\(s.queued) queued)" : "")"))
@@ -223,10 +238,13 @@ func messagesSource(_ obj: Any?) -> MessagesSource? {
         age: m["age"] as? Int ?? -1)
 }
 
-// Offered only for the pipeline's own source: the sync runs as this app's
-// child, so this app is what needs the grant. The system-config backup runs
-// from a switch, whose grant is not this app's to give.
-func offerFullDiskAccess(_ source: MessagesSource?) -> Bool { source?.needsFullDiskAccess == true }
+// The one "Grant Full Disk Access…" action, for either refusal the sync meets
+// as this app's child: the Messages attachments scan and the staging reads.
+// Never for the system-config backup, which runs from a switch, whose grant is
+// not this app's to give.
+func offerFullDiskAccess(_ s: Stats) -> Bool {
+    s.messages?.needsFullDiskAccess == true || s.stagingNeedsFullDiskAccess
+}
 
 // {"ok":bool,"at":"<ISO 8601>","reason":"...","items":N,"dest":"<path>"},
 // replaced atomically by system-config. Only ok, at and reason are shown.

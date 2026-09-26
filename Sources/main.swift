@@ -370,6 +370,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         s.reclaimed = b["reclaimed"] as? Int ?? 0
         s.reclaimPending = b["reclaim_pending"] as? Int ?? 0
         s.phase = b["phase"] as? String ?? ""
+        s.stagingAccess = b["staging_access"] as? String ?? "unknown"
+        s.stagingReason = b["staging_reason"] as? String ?? ""
         s.messages = messagesSource(root["messages"])
         return s
     }
@@ -574,9 +576,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             m.addItem(.separator())
             header(m, "Messages")
             for (label, value) in messageRows { mono(m, label, value) }
-            if offerFullDiskAccess(source) {
-                action(m, "Grant Full Disk Access…", #selector(grantFullDiskAccess))
-            }
+        }
+        // One action for either refusal (the Staging row above, or Messages).
+        if haveStats && offerFullDiskAccess(stats) {
+            action(m, "Grant Full Disk Access…", #selector(grantFullDiskAccess))
         }
 
         m.addItem(.separator())
