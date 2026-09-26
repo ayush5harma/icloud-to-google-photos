@@ -182,3 +182,105 @@ func uploaderLauncher(_ backend: Backend, appPath: String) -> (title: String, pa
     case .avd: return ("Open Google Photos (AVD)", avdLauncherPath)
     }
 }
+
+// MARK: - Messages
+
+// Messages has two backups of its own, and the menu shows them apart from the
+// photo sync because neither says anything about it: a Messages scan that
+// could not look is not a photo that failed to upload.
+//
+// 1. The pipeline's own source (lib/messages.sh): images and videos from
+//    Messages attachments staged into the photo sync. The collector reports it
+//    as its "messages" object, from the line every scan leaves.
+// 2. system-config's Messages backup, a copy of Messages to Drive made at
+//    every switch. It writes one JSON file; this app only reads it.
+struct MessagesSource: Equatable {
+    enum State: String { case ok, skipped, off, unknown }
+    var state: State
+    var reason = ""
+    var count = 0     // attachments dealt with so far: staged, or already in Google Photos
+    var age = -1      // seconds since that scan, -1 when there has been none
+
+    // TCC refusing a process Full Disk Access reaches the shell as EPERM,
+    // "Operation not permitted" -- the reason every run logged on 2026-09-26.
+    // A plain "Permission denied" (EACCES) is file modes, which Full Disk
+    // Access does not change, so it is not offered the grant.
+    var needsFullDiskAccess: Bool {
+        state == .skipped && reason.range(of: "Operation not permitted", options: .caseInsensitive) != nil
+    }
+}
+
+// The collector's "messages" object. nil when there is none -- a collector
+// older than this app -- so the row is hidden rather than guessed; a state this
+// app does not know is .unknown, which the row says, rather than dropped.
+func messagesSource(_ obj: Any?) -> MessagesSource? {
+    guard let m = obj as? [String: Any] else { return nil }
+    return MessagesSource(
+        state: (m["state"] as? String).flatMap(MessagesSource.State.init(rawValue:)) ?? .unknown,
+        reason: m["reason"] as? String ?? "",
+        count: m["count"] as? Int ?? 0,
+        age: m["age"] as? Int ?? -1)
+}
+
+// Offered only for the pipeline's own source: the sync runs as this app's
+// child, so this app is what needs the grant. The system-config backup runs
+// from a switch, whose grant is not this app's to give.
+func offerFullDiskAccess(_ source: MessagesSource?) -> Bool { source?.needsFullDiskAccess == true }
+
+// {"ok":bool,"at":"<ISO 8601>","reason":"...","items":N,"dest":"<path>"},
+// replaced atomically by system-config. Only ok, at and reason are shown.
+enum MessagesBackup: Equatable {
+    case ok(at: Date?)
+    case failed(reason: String, at: Date?)
+    case unreadable
+}
+
+func messagesBackupPath(home: String) -> String { home + "/.local/state/system-config/messages-backup.json" }
+
+// nil data is a file that does not exist: that host does not run the backup,
+// so the row is hidden. A file that exists but is not an object with a boolean
+// "ok" is .unreadable -- a backup of unknown outcome must not read as fine. An
+// "at" that does not parse only loses the age.
+func messagesBackup(_ data: Data?) -> MessagesBackup? {
+    guard let data else { return nil }
+    guard let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+          let ok = o["ok"] as? Bool else { return .unreadable }
+    let at = (o["at"] as? String).flatMap(isoDate)
+    return ok ? .ok(at: at) : .failed(reason: o["reason"] as? String ?? "", at: at)
+}
+
+func isoDate(_ s: String) -> Date? {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime]
+    if let d = f.date(from: s) { return d }
+    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return f.date(from: s)
+}
+
+// The Messages section, in menu order; empty when there is nothing to say.
+// Drawn with ledgerLine like the ledger, so the values share its column.
+func messagesRows(source: MessagesSource?, backup: MessagesBackup?, now: Date) -> [(String, String)] {
+    var rows: [(String, String)] = []
+    if let m = source {
+        let v: String
+        switch m.state {
+        case .ok: v = "\(m.count) synced"
+        case .skipped where m.needsFullDiskAccess: v = "skipped: needs Full Disk Access"
+        case .skipped: v = "skipped: \(m.reason.isEmpty ? "see sync.log" : m.reason)"
+        case .off: v = "off"
+        case .unknown: v = "not scanned yet"
+        }
+        rows.append(("Attachments", v))
+    }
+    if let b = backup {
+        func age(_ at: Date?) -> String { at.map { " · " + relAge(max(0, Int(now.timeIntervalSince($0)))) } ?? "" }
+        let v: String
+        switch b {
+        case .ok(let at): v = "ok" + age(at)
+        case .failed(let reason, let at): v = (reason.isEmpty ? "failed" : "failed: \(reason)") + age(at)
+        case .unreadable: v = "unreadable"
+        }
+        rows.append(("Backup", v))
+    }
+    return rows
+}
