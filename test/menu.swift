@@ -101,7 +101,7 @@ let fda = messagesSource(["state": "skipped", "reason": "Operation not permitted
 check("the measured 2026-09-26 skip reads as needing Full Disk Access",
       fda?.state == .skipped && fda?.needsFullDiskAccess == true)
 check("and its row says so, not macOS's words",
-      value(messagesRows(source: fda, backup: nil, now: now), "Attachments") == "skipped: needs Full Disk Access")
+      value(messagesRows(source: fda, backup: nil, now: now), "Attachments") == "skipped: needs Full Disk Access · 30s ago")
 check("the Grant Full Disk Access action is offered for it",
       offerFullDiskAccess(fda))
 let denied = messagesSource(["state": "skipped", "reason": "Permission denied", "count": 4])
@@ -113,14 +113,14 @@ check("a skip with no reason still says it was skipped",
           == "skipped: see sync.log")
 let okSource = messagesSource(["state": "ok", "reason": "", "count": 1161, "age": 60])
 check("a scan that ran shows how many attachments are dealt with",
-      value(messagesRows(source: okSource, backup: nil, now: now), "Attachments") == "1161 synced"
+      value(messagesRows(source: okSource, backup: nil, now: now), "Attachments") == "1161 synced · 1m ago"
       && !offerFullDiskAccess(okSource))
 check("the source off says off",
       value(messagesRows(source: messagesSource(["state": "off", "count": 0, "age": -1]), backup: nil, now: now),
             "Attachments") == "off")
 check("an enabled source that has not scanned is not called ok",
       value(messagesRows(source: messagesSource(["state": "unknown"]), backup: nil, now: now), "Attachments")
-          == "not scanned yet")
+          == "no scan reported yet")
 check("a state this app does not know is unknown, not dropped",
       messagesSource(["state": "exploded"])?.state == .unknown)
 check("a collector without a messages object shows no Attachments row",

@@ -263,13 +263,19 @@ func isoDate(_ s: String) -> Date? {
 func messagesRows(source: MessagesSource?, backup: MessagesBackup?, now: Date) -> [(String, String)] {
     var rows: [(String, String)] = []
     if let m = source {
+        // The scan's age is part of the value: a run that fails before the
+        // scan (icloudpd, say) or dies in it leaves the last line standing,
+        // and "1161 synced" from days ago must look days old.
+        let ago = m.age >= 0 ? " · " + relAge(m.age) : ""
         let v: String
         switch m.state {
-        case .ok: v = "\(m.count) synced"
-        case .skipped where m.needsFullDiskAccess: v = "skipped: needs Full Disk Access"
-        case .skipped: v = "skipped: \(m.reason.isEmpty ? "see sync.log" : m.reason)"
+        case .ok: v = "\(m.count) synced" + ago
+        case .skipped where m.needsFullDiskAccess: v = "skipped: needs Full Disk Access" + ago
+        case .skipped: v = "skipped: \(m.reason.isEmpty ? "see sync.log" : m.reason)" + ago
         case .off: v = "off"
-        case .unknown: v = "not scanned yet"
+        // Never scanned, an unreadable status line, or a state this app does
+        // not know: in each, no scan has told this menu anything it can use.
+        case .unknown: v = "no scan reported yet"
         }
         rows.append(("Attachments", v))
     }
