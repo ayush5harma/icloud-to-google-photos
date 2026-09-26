@@ -189,5 +189,31 @@ if [ "$running" = true ]; then
   esac
 fi
 
-printf '{"backup":{"armed":%s,"backend":"%s","app":%s,"app_online":%s,"signed_in":%s,"app_path":"%s","emulator":%s,"staged":%s,"remaining":%s,"on_device":%s,"given_up":%s,"uploaded":%s,"queued":%s,"failed":%s,"upload_age":%s,"confirmed":%s,"confirmed_age":%s,"last_run_age":%s,"running":%s,"phase":"%s","reclaimed":%s,"reclaim_pending":%s,"present":%s,"kept":%s},"ts":%s}\n' \
-  "$armed" "$PHOTOS_BACKEND" "$app" "$app_online" "$signed_in" "$app_path" "$emu" "${staged:-0}" "${remaining:-0}" "${ondev:-0}" "${given_up:-0}" "${uploaded:-0}" "${queued:-0}" "${failed:-0}" "${upl_age:--1}" "$confirmed" "$confirmed_age" "$last_run_age" "$running" "$phase" "$reclaimed" "$reclaim_pending" "$present" "$kept" "$(date +%s)"
+# THE MESSAGES SOURCE, reported on its own because the menu shows it on its own
+# rows: a skipped Messages scan says nothing about the photo sync, and "needs
+# Full Disk Access" must not hide inside a photo-sync status. Read from the
+# line msg_scan (lib/messages.sh) replaces on every scan, never from the log.
+# The CONFIG decides "off" -- a line left by an earlier, enabled run is not a
+# source that still runs -- and a line that does not parse is "unknown", as is
+# an enabled source that has not scanned yet: neither is an observation.
+msg_state=off; msg_reason=""; msg_count=0; msg_age=-1
+if [ "${MESSAGES_SOURCE:-0}" = 1 ]; then
+  msg_state=unknown
+  if [ -r "$STATE_DIR/messages-status" ]; then
+    IFS="$(printf '\t')" read -r m_ts m_state m_count m_reason < "$STATE_DIR/messages-status" 2>/dev/null || true
+    case "${m_ts:-x}${m_count:-x}" in
+      *[!0-9]*) ;;
+      *)
+        case "${m_state:-}" in
+          ok|skipped)
+            msg_state="$m_state"; msg_count="$m_count"
+            msg_age=$(( $(date +%s) - m_ts )); [ "$msg_age" -lt 0 ] && msg_age=0
+            msg_reason="$(printf '%s' "${m_reason:-}" | tr -d '"\\' | tr -d '\000-\037' | cut -c1-160)" ;;
+        esac ;;
+    esac
+  fi
+fi
+
+printf '{"backup":{"armed":%s,"backend":"%s","app":%s,"app_online":%s,"signed_in":%s,"app_path":"%s","emulator":%s,"staged":%s,"remaining":%s,"on_device":%s,"given_up":%s,"uploaded":%s,"queued":%s,"failed":%s,"upload_age":%s,"confirmed":%s,"confirmed_age":%s,"last_run_age":%s,"running":%s,"phase":"%s","reclaimed":%s,"reclaim_pending":%s,"present":%s,"kept":%s},"messages":{"state":"%s","reason":"%s","count":%s,"age":%s},"ts":%s}\n' \
+  "$armed" "$PHOTOS_BACKEND" "$app" "$app_online" "$signed_in" "$app_path" "$emu" "${staged:-0}" "${remaining:-0}" "${ondev:-0}" "${given_up:-0}" "${uploaded:-0}" "${queued:-0}" "${failed:-0}" "${upl_age:--1}" "$confirmed" "$confirmed_age" "$last_run_age" "$running" "$phase" "$reclaimed" "$reclaim_pending" "$present" "$kept" \
+  "$msg_state" "$msg_reason" "$msg_count" "$msg_age" "$(date +%s)"
