@@ -532,9 +532,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // Aligned "label  value" row for the ledger. The pad width must exceed the
-    // longest label or label and value fuse into one word.
+    // longest label: String.padding(toLength:) TRUNCATES a longer one, so at 12
+    // the Mac backend's 13-character "Google Photos" row read
+    // "Google Photorunning". 15 is that label plus a two-space gap.
     private func mono(_ m: NSMenu, _ label: String, _ value: String) {
-        let s = label.padding(toLength: 12, withPad: " ", startingAt: 0) + value
+        let s = label.padding(toLength: 15, withPad: " ", startingAt: 0) + value
         let x = NSMenuItem(title: s, action: nil, keyEquivalent: ""); x.isEnabled = false
         x.attributedTitle = NSAttributedString(string: s, attributes: [
             .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
