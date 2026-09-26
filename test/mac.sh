@@ -157,5 +157,85 @@ check "--retry-given-up clears the budget" test "$(mac_given_up | mac_count)" = 
 check "and says how many" grep -q '1 file(s) given up' <<<"$LOGGED"
 check "the file is a candidate again" grep -qx 'lost/L.HEIC' <<<"$(mac_list_new /dev/stdout)"
 
+echo "online-only files"
+# A real dataless placeholder cannot be made in a scratch directory, so the FLAG
+# is stubbed and the READ is real, against a FIFO standing in for the stub: a
+# reader blocks in open() on a FIFO that nobody writes, which is the stuck
+# provider exactly, and a FIFO whose writer serves the bytes, swaps a regular
+# file in and clears the flag BEFORE closing is a provider that materialises a
+# file when it is read -- measured on Drive's stream mode 2026-09-26, where
+# every staged file was such a stub and none was ever handed over.
+DATALESS="$T/dataless.list"; : > "$DATALESS"
+is_dataless() { grep -qxF "$1" "$DATALESS" 2>/dev/null; }
+SERVERS=""
+mkdir -p "$STAGING/hyd"
+serves() {  # <rel>: a stub that materialises when it is read
+  local p="$STAGING/$1"
+  mkfifo "$p"; printf '%s\n' "$p" >> "$DATALESS"; printf 'bytes of %s' "$1" > "$p.real"
+  ( exec 3>"$p"; cat "$p.real" >&3; mv -f "$p.real" "$p"
+    grep -vxF "$p" "$DATALESS" > "$DATALESS.t"; mv -f "$DATALESS.t" "$DATALESS"; exec 3>&- ) &
+  SERVERS="$SERVERS $!"
+}
+stuck() { mkfifo "$STAGING/$1"; printf '%s\n' "$STAGING/$1" >> "$DATALESS"; }   # never served
+stays() { printf 'x' > "$STAGING/$1"; printf '%s\n' "$STAGING/$1" >> "$DATALESS"; }  # read, still a stub
+KEEP_PUSH_CAP="$PUSH_CAP"
+
+serves hyd/A.JPG; stuck hyd/B.JPG; stays hyd/C.JPG; serves hyd/D.JPG
+printf 'hyd/A.JPG\nhyd/B.JPG\nhyd/C.JPG\nhyd/D.JPG\n' > "$T/hyd.list"
+# shellcheck disable=SC2034  # read by lib/mac.sh
+MAC_HYDRATE_TIMEOUT=1 MAC_HYDRATE_BUDGET=30
+LOGGED=""; MAC_HANDED=0
+t0=$SECONDS; mac_handoff "$T/hyd.list"; took=$((SECONDS - t0))
+check "a stub that materialises when read is handed over" test "$(row hyd/A.JPG 3)/$(row hyd/D.JPG 3)" = "queued/queued"
+check "with its bytes" test "$(cat "$MAC_INBOX/hyd_A.JPG" 2>/dev/null)" = "bytes of hyd/A.JPG"
+check "a stub still blocked at the bound is not handed over" test -z "$(row hyd/B.JPG 3)"
+check "nor is one still dataless after a full read" test -z "$(row hyd/C.JPG 3)"
+check "the log counts both apart" grep -q 'handed to Google Photos 2 .*hydrated 2, evicted-skipped 2' <<<"$LOGGED"
+check "and says why each was left" grep -q '1 still blocked after the 1s per-file bound, 1 still online-only after a full read, 0 unreadable, 0 not tried' <<<"$LOGGED"
+check "a timed-out file is named" grep -q 'still online-only after 1s of reading, left for the next run: hyd/B.JPG' <<<"$LOGGED"
+check "the blocked read was killed, not left to hang" none pgrep -f "cat -- $STAGING/hyd/B.JPG"
+check "the run was bounded by the per-file timeout" test "$took" -le 4
+
+serves hyd/E.JPG; serves hyd/F.JPG
+printf 'hyd/E.JPG\nhyd/F.JPG\n' > "$T/hyd.list"
+LOGGED=""; MAC_HANDED=0; PUSH_CAP=1
+mac_handoff "$T/hyd.list"
+check "hydration stops at the cap: the first is handed over" test "$(row hyd/E.JPG 3)" = queued -a "$MAC_HANDED" = 1
+check "and the next one is never read" grep -qxF "$STAGING/hyd/F.JPG" "$DATALESS"
+PUSH_CAP="$KEEP_PUSH_CAP"
+
+stuck hyd/G.JPG; stuck hyd/H.JPG
+printf 'hyd/G.JPG\nhyd/H.JPG\nhyd/F.JPG\n' > "$T/hyd.list"
+# shellcheck disable=SC2034  # read by lib/mac.sh
+MAC_HYDRATE_BUDGET=1
+LOGGED=""; MAC_HANDED=0
+mac_handoff "$T/hyd.list"
+check "once the run's hydration budget is spent nothing else is read" grep -qxF "$STAGING/hyd/F.JPG" "$DATALESS"
+# SECONDS is whole seconds, so a one-second budget may already read as spent
+# before the first file: G is tried or not, but nothing after it ever is.
+check "and the untried ones are counted as such" grep -qE '(1 still blocked after the 1s per-file bound, 0 still online-only after a full read, 0 unreadable, 2|0 still blocked after the 1s per-file bound, 0 still online-only after a full read, 0 unreadable, 3) not tried' <<<"$LOGGED"
+
+# shellcheck disable=SC2034  # read by lib/mac.sh
+MAC_HYDRATE_BUDGET=30 MAC_HYDRATE_TIMEOUT=0
+LOGGED=""; MAC_HANDED=0
+printf 'hyd/F.JPG\n' > "$T/hyd.list"; mac_handoff "$T/hyd.list"
+check "MAC_HYDRATE_TIMEOUT=0 turns hydration off: the stub is skipped unread" grep -qxF "$STAGING/hyd/F.JPG" "$DATALESS"
+check "and is counted as not tried, not as a timeout" grep -q '0 still blocked .*, 1 not tried' <<<"$LOGGED"
+
+# A human's "08" is octal to $(( )), which aborted the handoff before 10#.
+# shellcheck disable=SC2034  # read by lib/mac.sh
+MAC_HYDRATE_TIMEOUT=08 MAC_HYDRATE_BUDGET=030
+LOGGED=""; MAC_HANDED=0
+printf 'hyd/F.JPG\n' > "$T/hyd.list"; mac_handoff "$T/hyd.list"
+check "a zero-padded bound is decimal, and the stub is fetched" test "$(row hyd/F.JPG 3)" = queued
+
+printf 'x' > "$STAGING/hyd/U.JPG"; chmod 000 "$STAGING/hyd/U.JPG"; printf '%s\n' "$STAGING/hyd/U.JPG" >> "$DATALESS"
+LOGGED=""; MAC_HANDED=0
+printf 'hyd/U.JPG\n' > "$T/hyd.list"; mac_handoff "$T/hyd.list"
+check "a read that fails is counted apart from a stub that stays one" grep -q '0 still online-only after a full read, 1 unreadable' <<<"$LOGGED"
+chmod 600 "$STAGING/hyd/U.JPG"
+# shellcheck disable=SC2086  # a list of pids
+{ kill $SERVERS; wait $SERVERS; } 2>/dev/null
+
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

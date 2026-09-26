@@ -197,7 +197,12 @@ pipeline becomes a one-way copier.
    photo keeps its date, which becomes the item's timestamp) written under a
    dot-name and renamed into place, named after the staged path
    (`2026/05/IMG_2885.HEIC` -> `2026_05_IMG_2885.HEIC`) so the ledger maps every
-   name back exactly. The staging tree is never touched.
+   name back exactly. The staging tree is never touched. A staged file a
+   cloud folder has evicted to an online-only placeholder is first fetched by
+   a read bounded per file (`MAC_HYDRATE_TIMEOUT`) and per run
+   (`MAC_HYDRATE_BUDGET`), because reading a stub has no timeout of its own;
+   one still a placeholder afterwards waits for the next run. The log line
+   counts both (`hydrated N`, `evicted-skipped N`).
 3. **Google Photos is launched in the background** (`open -g`) if it is not
    running and there is something to hand over or to wait for; a tick with
    nothing new and nothing waiting is one listing and one read of the
@@ -478,6 +483,13 @@ app's child; the child inherits the app's file-provider grant. If your staging
 directory is a plain local folder, that indirection is harmless and you can
 ignore it.
 
+The other side of the bytes leaving the disk is that a file Drive has already
+uploaded is an online-only placeholder by the time the handoff reaches it
+(measured 2026-09-26: a whole 4,371-file backlog). The handoff fetches each one
+back with a bounded read before copying it (a 68 KB photo took 1.97 s), up to
+the run's cap and within `MAC_HYDRATE_BUDGET`, and never reads a placeholder
+without a bound.
+
 ---
 
 ## Requirements
@@ -714,6 +726,7 @@ first place.
 | `GPHOTOS_IPA_URL` / `GPHOTOS_IPA_SHA256` | this repo's release asset | The IPA to install and the hash it must have. |
 | `IPA_INSTALL` | `ipa-install-on-mac` | The converter; fetched at a pinned revision when not on PATH. |
 | `MAC_INBOX_MAX` | `300` | Files waiting in the upload folder at once (the engine keeps a second copy of each while it uploads). |
+| `MAC_HYDRATE_TIMEOUT` / `MAC_HYDRATE_BUDGET` | `120` / `600` | Seconds per file, and per run in all, spent fetching online-only staged files before handing them over. `MAC_HYDRATE_TIMEOUT=0` skips them unread. |
 | `PRESENCE_CHECK` | `1` | Look a staged file up in Google Photos' own database before uploading it. 0 uploads everything as before. |
 | `PRESENCE_BUDGET` | `300` | Seconds per run spent on that lookup (it reads each candidate's bytes). Whatever it does not reach is handed over as usual. |
 | `AVD_NAME` | `gphotos-tablet` | The emulator's name. |
