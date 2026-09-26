@@ -439,6 +439,14 @@ the folder itself -- which is indistinguishable from "no such folder" unless you
 keep stderr, which this does. An unreadable folder logs one line and the tick
 carries on: a Messages source that failed a photo sync would be a bad trade.
 
+The menu bar shows this source on its own **Messages** rows, apart from the
+photo sync: `Attachments  <n> synced`, `skipped: needs Full Disk Access` or
+`off`. The sync runs as a child of `Photo Sync.app`, so that app is what needs
+the grant; when the scan was refused, **Grant Full Disk Access…** opens that
+pane of Privacy & Security and reveals the app in Finder to add. A `Backup` row
+beside it reads system-config's Messages backup from
+`~/.local/state/system-config/messages-backup.json` when that file exists.
+
 **Nothing in Messages is ever modified or deleted by this.**
 
 ### The two reports
@@ -489,6 +497,13 @@ uploaded is an online-only placeholder by the time the handoff reaches it
 back with a bounded read before copying it (a 68 KB photo took 1.97 s), up to
 the run's cap and within `MAC_HYDRATE_BUDGET`, and never reads a placeholder
 without a bound.
+
+Those reads can be refused outright: the same day, the launchd-run sync had
+every one refused ("Operation not permitted") until `Photo Sync.app` was given
+**Full Disk Access**, while a terminal that had it read the same files. The
+first refusal now stops the reading for that run, with one log line naming
+the grant, and the menu shows `Staging  cannot read cloud files: needs Full
+Disk Access` and a **Grant Full Disk Access…** action.
 
 ---
 
@@ -795,6 +810,8 @@ All under `~/.cache/avd-photos` (`AVD_PHOTOS_STATE_DIR`):
 | `device.id` | The emulator's `android_id`; a change resets the ledger. |
 | `device-busy` | A batch is on the device between push and confirmation. |
 | `messages-state.tsv` | The Messages source's ledger: guid, sha1, state (`staged`/`present`), stamp, staged path, chat id, handle id, date, bytes, kind. Keyed by guid+sha1. |
+| `staging-access` | `<epoch>\t<ok\|denied>\t<reason>` from the last handoff that read an online-only staged file; `avd-photos-status` reports it as `staging_access`. |
+| `messages-status` | `<epoch>\t<ok\|skipped>\t<ledger rows>\t<reason>` from the last Messages scan; `avd-photos-status` reports it as its `messages` object. |
 | `phase` | The running step, or `failed: <why>` from the last run. Removed on a clean exit. |
 | `sync.lock/pid`, `setup.lock/pid` | Single-flight locks (mkdir is the atomic test-and-set; macOS has no `flock`). |
 | `setup-complete` | Written only after the LAST setup phase succeeds. The login bootstrap keys on this. |

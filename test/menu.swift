@@ -85,5 +85,105 @@ check("every value starts in the same column",
 check("a label longer than the column is not truncated",
       ledgerLine("A very long label", "v") == "A very long label  v")
 
+// ── Messages ────────────────────────────────────────────────────────────────
+// Two sources shown apart from the photo sync: the pipeline's own scan of
+// Messages attachments (the collector's "messages" object) and system-config's
+// Messages backup (a JSON file it writes at every switch).
+func value(_ rows: [(String, String)], _ label: String) -> String? { rows.first { $0.0 == label }?.1 }
+let now = Date(timeIntervalSince1970: 1_790_000_000)
+func iso(_ secondsAgo: Int) -> String {
+    let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime]
+    return f.string(from: now.addingTimeInterval(TimeInterval(-secondsAgo)))
+}
+func backup(_ json: String) -> MessagesBackup? { messagesBackup(Data(json.utf8)) }
+func offer(_ m: MessagesSource?) -> Bool { var x = Stats(); x.messages = m; return offerFullDiskAccess(x) }
+
+let fda = messagesSource(["state": "skipped", "reason": "Operation not permitted", "count": 0, "age": 30])
+check("the measured 2026-09-26 skip reads as needing Full Disk Access",
+      fda?.state == .skipped && fda?.needsFullDiskAccess == true)
+check("and its row says so, not macOS's words",
+      value(messagesRows(source: fda, backup: nil, now: now), "Attachments") == "skipped: needs Full Disk Access · 30s ago")
+check("the Grant Full Disk Access action is offered for it",
+      offer(fda))
+let denied = messagesSource(["state": "skipped", "reason": "Permission denied", "count": 4])
+check("another skip keeps its own reason and offers no Full Disk Access",
+      value(messagesRows(source: denied, backup: nil, now: now), "Attachments") == "skipped: Permission denied"
+      && !offer(denied))
+check("a skip with no reason still says it was skipped",
+      value(messagesRows(source: messagesSource(["state": "skipped"]), backup: nil, now: now), "Attachments")
+          == "skipped: see sync.log")
+let okSource = messagesSource(["state": "ok", "reason": "", "count": 1161, "age": 60])
+check("a scan that ran shows how many attachments are dealt with",
+      value(messagesRows(source: okSource, backup: nil, now: now), "Attachments") == "1161 synced · 1m ago"
+      && !offer(okSource))
+check("the source off says off",
+      value(messagesRows(source: messagesSource(["state": "off", "count": 0, "age": -1]), backup: nil, now: now),
+            "Attachments") == "off")
+check("an enabled source that has not scanned is not called ok",
+      value(messagesRows(source: messagesSource(["state": "unknown"]), backup: nil, now: now), "Attachments")
+          == "no scan reported yet")
+check("a state this app does not know is unknown, not dropped",
+      messagesSource(["state": "exploded"])?.state == .unknown)
+check("a collector without a messages object shows no Attachments row",
+      messagesSource(nil) == nil && messagesSource("x") == nil
+      && value(messagesRows(source: nil, backup: nil, now: now), "Attachments") == nil)
+
+check("no backup file: no Backup row, and no section at all",
+      messagesBackup(nil) == nil && messagesRows(source: nil, backup: nil, now: now).isEmpty)
+check("a backup file that is not JSON is unreadable",
+      backup("{not json") == .unreadable && messagesBackup(Data()) == .unreadable)
+check("JSON without a boolean ok is unreadable",
+      backup(#"{"at":"2026-09-26T10:00:00Z"}"#) == .unreadable
+      && backup(#"{"ok":"yes"}"#) == .unreadable && backup("[1,2]") == .unreadable)
+check("and says so on its row",
+      value(messagesRows(source: nil, backup: .unreadable, now: now), "Backup") == "unreadable")
+let good = backup(#"{"ok":true,"at":"\#(iso(180))","reason":"","items":42,"dest":"/x"}"#)
+check("a good backup reads ok with its age",
+      value(messagesRows(source: nil, backup: good, now: now), "Backup") == "ok · 3m ago")
+let bad = backup(#"{"ok":false,"at":"\#(iso(7200))","reason":"Drive not mounted","items":0}"#)
+check("a failed backup names the reason and when",
+      value(messagesRows(source: nil, backup: bad, now: now), "Backup") == "failed: Drive not mounted · 2.0h ago")
+check("an offset, fractional seconds and a missing time all read",
+      backup(#"{"ok":true,"at":"2026-09-26T15:30:00+05:30"}"#) == .ok(at: Date(timeIntervalSince1970: 1_790_416_800))
+      && backup(#"{"ok":true,"at":"2026-09-26T10:00:00.250Z"}"#) != .unreadable
+      && value(messagesRows(source: nil, backup: backup(#"{"ok":true}"#), now: now), "Backup") == "ok")
+check("a failure with no reason is still a failure",
+      value(messagesRows(source: nil, backup: backup(#"{"ok":false}"#), now: now), "Backup") == "failed")
+check("the backup's own Full Disk Access trouble offers nothing: this app is not what runs it",
+      !offer(nil))
+check("the backup path is under the owner's ~/.local/state/system-config",
+      messagesBackupPath(home: "/Users/u") == "/Users/u/.local/state/system-config/messages-backup.json")
+
+// ── Reading the staging tree ────────────────────────────────────────────────
+// 2026-09-26: the launchd-run sync had every read of the Drive staging tree
+// refused (no Full Disk Access) and handed nothing over, with nothing in the
+// menu to say why.
+var denied2 = Stats(); denied2.stagingAccess = "denied"; denied2.stagingReason = "Operation not permitted"
+check("a refused staging read has its own row on the Mac backend",
+      value(ledgerRows(denied2, backend: .mac, haveStats: true), "Staging")
+          == "cannot read cloud files: needs Full Disk Access")
+var agedDenial = denied2; agedDenial.stagingAge = 7200
+check("with the age of the run that was refused",
+      value(ledgerRows(agedDenial, backend: .mac, haveStats: true), "Staging")
+          == "cannot read cloud files: needs Full Disk Access · 2.0h ago")
+check("and offers the same Grant Full Disk Access action", offerFullDiskAccess(denied2))
+var modes = denied2; modes.stagingReason = "Permission denied"
+check("a file-mode refusal names itself and offers no grant",
+      value(ledgerRows(modes, backend: .mac, haveStats: true), "Staging") == "cannot read cloud files: Permission denied"
+      && !offerFullDiskAccess(modes))
+var allowed = denied2; allowed.stagingAccess = "ok"
+check("reads allowed, or never tried: no Staging row",
+      value(ledgerRows(allowed, backend: .mac, haveStats: true), "Staging") == nil
+      && value(ledgerRows(Stats(), backend: .mac, haveStats: true), "Staging") == nil
+      && !offerFullDiskAccess(allowed))
+check("the emulator backend never reads stubs, so never shows the row",
+      value(ledgerRows(denied2, backend: .avd, haveStats: true), "Staging") == nil)
+
+let msgRows = messagesRows(source: fda, backup: bad, now: now)
+check("the section is Attachments then Backup", labels(msgRows) == ["Attachments", "Backup"])
+let allLines = (ledgerRows(s, backend: .mac, haveStats: true) + msgRows).map { (l, v) in (l, ledgerLine(l, v)) }
+check("Messages values start in the ledger's column",
+      Set(allLines.map { l, line in line.dropFirst(l.count).prefix { $0 == " " }.count + l.count }).count == 1)
+
 print("\(pass) passed, \(fail) failed")
 if fail > 0 { exit(1) }

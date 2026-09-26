@@ -370,6 +370,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         s.reclaimed = b["reclaimed"] as? Int ?? 0
         s.reclaimPending = b["reclaim_pending"] as? Int ?? 0
         s.phase = b["phase"] as? String ?? ""
+        s.stagingAccess = b["staging_access"] as? String ?? "unknown"
+        s.stagingReason = b["staging_reason"] as? String ?? ""
+        s.stagingAge = b["staging_age"] as? Int ?? -1
+        s.messages = messagesSource(root["messages"])
         return s
     }
 
@@ -561,6 +565,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             mono(m, label, value)
         }
 
+        // Messages, apart from the photo sync (model.swift says why). The
+        // backup file is read here, at open, like every age in this menu: it
+        // changes only at a switch, and a missing file is a hidden row.
+        let source = haveStats ? stats.messages : nil
+        let backupFile = messagesBackupPath(home: FileManager.default.homeDirectoryForCurrentUser.path)
+        let backupData = FileManager.default.fileExists(atPath: backupFile)
+            ? ((try? Data(contentsOf: URL(fileURLWithPath: backupFile))) ?? Data()) : nil
+        let messageRows = messagesRows(source: source, backup: messagesBackup(backupData), now: Date())
+        if !messageRows.isEmpty {
+            m.addItem(.separator())
+            header(m, "Messages")
+            for (label, value) in messageRows { mono(m, label, value) }
+        }
+        // One action for either refusal (the Staging row above, or Messages).
+        if haveStats && offerFullDiskAccess(stats) {
+            action(m, "Grant Full Disk Access…", #selector(grantFullDiskAccess))
+        }
+
         m.addItem(.separator())
         let launcher = uploaderLauncher(backend, appPath: stats.appPath)
         if FileManager.default.fileExists(atPath: launcher.path) {
@@ -642,6 +664,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             try? q.run()
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.refresh() }
+    }
+    // The sync runs as this app's child (PhotoSync --sync), so TCC asks about
+    // THIS bundle: the pane opens at Full Disk Access and Finder shows the app,
+    // ready to drag into the list or find with "+". Nothing is granted from
+    // here; macOS lets only the owner do that.
+    @objc private func grantFullDiskAccess() {
+        if let pane = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+            NSWorkspace.shared.open(pane)
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
     }
     @objc private func quit() { NSApp.terminate(nil) }
     @objc private func openUploader(_ sender: NSMenuItem) {

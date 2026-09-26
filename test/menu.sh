@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The menu's model (Sources/model.swift) compiled beside test/menu.swift and
 # run: which backend the dropdown describes when the collector has or has not
-# answered, which ledger rows each backend shows, and the ledger's text. No
+# answered, which ledger rows each backend shows, the ledger's text, and the
+# Messages rows (the pipeline's own source, system-config's backup). No
 # AppKit, no menu bar, no collector; nothing outside a scratch directory.
 #
 # Usage: test/menu.sh

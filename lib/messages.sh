@@ -58,6 +58,25 @@ MSG_PREFIX="messages"
 # is camera media and Google Photos would reject or misfile them.
 MSG_EXTS="heic heif jpg jpeg png gif webp mov mp4 m4v"
 
+# WHAT THE LAST SCAN CONCLUDED, for the menu (through avd-photos-status): the
+# log line says it to a human, but a reader that greps a rotated log for prose
+# breaks the day the wording changes, and "skipped for want of Full Disk Access"
+# is exactly what the menu must be able to say on its own row. One line,
+# tab-separated, replaced whole on every scan:
+#
+#   epoch   when the scan ended
+#   state   ok        the scan ran (including "no attachment rows")
+#           skipped   it could not look; nothing was read or recorded
+#   count   rows in MSG_STATE: attachments dealt with so far, staged or
+#           already in Google Photos. Kept through a skip.
+#   reason  macOS's own words for a skip ("Operation not permitted" is TCC
+#           refusing Full Disk Access), or what failed; empty when ok
+#
+# Nothing is written with the source off: the collector reads MESSAGES_SOURCE
+# itself and reports "off", so a status left by an earlier, enabled run cannot
+# claim the source is still running.
+MSG_STATUS="$STATE_DIR/messages-status"
+
 # Counters for the one line this source logs, and for the caller's own report.
 MSG_SEEN=0        # attachment rows with a media extension and bytes on disk
 MSG_NEW=0         # not in the ledger before this run
@@ -96,6 +115,21 @@ msg_kind() {
   ext="$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')"
   case " $MSG_EXTS " in *" $ext "*) ;; *) return 1 ;; esac
   case "$ext" in mov|mp4|m4v) printf 'video\n' ;; *) printf 'image\n' ;; esac
+}
+
+# Replaced by a rename, so the collector never reads half a line; a status that
+# cannot be written costs the menu a row, never the tick. The reason keeps
+# printable ASCII only: that drops the tab and newline this line is split on,
+# and under LC_ALL=C cut counts bytes, so a cut through a multibyte character
+# would hand the collector invalid UTF-8 and the menu an unparseable blob.
+msg_status() {  # <ok|skipped> [reason]
+  local n=0 reason
+  [ -r "$MSG_STATE" ] && n="$(grep -c . "$MSG_STATE" 2>/dev/null)"
+  reason="$(printf '%s' "${2:-}" | LC_ALL=C tr -cd '\040-\176' | cut -c1-160)"
+  printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$1" "${n:-0}" "$reason" > "$MSG_STATUS.tmp" 2>/dev/null \
+    && mv -f "$MSG_STATUS.tmp" "$MSG_STATUS" 2>/dev/null
+  rm -f "$MSG_STATUS.tmp" 2>/dev/null
+  return 0
 }
 
 # FULL DISK ACCESS IS THE WHOLE PREREQUISITE, and a process without it gets
@@ -317,12 +351,14 @@ msg_scan() {
   MSG_T0="$(date +%s)"
   if ! msg_readable; then
     log "Messages source skipped: cannot read $MESSAGES_DIR ($MSG_UNREADABLE) — Full Disk Access is needed by whatever runs this sync"
+    msg_status skipped "$MSG_UNREADABLE"
     return 0
   fi
-  snap="$(mktemp -d)" || return 0
+  snap="$(mktemp -d)" || { msg_status skipped "could not make a temporary directory"; return 0; }
   MSG_SNAP="$snap"
   if ! msg_db_snapshot "$snap"; then
     log "Messages source skipped: could not copy $MESSAGES_DB (with its -wal and -shm) — nothing was read"
+    msg_status skipped "could not copy chat.db"
     msg_cleanup_snapshot; return 0
   fi
   # Whatever a killed run left half-copied. Named, not globbed by extension,
@@ -333,8 +369,10 @@ msg_scan() {
   if [ ! -s "$rows" ]; then
     if [ -n "$MSG_ROWS_ERR" ]; then
       log "Messages source skipped: the chat.db copy could not be queried ($MSG_ROWS_ERR)"
+      msg_status skipped "chat.db could not be queried: $MSG_ROWS_ERR"
     else
       log "Messages source: no attachment rows in the chat.db copy — nothing to do"
+      msg_status ok
     fi
     msg_cleanup_snapshot; rm -f "$rows"; return 0
   fi
@@ -392,6 +430,7 @@ msg_scan() {
   secs="$(msg_elapsed)"
   log "Messages source: $MSG_SEEN media attachment(s) seen, $MSG_NEW new, $MSG_STAGED staged, $MSG_PRESENT already in Google Photos, $gone with no bytes on disk, $MSG_SKIPPED not media, $failed not staged, ${secs}s"
   [ "$over" -gt 0 ] && log "  stopped at the ${MESSAGES_BUDGET}s budget with $over row(s) not looked at; the next tick continues where this one stopped"
+  msg_status ok
   msg_cleanup_snapshot; rm -f "$rows"
   return 0
 }
