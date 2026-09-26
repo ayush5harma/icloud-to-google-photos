@@ -189,6 +189,23 @@ if [ "$running" = true ]; then
   esac
 fi
 
+# WHETHER THE SYNC MAY READ ITS OWN STAGING TREE. A cloud-provider mount can
+# refuse every read to a process without Full Disk Access (2026-09-26: 2,667
+# refusals, nothing handed over), and that is a photo-sync fact, so it travels
+# in "backup". Written by mac_handoff after any run that read an online-only
+# file; "unknown" until one has.
+staging_access=unknown; staging_reason=""
+if [ -r "$MAC_ACCESS" ]; then
+  IFS="$(printf '\t')" read -r a_ts a_state a_reason < "$MAC_ACCESS" 2>/dev/null || true
+  case "${a_ts:-x}" in
+    *[!0-9]*) ;;
+    *) case "${a_state:-}" in
+         ok|denied) staging_access="$a_state"
+                    staging_reason="$(printf '%s' "${a_reason:-}" | LC_ALL=C tr -cd '\040-\176' | tr -d '"\\' | cut -c1-160)" ;;
+       esac ;;
+  esac
+fi
+
 # THE MESSAGES SOURCE, reported on its own because the menu shows it on its own
 # rows: a skipped Messages scan says nothing about the photo sync, and "needs
 # Full Disk Access" must not hide inside a photo-sync status. Read from the
@@ -216,6 +233,6 @@ if [ "${MESSAGES_SOURCE:-0}" = 1 ]; then
   fi
 fi
 
-printf '{"backup":{"armed":%s,"backend":"%s","app":%s,"app_online":%s,"signed_in":%s,"app_path":"%s","emulator":%s,"staged":%s,"remaining":%s,"on_device":%s,"given_up":%s,"uploaded":%s,"queued":%s,"failed":%s,"upload_age":%s,"confirmed":%s,"confirmed_age":%s,"last_run_age":%s,"running":%s,"phase":"%s","reclaimed":%s,"reclaim_pending":%s,"present":%s,"kept":%s},"messages":{"state":"%s","reason":"%s","count":%s,"age":%s},"ts":%s}\n' \
-  "$armed" "$PHOTOS_BACKEND" "$app" "$app_online" "$signed_in" "$app_path" "$emu" "${staged:-0}" "${remaining:-0}" "${ondev:-0}" "${given_up:-0}" "${uploaded:-0}" "${queued:-0}" "${failed:-0}" "${upl_age:--1}" "$confirmed" "$confirmed_age" "$last_run_age" "$running" "$phase" "$reclaimed" "$reclaim_pending" "$present" "$kept" \
+printf '{"backup":{"armed":%s,"backend":"%s","app":%s,"app_online":%s,"signed_in":%s,"app_path":"%s","emulator":%s,"staged":%s,"remaining":%s,"on_device":%s,"given_up":%s,"uploaded":%s,"queued":%s,"failed":%s,"upload_age":%s,"confirmed":%s,"confirmed_age":%s,"last_run_age":%s,"running":%s,"phase":"%s","reclaimed":%s,"reclaim_pending":%s,"present":%s,"kept":%s,"staging_access":"%s","staging_reason":"%s"},"messages":{"state":"%s","reason":"%s","count":%s,"age":%s},"ts":%s}\n' \
+  "$armed" "$PHOTOS_BACKEND" "$app" "$app_online" "$signed_in" "$app_path" "$emu" "${staged:-0}" "${remaining:-0}" "${ondev:-0}" "${given_up:-0}" "${uploaded:-0}" "${queued:-0}" "${failed:-0}" "${upl_age:--1}" "$confirmed" "$confirmed_age" "$last_run_age" "$running" "$phase" "$reclaimed" "$reclaim_pending" "$present" "$kept" "$staging_access" "$staging_reason" \
   "$msg_state" "$msg_reason" "$msg_count" "$msg_age" "$(date +%s)"

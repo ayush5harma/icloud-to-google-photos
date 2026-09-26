@@ -82,6 +82,18 @@ check "an unreadable line is unknown, and the JSON still parses" \
   test "$(get messages.state)/$(get messages.count)/$(get messages.age)" = "unknown/0/-1" && parses
 printf '%s%sexploded%s5%s\n' "$(date +%s)" "$tab" "$tab" "$tab" > "$STATUS"; run
 check "a state the source never writes is unknown too" test "$(get messages.state)" = unknown
+echo "reading the staging tree"
+rm -f "$T/state/staging-access"; run
+check "no handoff has read a stub yet: unknown" \
+  test "$(get backup.staging_access)/$(get backup.staging_reason)" = "unknown/"
+printf '%s%sdenied%sOperation not permitted\n' "$(date +%s)" "$tab" "$tab" > "$T/state/staging-access"; run
+check "a refused read: denied, with macOS's words" \
+  test "$(get backup.staging_access)/$(get backup.staging_reason)" = "denied/Operation not permitted"
+printf '%s%sok%s\n' "$(date +%s)" "$tab" "$tab" > "$T/state/staging-access"; run
+check "an allowed one: ok" test "$(get backup.staging_access)" = ok
+printf 'nonsense\n' > "$T/state/staging-access"; run
+check "a line that is not one: unknown" test "$(get backup.staging_access)" = unknown && parses
+
 check "nothing on stderr through all of it" test ! -s "$T/err"
 
 echo "$PASS passed, $FAIL failed"
