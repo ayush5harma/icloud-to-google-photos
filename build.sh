@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build "Photo Sync.app" -- the menu-bar face of this pipeline -- from the two
+# Build "Photo Sync.app" -- the menu-bar face of this pipeline -- from the
 # Swift files in Sources/, and install it into /Applications (or wherever
 # --dest says).
 #
@@ -104,7 +104,8 @@ say "compiling"
 # the old process keeps its pages until it exits.
 if ! "$SWIFTC" -O -whole-module-optimization \
       -framework AppKit \
-      -o "$BIN.new" "$SRC_DIR/Sources/main.swift" 2>"$SRC_DIR/.build.log"; then
+      -o "$BIN.new" "$SRC_DIR/Sources/main.swift" "$SRC_DIR/Sources/model.swift" \
+      2>"$SRC_DIR/.build.log"; then
   say "BUILD FAILED — see $SRC_DIR/.build.log"
   tail -15 "$SRC_DIR/.build.log" | sed 's/^/      /'
   rm -f "$BIN.new"
