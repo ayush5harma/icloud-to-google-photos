@@ -110,53 +110,23 @@ if cliArgs.first == "--run" {
 // "Check iCloud now" kickstarts <prefix>.sync so the run is launchd's child and
 // a restart of this app cannot kill it mid-push.
 let labelPrefix = "com.ayushsharma.icloud-to-google-photos"
-// MARK: - Model
 
-struct Stats {
-    var armed = false, emulator = false
-    var backend = "avd"      // "mac": Google Photos for iPhone/iPad on this Mac; "avd": the emulator
-    var app = false, appOnline = false, signedIn = false   // the Mac backend's app, from the bridge heartbeat
-    // Where GPHOTOS_APP says Google Photos is. Published by the collector,
-    // which is the only reader of the config file this app can ask: a launchd
-    // agent's environment carries PATH and nothing else, so reading it here
-    // always yielded the default.
-    var appPath = "/Applications/GooglePhotos.app"
-    var staged = 0, remaining = 0, onDevice = 0, uploaded = 0, queued = 0, failed = 0
-    var givenUp = 0          // failed their three tries; nothing retries them on its own
-    var uploadAge = -1
-    var confirmed = false    // last-upload-confirmed stamp present
-    var confirmedAge = -1
-    var lastRunAge = -1      // seconds since the sync job last COMPLETED a run
-    var running = false      // a sync run holds its lock right now
-    var reclaimed = 0        // deleted from iCloud after Google Photos confirmed them
-    var reclaimPending = 0   // confirmed, not yet deleted from iCloud
-    var phase = ""           // that run's current step, or "failed: <why>" from the last one
-
-    // "Caught up" requires the sync job's confirmation stamp, not arithmetic:
-    // the ledger can be full and upload-status left over from an older run while
-    // the stamp is deliberately deleted because a verify pass failed.
-    var backupDone: Bool { staged > 0 && remaining == 0 && onDevice == 0 && confirmed }
-    var backupUnverified: Bool { staged > 0 && remaining == 0 && onDevice == 0 && !confirmed }
-    // A live run is never "stalled" or "stale": it is pushing, indexing or
-    // verifying right now and says so in its phase line. Both flags once fired
-    // mid-push (the bar read "1000/377" with an exclamation) because the status
-    // file still described the previous batch; the collector now discards a
-    // status older than the last push, and these two ignore a run in flight.
-    var backupStalled: Bool { onDevice > 0 && uploaded == 0 && !running }
-    var uploadFraction: Double { onDevice > 0 ? Double(uploaded) / Double(onDevice) : 0 }
-    // The PIPELINE has stopped tracking reality: a batch is parked on the device
-    // with the verifier silent for an hour (a sync run died mid-flight), or the
-    // 15-minute job has not COMPLETED a run in three hours. Deliberately NOT
-    // keyed on confirmedAge -- a healthy no-op run leaves the stamp untouched,
-    // so its age grows on a perfectly good pipeline.
-    var backupStale: Bool {
-        if running { return false }
-        guard armed else { return false }
-        if onDevice > 0 && uploadAge > 3600 { return true }
-        if lastRunAge < 0 { return staged > 0 }   // armed, work staged, never ran
-        return lastRunAge > 3 * 3600
-    }
+// The two inputs effectiveBackend needs when the collector has not answered.
+// `uname -m`, which is what ap_defaults asks; and the config file at the path
+// lib/config.sh reads (AVD_PHOTOS_CONFIG_DIR is honoured for parity, though a
+// launchd agent never carries it). Reading a display hint from the environment
+// is harmless here, unlike resolveScript's choice of what to run.
+let hostMachine: String = {
+    var u = utsname()
+    guard uname(&u) == 0 else { return "" }
+    return withUnsafeBytes(of: &u.machine) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+}()
+func configText() -> String? {
+    let dir = ProcessInfo.processInfo.environment["AVD_PHOTOS_CONFIG_DIR"]
+        ?? FileManager.default.homeDirectoryForCurrentUser.path + "/.config/avd-photos"
+    return try? String(contentsOfFile: dir + "/config", encoding: .utf8)
 }
+// Stats, the backend resolution and the ledger rows are in model.swift.
 
 // MARK: - Formatting
 
@@ -166,16 +136,6 @@ func compact(_ n: Int) -> String {
     if n < 1000 { return "\(n)" }
     let k = Double(n) / 1000
     return k < 10 ? String(format: "%.1fk", k) : "\(Int(k))k"
-}
-
-// Relative age for the dropdown: "8s ago" / "3m ago" / "2.4h ago".
-func relAge(_ s: Int) -> String {
-    if s < 0 { return "never" }
-    if s < 5 { return "just now" }
-    if s < 60 { return "\(s)s ago" }
-    if s < 3600 { return "\(s / 60)m ago" }
-    if s < 86400 { return String(format: "%.1fh ago", Double(s) / 3600) }
-    return "\(s / 86400)d ago"
 }
 
 // MARK: - Colour
@@ -390,7 +350,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var s = Stats()
         s.armed = b["armed"] as? Bool ?? false
         s.emulator = b["emulator"] as? Bool ?? false
-        s.backend = b["backend"] as? String ?? "avd"
+        s.backend = b["backend"] as? String
         s.app = b["app"] as? Bool ?? false
         s.appOnline = b["app_online"] as? Bool ?? false
         s.signedIn = b["signed_in"] as? Bool ?? false
@@ -531,10 +491,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         m.addItem(x)
     }
 
-    // Aligned "label  value" row for the ledger. The pad width must exceed the
-    // longest label or label and value fuse into one word.
+    // Aligned "label  value" row for the ledger (ledgerLine, model.swift).
     private func mono(_ m: NSMenu, _ label: String, _ value: String) {
-        let s = label.padding(toLength: 12, withPad: " ", startingAt: 0) + value
+        let s = ledgerLine(label, value)
         let x = NSMenuItem(title: s, action: nil, keyEquivalent: ""); x.isEnabled = false
         x.attributedTitle = NSAttributedString(string: s, attributes: [
             .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
@@ -595,50 +554,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             note(m, "Dormant — run avd-photos-arm to enable the sync", color: .systemOrange)
         }
 
+        let backend = effectiveBackend(reported: haveStats ? stats.backend : nil,
+                                       configText: configText(), machine: hostMachine)
         m.addItem(.separator())
-        mono(m, "Staged", "\(stats.staged)")
-        mono(m, "Backlog", stats.remaining == 0 ? "caught up" : "\(stats.remaining)")
-        if stats.backend == "mac" {
-            if stats.onDevice > 0 { mono(m, "Uploading", "\(stats.onDevice) waiting on Google") }
-            // Shown only when there are any: these files are out of the
-            // pipeline until a human asks for them back, and a count nobody
-            // can act on is worse than no row.
-            if stats.givenUp > 0 { mono(m, "Given up", "\(stats.givenUp) — avd-photos-sync --retry-given-up") }
-        } else if stats.emulator || stats.onDevice > 0 {
-            mono(m, "On device", "\(stats.onDevice)\(stats.queued > 0 ? " (\(stats.queued) queued)" : "")")
-        }
-        // The count belongs to the batch the status was written for: once a newer
-        // push exists the collector drops it (uploadAge -1), so only the stamp's
-        // age is left to show; a verify pass in flight shows its own.
-        let verified: String
-        if !stats.confirmed { verified = "NOT confirmed" }
-        else if stats.running && stats.onDevice > 0 { verified = "\(stats.uploaded) of \(stats.onDevice) so far" }
-        else if stats.uploadAge < 0 { verified = "last batch \(relAge(stats.confirmedAge))" }
-        else { verified = "\(stats.uploaded) · \(relAge(stats.confirmedAge))" }
-        mono(m, "Verified", verified)
-        mono(m, "iCloud", "\(stats.reclaimed) freed\(stats.reclaimPending > 0 ? " · \(stats.reclaimPending) confirmed, pending" : "")")
-        mono(m, "Last run", stats.running ? "running now" : relAge(stats.lastRunAge))
-        if stats.backend == "mac" {
-            // The app uploads only while it has a visible window and a network
-            // (the engine's own rule), so a hidden window is worth a line: the
-            // sync launches it in the background and never brings it forward.
-            let state: String
-            if !stats.app { state = "not running" }
-            else if !stats.signedIn { state = "running · not signed in" }
-            else if stats.appOnline { state = "running" }
-            else { state = stats.onDevice > 0 ? "running · window hidden, uploads paused" : "running · window hidden" }
-            mono(m, "Google Photos", state)
-        } else {
-            mono(m, "Emulator", stats.emulator ? "running" : "stopped")
+        for (label, value) in ledgerRows(stats, backend: backend, haveStats: haveStats) {
+            mono(m, label, value)
         }
 
         m.addItem(.separator())
-        if stats.backend == "mac" {
-            if FileManager.default.fileExists(atPath: stats.appPath) {
-                action(m, "Open Google Photos", #selector(openGPhotos))
-            }
-        } else if FileManager.default.fileExists(atPath: "/Applications/Google Photos (AVD).app") {
-            action(m, "Open Google Photos (AVD)", #selector(openAVD))
+        let launcher = uploaderLauncher(backend, appPath: stats.appPath)
+        if FileManager.default.fileExists(atPath: launcher.path) {
+            let x = NSMenuItem(title: launcher.title, action: #selector(openUploader(_:)), keyEquivalent: "")
+            x.target = self; x.representedObject = launcher.path
+            m.addItem(x)
         }
         // Manual iCloud reclaim. Offered ONLY once Google Photos' own database
         // has confirmed the batch (stats.confirmed is the last-upload-confirmed
@@ -716,8 +644,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.refresh() }
     }
     @objc private func quit() { NSApp.terminate(nil) }
-    @objc private func openAVD() { NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/Google Photos (AVD).app")) }
-    @objc private func openGPhotos() { NSWorkspace.shared.open(URL(fileURLWithPath: stats.appPath)) }
+    @objc private func openUploader(_ sender: NSMenuItem) {
+        guard let path = sender.representedObject as? String else { return }
+        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+    }
 }
 
 let app = NSApplication.shared

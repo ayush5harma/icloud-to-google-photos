@@ -585,11 +585,15 @@ tally), yellow while pushing, indexing or pruning on the device, blue while
 Google Photos confirms, purple while iCloud space is being reclaimed, a green
 check when everything staged is confirmed, and orange or red with an exclamation
 when the pipeline has stopped tracking reality. When it is not armed the ring is
-dim and the menu says so. The dropdown carries the ledger (staged, backlog, on
-device, verified, iCloud freed, last run, emulator), the live phase line of a
-running sync, "Check iCloud now", and "Offload from iCloud" - which is offered
-only once a batch has actually been confirmed, because it deletes from the real
-photo library.
+dim and the menu says so. The dropdown carries the ledger (staged, backlog,
+verified, iCloud freed, last run, and the backend's own rows: uploading, given
+up and the Google Photos app's state on the Mac backend; on device and the
+emulator's state on the emulator), the live phase line of a running sync,
+"Check iCloud now", and "Offload from iCloud" - which is offered only once a
+batch has actually been confirmed, because it deletes from the real photo
+library. The menu shows only one backend's rows: the one the collector reports,
+or, before its first answer, `PHOTOS_BACKEND` from the config file, else the
+host default (Apple silicon: the Mac backend).
 
 **The command line:**
 
@@ -863,8 +867,10 @@ test/    mac.sh       the Mac backend's bookkeeping, on a scratch state
          keep.py      the reclaim's keep list, on fixtures
          messages.sh  the Messages source, on a fixture chat.db
          reports.sh   the two reports, on a fixture ledger and database
+         menu.sh      the menu's rows per backend (compiles Sources/model.swift)
 ios/     gp-bridge.m  the folder-to-GoToHP bridge linked into Google Photos for Mac
-Sources/ main.swift (the menu-bar app)  icon.swift (its artwork, drawn at build time)
+Sources/ main.swift (the menu-bar app)  model.swift (its ledger and backend, no AppKit)
+         icon.swift (its artwork, drawn at build time)
 build.sh          builds Photo Sync.app with swiftc; no Xcode project
 install.sh        commands, app, agents; --uninstall
 launchd/          the five agent templates
