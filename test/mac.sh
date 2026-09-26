@@ -234,6 +234,44 @@ LOGGED=""; MAC_HANDED=0
 printf 'hyd/U.JPG\n' > "$T/hyd.list"; mac_handoff "$T/hyd.list"
 check "a read that fails is counted apart from a stub that stays one" grep -q '0 still online-only after a full read, 1 unreadable' <<<"$LOGGED"
 chmod 600 "$STAGING/hyd/U.JPG"
+check "a file-mode refusal is recorded with macOS's words" \
+  test "$(cut -f2,3 "$MAC_ACCESS")" = "denied$(printf '\t')Permission denied"
+
+echo "online-only files this process may not read"
+# Measured 2026-09-26 on Caraxes: the launchd-run sync (Photo Sync.app --sync,
+# no Full Disk Access) had every read of the Drive staging tree refused, logged
+# "2667 unreadable, 1703 not tried (the 600s hydration budget was spent)" and
+# handed over nothing -- the refusals were fast, and there were enough of them
+# to spend the whole budget. The READER is stubbed to fail the way TCC does.
+READS="$T/reads"; : > "$READS"
+hydrate_read() { printf '%s\n' "$1" >> "$READS"; printf 'cat: %s: Operation not permitted\n' "$1" >&2; return 1; }
+for x in P1 P2 P3; do printf 'x' > "$STAGING/hyd/$x.JPG"; printf '%s\n' "$STAGING/hyd/$x.JPG" >> "$DATALESS"; done
+# shellcheck disable=SC2034  # read by lib/mac.sh
+MAC_HYDRATE_TIMEOUT=5 MAC_HYDRATE_BUDGET=30
+LOGGED=""; MAC_HANDED=0
+printf 'hyd/P1.JPG\nhyd/P2.JPG\nhyd/P3.JPG\n' > "$T/hyd.list"
+mac_handoff "$T/hyd.list"
+check "the first refusal stops hydration for the run: one read, not three" test "$(grep -c . "$READS")" = 1
+check "nothing is handed over" test "$MAC_HANDED" = 0 -a -z "$(row hyd/P2.JPG 3)"
+check "one line names the refusal and who needs the grant" \
+  test "$(grep -c 'online-only files cannot be read: Operation not permitted -- Full Disk Access is needed by whatever runs this sync (Photo Sync.app)' <<<"$LOGGED")" = 1
+check "the counts keep their meanings, and the refused ones are their own" \
+  grep -q '0 still online-only after a full read, 1 unreadable, 0 not tried (.*), 2 not read because reading was refused' <<<"$LOGGED"
+check "the staging-access line says denied, with macOS's words" \
+  test "$(cut -f2,3 "$MAC_ACCESS")" = "denied$(printf '\t')Operation not permitted"
+# shellcheck disable=SC1091
+. "$HERE/../lib/fs.sh"   # the real reader back, which brings the real flag test too
+is_dataless() { grep -qxF "$1" "$DATALESS" 2>/dev/null; }
+serves hyd/Q.JPG
+LOGGED=""; MAC_HANDED=0
+printf 'hyd/Q.JPG\n' > "$T/hyd.list"; mac_handoff "$T/hyd.list"
+check "a run whose reads are allowed again says ok" \
+  test "$(row hyd/Q.JPG 3)/$(cut -f2 "$MAC_ACCESS")" = "queued/ok"
+check "and logs no refusal" none grep -q 'reading was refused\|cannot be read' <<<"$LOGGED"
+before="$(cat "$MAC_ACCESS")"
+printf 'hyd/P1.JPG\n' > "$T/hyd.list"; sed -i '' "\|$STAGING/hyd/P1.JPG|d" "$DATALESS"
+LOGGED=""; MAC_HANDED=0; mac_handoff "$T/hyd.list"
+check "a run that reads no stub leaves the line alone (it observed nothing)" test "$(cat "$MAC_ACCESS")" = "$before"
 # shellcheck disable=SC2086  # a list of pids
 { kill $SERVERS; wait $SERVERS; } 2>/dev/null
 

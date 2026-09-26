@@ -57,7 +57,12 @@ MAC_STATE="$STATE_DIR/mac-state.tsv"
 # it -- it is the evidence trail for a reclaim that was decided without an
 # upload of our own.
 MAC_PRESENT="$STATE_DIR/mac-present.tsv"
-MAC_RETRIES=3                                  # handoffs per file before it is left alone
+# Whether this process may read the online-only staged files, for the menu
+# (through avd-photos-status): "<epoch>\t<ok|denied>\t<errno text>", replaced by
+# a rename after every handoff that tried to read one. A run that read no stub
+# observed nothing and leaves it alone.
+MAC_ACCESS="$STATE_DIR/staging-access"
+MAC_RETRIES=3                                 # handoffs per file before it is left alone
 # A handoff the bridge has NO ENTRY for this long after the copy was lost on
 # the way (a copy that never settled, a folder emptied by hand): it counts as
 # a failure and is handed over again. A name the bridge does hold is the
@@ -481,6 +486,7 @@ mac_list_new() {
 mac_handoff() {  # [file of new staged paths]
   local newf batch rel name src_sz dst_sz room cap target evicted=0 empty=0 short=0 total_new clash own=0
   local hyd_end hyd_secs hydrated=0 hyd_slow=0 hyd_stub=0 hyd_err=0 hyd_untried=0
+  local hyd_tried=0 hyd_refused="" hyd_denied=0
   # A config file is a human's file (see mac_presence_pass): a bound that is not
   # a number falls back to the default rather than aborting the run under set -u,
   # and 10# keeps a digits-only "08" from being octal (an arithmetic error that
@@ -523,6 +529,11 @@ mac_handoff() {  # [file of new staged paths]
     # twice: per file, and by what is left of the run's budget, so a Drive that
     # serves nothing costs one budget per run and not the run.
     if is_dataless "$STAGING/$rel"; then
+      # A REFUSAL IS NOT PER FILE. When macOS refuses this process one read of
+      # the staging tree it refuses them all, and fast: on 2026-09-26 the
+      # launchd-run sync spent its whole 600 s budget on 2,667 refusals and
+      # handed nothing over. After the first, the rest are not read this run.
+      if [ -n "$hyd_refused" ]; then hyd_denied=$((hyd_denied + 1)); evicted=$((evicted + 1)); continue; fi
       hyd_secs=$((hyd_end - SECONDS))
       [ "$hyd_secs" -gt "$MAC_HYDRATE_TIMEOUT" ] && hyd_secs="$MAC_HYDRATE_TIMEOUT"
       if [ "$hyd_secs" -le 0 ]; then
@@ -535,12 +546,25 @@ mac_handoff() {  # [file of new staged paths]
       # and only the first is named, because a provider that fails fast would
       # fail every candidate the same way.
       case $? in
-        0)   hydrated=$((hydrated + 1)) ;;
-        124) hyd_slow=$((hyd_slow + 1)); evicted=$((evicted + 1))
+        0)   hyd_tried=1; hydrated=$((hydrated + 1)) ;;
+        124) hyd_tried=1; hyd_slow=$((hyd_slow + 1)); evicted=$((evicted + 1))
              log "  still online-only after ${hyd_secs}s of reading, left for the next run: $rel"; continue ;;
-        2)   hyd_err=$((hyd_err + 1)); evicted=$((evicted + 1))
+        2)   hyd_tried=1; hyd_err=$((hyd_err + 1)); evicted=$((evicted + 1))
+             # EPERM is TCC, which a Full Disk Access grant to the app this
+             # sync runs under fixes; EACCES is file modes, which it does not.
+             # Both refuse every file alike, so both stop the reading.
+             case "$HYDRATE_ERR" in
+               *"Operation not permitted"*)
+                 hyd_refused="$HYDRATE_ERR"
+                 log "  online-only files cannot be read: $HYDRATE_ERR -- Full Disk Access is needed by whatever runs this sync (Photo Sync.app); the rest are not read this run (first: $rel)"
+                 continue ;;
+               *"Permission denied"*)
+                 hyd_refused="$HYDRATE_ERR"
+                 log "  online-only files cannot be read: $HYDRATE_ERR -- the file modes refuse this user; the rest are not read this run (first: $rel)"
+                 continue ;;
+             esac
              [ "$hyd_err" -eq 1 ] && log "  an online-only file could not be read (the first of this run): $rel"; continue ;;
-        *)   hyd_stub=$((hyd_stub + 1)); evicted=$((evicted + 1))
+        *)   hyd_tried=1; hyd_stub=$((hyd_stub + 1)); evicted=$((evicted + 1))
              [ "$hyd_stub" -eq 1 ] && log "  still online-only after a full read (the first of this run): $rel"; continue ;;
       esac
     fi
@@ -566,7 +590,13 @@ mac_handoff() {  # [file of new staged paths]
   done < "$batch"
   log "staged $MAC_STAGED media file(s); new since last run: $total_new; handed to Google Photos $MAC_HANDED (cap $cap), short $short, hydrated $hydrated, evicted-skipped $evicted, empty-skipped $empty; given up after $MAC_RETRIES failures so far: $(mac_given_up | mac_count)"
   [ "$evicted" -gt 0 ] \
-    && log "  online-only files not handed over: $hyd_slow still blocked after the ${MAC_HYDRATE_TIMEOUT}s per-file bound, $hyd_stub still online-only after a full read, $hyd_err unreadable, $hyd_untried not tried (the ${MAC_HYDRATE_BUDGET}s hydration budget was spent, or MAC_HYDRATE_TIMEOUT is 0)"
+    && log "  online-only files not handed over: $hyd_slow still blocked after the ${MAC_HYDRATE_TIMEOUT}s per-file bound, $hyd_stub still online-only after a full read, $hyd_err unreadable, $hyd_untried not tried (the ${MAC_HYDRATE_BUDGET}s hydration budget was spent, or MAC_HYDRATE_TIMEOUT is 0)$([ -n "$hyd_refused" ] && printf ', %s not read because reading was refused' "$hyd_denied")"
+  if [ "$hyd_tried" -eq 1 ]; then
+    { if [ -n "$hyd_refused" ]; then printf '%s\tdenied\t%s\n' "$(date +%s)" "$hyd_refused"
+      else printf '%s\tok\t\n' "$(date +%s)"; fi; } > "$MAC_ACCESS.tmp" 2>/dev/null \
+      && mv -f "$MAC_ACCESS.tmp" "$MAC_ACCESS" 2>/dev/null
+    rm -f "$MAC_ACCESS.tmp" 2>/dev/null
+  fi
   [ "$total_new" -gt "$MAC_HANDED" ] && log "$((total_new - MAC_HANDED)) left for the next run"
   [ "$own" -eq 1 ] && rm -f "$newf"
   rm -f "$batch"
