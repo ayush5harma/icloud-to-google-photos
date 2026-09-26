@@ -480,11 +480,13 @@ mac_list_new() {
 # from anywhere else is still complete.
 mac_handoff() {  # [file of new staged paths]
   local newf batch rel name src_sz dst_sz room cap target evicted=0 empty=0 short=0 total_new clash own=0
-  local hyd_end hyd_secs hydrated=0 hyd_slow=0 hyd_stub=0 hyd_untried=0
+  local hyd_end hyd_secs hydrated=0 hyd_slow=0 hyd_stub=0 hyd_err=0 hyd_untried=0
   # A config file is a human's file (see mac_presence_pass): a bound that is not
-  # a number falls back to the default rather than aborting the run under set -u.
-  case "${MAC_HYDRATE_TIMEOUT:-}" in ''|*[!0-9]*) MAC_HYDRATE_TIMEOUT=120 ;; esac
-  case "${MAC_HYDRATE_BUDGET:-}" in ''|*[!0-9]*) MAC_HYDRATE_BUDGET=600 ;; esac
+  # a number falls back to the default rather than aborting the run under set -u,
+  # and 10# keeps a digits-only "08" from being octal (an arithmetic error that
+  # would abort the handoff).
+  case "${MAC_HYDRATE_TIMEOUT:-}" in ''|*[!0-9]*) MAC_HYDRATE_TIMEOUT=120 ;; *) MAC_HYDRATE_TIMEOUT=$((10#$MAC_HYDRATE_TIMEOUT)) ;; esac
+  case "${MAC_HYDRATE_BUDGET:-}" in ''|*[!0-9]*) MAC_HYDRATE_BUDGET=600 ;; *) MAC_HYDRATE_BUDGET=$((10#$MAC_HYDRATE_BUDGET)) ;; esac
   hyd_end=$((SECONDS + MAC_HYDRATE_BUDGET))
   batch="$(mktemp)"
   rm -f "$MAC_INBOX"/.incoming-* 2>/dev/null
@@ -526,12 +528,20 @@ mac_handoff() {  # [file of new staged paths]
       if [ "$hyd_secs" -le 0 ]; then
         hyd_untried=$((hyd_untried + 1)); evicted=$((evicted + 1)); continue
       fi
-      [ "$hydrated" -eq 0 ] && phase "fetching online-only staged files from the cloud"
+      phase "pushing $(count_lines "$batch") of $target to Google Photos: fetching an online-only file"
       hydrate_bounded "$STAGING/$rel" "$hyd_secs"
+      # Timeouts are named, since each costs up to the per-file bound every run
+      # and the budget caps how many there can be; the other two are counted
+      # and only the first is named, because a provider that fails fast would
+      # fail every candidate the same way.
       case $? in
         0)   hydrated=$((hydrated + 1)) ;;
-        124) hyd_slow=$((hyd_slow + 1)); evicted=$((evicted + 1)); continue ;;
-        *)   hyd_stub=$((hyd_stub + 1)); evicted=$((evicted + 1)); continue ;;
+        124) hyd_slow=$((hyd_slow + 1)); evicted=$((evicted + 1))
+             log "  still online-only after ${hyd_secs}s of reading, left for the next run: $rel"; continue ;;
+        2)   hyd_err=$((hyd_err + 1)); evicted=$((evicted + 1))
+             [ "$hyd_err" -eq 1 ] && log "  an online-only file could not be read (the first of this run): $rel"; continue ;;
+        *)   hyd_stub=$((hyd_stub + 1)); evicted=$((evicted + 1))
+             [ "$hyd_stub" -eq 1 ] && log "  still online-only after a full read (the first of this run): $rel"; continue ;;
       esac
     fi
     src_sz="$(/usr/bin/stat -f %z "$STAGING/$rel" 2>/dev/null || echo 0)"
@@ -556,7 +566,7 @@ mac_handoff() {  # [file of new staged paths]
   done < "$batch"
   log "staged $MAC_STAGED media file(s); new since last run: $total_new; handed to Google Photos $MAC_HANDED (cap $cap), short $short, hydrated $hydrated, evicted-skipped $evicted, empty-skipped $empty; given up after $MAC_RETRIES failures so far: $(mac_given_up | mac_count)"
   [ "$evicted" -gt 0 ] \
-    && log "  online-only files not handed over: $hyd_slow still blocked after the ${MAC_HYDRATE_TIMEOUT}s per-file bound, $hyd_stub still online-only after a full read, $hyd_untried not tried (the ${MAC_HYDRATE_BUDGET}s hydration budget was spent, or MAC_HYDRATE_TIMEOUT is 0)"
+    && log "  online-only files not handed over: $hyd_slow still blocked after the ${MAC_HYDRATE_TIMEOUT}s per-file bound, $hyd_stub still online-only after a full read, $hyd_err unreadable, $hyd_untried not tried (the ${MAC_HYDRATE_BUDGET}s hydration budget was spent, or MAC_HYDRATE_TIMEOUT is 0)"
   [ "$total_new" -gt "$MAC_HANDED" ] && log "$((total_new - MAC_HANDED)) left for the next run"
   [ "$own" -eq 1 ] && rm -f "$newf"
   rm -f "$batch"

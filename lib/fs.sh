@@ -59,19 +59,24 @@ is_dataless() {
 # 5 ms). Skipping them all on the metadata check alone handed nothing to Google
 # Photos for hours.
 #   0    the read finished and the file is no longer dataless
-#   1    the read failed, or finished and the file is still a stub
+#   1    the read finished and the file is still a stub
+#   2    the read itself failed (an I/O error, a file gone mid-run)
 #   124  the read was still going at <secs> and was killed
-# Polls every 0.1 s, because most reads take a second or two. After the kill it
-# waits at most a second for the reader to go: a read blocked in the kernel may
-# not die on SIGKILL, and a plain `wait` would then hang exactly the way the
-# bound exists to prevent. That reap sits in a stderr-silenced group, or bash
-# prints its "Killed: 9" job notice at the next command.
+# Polls every 0.1 s, because most reads take a second or two; the bound is
+# checked against SECONDS as well, so the fork of each sleep cannot stretch it
+# past <secs> + 1. After the kill it waits at most a second for the reader to
+# go: a read blocked in the kernel may not die on SIGKILL, and a plain `wait`
+# would then hang exactly the way the bound exists to prevent. That reap sits in
+# a stderr-silenced group, or bash prints its "Killed: 9" job notice at the next
+# command.
 hydrate_bounded() {
-  local f="$1" secs="$2" pid rc n=0
-  case "$secs" in ''|*[!0-9]*) secs=0 ;; esac
+  local f="$1" secs="$2" pid rc n=0 end
+  # 10#: a digits-only "08" is otherwise octal to $(( )) and aborts the caller.
+  case "$secs" in ''|*[!0-9]*) secs=0 ;; *) secs=$((10#$secs)) ;; esac
+  end=$((SECONDS + secs + 1))
   /bin/cat -- "$f" >/dev/null 2>&1 </dev/null & pid=$!
   while kill -0 "$pid" 2>/dev/null; do
-    if [ "$n" -ge $((secs * 10)) ]; then
+    if [ "$n" -ge $((secs * 10)) ] || [ "$SECONDS" -ge "$end" ]; then
       kill -9 "$pid" 2>/dev/null
       { n=0; while kill -0 "$pid" && [ "$n" -lt 10 ]; do sleep 0.1; n=$((n + 1)); done
         kill -0 "$pid" || wait "$pid"; } 2>/dev/null
@@ -80,7 +85,7 @@ hydrate_bounded() {
     sleep 0.1; n=$((n + 1))
   done
   wait "$pid"; rc=$?
-  [ "$rc" -eq 0 ] || return 1
+  [ "$rc" -eq 0 ] || return 2
   is_dataless "$f" && return 1
   return 0
 }
