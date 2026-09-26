@@ -103,6 +103,9 @@ gp_present() {
 sha8() { msg_sha1 "$1" | cut -c1-8; }
 rows() { [ -r "$MSG_STATE" ] && grep -c . "$MSG_STATE" || echo 0; }
 field() { awk -F'\t' -v g="$1" -v f="$2" '$1 == g { print $f }' "$MSG_STATE"; }
+# The status line the menu reads through avd-photos-status: epoch, state,
+# ledger rows, reason, tab-separated.
+st() { cut -f"$1" "$MSG_STATUS" 2>/dev/null; }
 
 echo "the scan"
 msg_scan
@@ -129,6 +132,11 @@ check "the staged path carries the date's year and month" \
   test -f "$STAGING/messages/$(date -r $AUG +%Y/%m)/$(sha8 "$A/06/late.PNG")-late.PNG"
 check "the log says what it did" grep -qE 'Messages source: 5 media attachment\(s\) seen, 4 new, 3 staged, 1 already in Google Photos, 1 with no bytes' <<<"$LOGGED"
 check "the counters agree with it" test "$MSG_STAGED/$MSG_PRESENT/$MSG_SEEN" = "3/1/5"
+check "the scan leaves a status line: ok, with the ledger's row count" \
+  test "$(st 2)/$(st 3)" = "ok/$(rows)"
+check "stamped now, and one line of exactly four fields" \
+  test "$(( $(date +%s) - $(st 1) ))" -lt 60 -a "$(grep -c . "$MSG_STATUS")" = 1 \
+    -a "$(awk -F'\t' '{ print NF }' "$MSG_STATUS")" = 4
 
 echo "a half-copied file"
 # The staging enumeration selects on the extension alone, so a partial copy
@@ -214,6 +222,8 @@ msg_scan; rc=$?
 check "an unreadable database is not reported as an empty one" \
   test "$rc" = 0 && grep -q 'could not be queried' <<<"$LOGGED"
 check "and no copy of anyone's messages is left behind" test -z "$MSG_SNAP"
+check "the status says skipped and why, not ok" \
+  test "$(st 2)" = skipped && grep -q 'could not be queried' <<<"$(st 4)"
 MESSAGES_DB="$SAVED_DB"
 
 echo "the per-tick budget"
@@ -271,6 +281,11 @@ check "the scan does not fail the tick" test "$rc" = 0
 check "it logs exactly one line, naming the reason" \
   test "$(grep -c . <<<"$LOGGED")" = 1 && grep -q 'Messages source skipped: cannot read' <<<"$LOGGED"
 check "and changes no ledger" test "$(rows)" = "$BEFORE"
+# chmod gives EPERM's cousin EACCES ("Permission denied"); TCC's refusal on the
+# real Mac reads "Operation not permitted". Either way the reason is macOS's
+# own words, for the menu to recognise, and the ledger count survives the skip.
+check "the status says skipped, with macOS's reason and the count kept" \
+  test "$(st 2)/$(st 3)/$(st 4)" = "skipped/$BEFORE/Permission denied"
 
 echo "off by default"
 LOGGED=""
@@ -278,6 +293,8 @@ LOGGED=""
 MESSAGES_SOURCE=0
 msg_scan
 check "MESSAGES_SOURCE=0 is a no-op, and silent" test -z "$LOGGED"
+check "and writes no status (the collector reports off from the config)" \
+  test "$(rm -f "$MSG_STATUS"; msg_scan; [ -e "$MSG_STATUS" ] && echo yes)" = ""
 
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
