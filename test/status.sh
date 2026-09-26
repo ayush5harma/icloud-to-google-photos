@@ -67,6 +67,15 @@ check "the output still parses" parses
 check "and the reason survives, less the quote and backslash" \
   test "$(get messages.reason)" = "chat.db could not be queried: near x: syntax error"
 
+# The collector runs under LC_ALL=C, where cut counts BYTES: a long reason cut
+# through a multibyte character is invalid UTF-8, JSONSerialization refuses the
+# whole blob, and the menu loses every row, photo sync included.
+long="$(printf 'x%.0s' $(seq 1 159))é and more"
+printf '%s%sskipped%s3%s%s\n' "$(date +%s)" "$tab" "$tab" "$tab" "$long" > "$STATUS"
+run
+check "a long non-ASCII reason cannot split a character and break the JSON" \
+  test "$(LC_ALL=C tr -d '\040-\176' < "$T/out.json" | wc -c | tr -d ' ')" = 1
+
 echo "a status line that is not one"
 printf 'garbage\n' > "$STATUS"; run
 check "an unreadable line is unknown, and the JSON still parses" \

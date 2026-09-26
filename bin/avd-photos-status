@@ -208,7 +208,9 @@ if [ "${MESSAGES_SOURCE:-0}" = 1 ]; then
           ok|skipped)
             msg_state="$m_state"; msg_count="$m_count"
             msg_age=$(( $(date +%s) - m_ts )); [ "$msg_age" -lt 0 ] && msg_age=0
-            msg_reason="$(printf '%s' "${m_reason:-}" | tr -d '"\\' | tr -d '\000-\037' | cut -c1-160)" ;;
+            # Printable ASCII before the cut: under LC_ALL=C cut counts bytes,
+            # and half a UTF-8 character makes the WHOLE blob unparseable.
+            msg_reason="$(printf '%s' "${m_reason:-}" | LC_ALL=C tr -cd '\040-\176' | tr -d '"\\' | cut -c1-160)" ;;
         esac ;;
     esac
   fi

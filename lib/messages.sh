@@ -118,11 +118,14 @@ msg_kind() {
 }
 
 # Replaced by a rename, so the collector never reads half a line; a status that
-# cannot be written costs the menu a row, never the tick.
+# cannot be written costs the menu a row, never the tick. The reason keeps
+# printable ASCII only: that drops the tab and newline this line is split on,
+# and under LC_ALL=C cut counts bytes, so a cut through a multibyte character
+# would hand the collector invalid UTF-8 and the menu an unparseable blob.
 msg_status() {  # <ok|skipped> [reason]
   local n=0 reason
   [ -r "$MSG_STATE" ] && n="$(grep -c . "$MSG_STATE" 2>/dev/null)"
-  reason="$(printf '%s' "${2:-}" | tr -d '\000-\037' | cut -c1-160)"
+  reason="$(printf '%s' "${2:-}" | LC_ALL=C tr -cd '\040-\176' | cut -c1-160)"
   printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$1" "${n:-0}" "$reason" > "$MSG_STATUS.tmp" 2>/dev/null \
     && mv -f "$MSG_STATUS.tmp" "$MSG_STATUS" 2>/dev/null
   rm -f "$MSG_STATUS.tmp" 2>/dev/null
@@ -351,7 +354,7 @@ msg_scan() {
     msg_status skipped "$MSG_UNREADABLE"
     return 0
   fi
-  snap="$(mktemp -d)" || return 0
+  snap="$(mktemp -d)" || { msg_status skipped "could not make a temporary directory"; return 0; }
   MSG_SNAP="$snap"
   if ! msg_db_snapshot "$snap"; then
     log "Messages source skipped: could not copy $MESSAGES_DB (with its -wal and -shm) — nothing was read"
