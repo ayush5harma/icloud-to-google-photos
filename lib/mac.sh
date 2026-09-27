@@ -561,12 +561,19 @@ mac_handoff() {  # [file of new staged paths]
              # single unreadable file first in the list would block every
              # read on every run.
              case "$HYDRATE_ERR" in
+               *"Resource deadlock avoided"*)
+                 # EDEADLK: this process may not materialize dataless files at
+                 # all (launchd's default for jobs, measured 2026-09-27), so it
+                 # refuses every stub alike -- stop, and say how to fix it.
+                 hyd_refused="$HYDRATE_ERR"
+                 log "  online-only files cannot be read: $HYDRATE_ERR -- dataless materialization is off for this process; set MaterializeDatalessFiles in its launchd job (launchd.plist(5)); the rest are not read this run (first: $rel)"
+                 continue ;;
                *"Operation not permitted"*)
                  hyd_refused="$HYDRATE_ERR"
                  log "  online-only files cannot be read: $HYDRATE_ERR -- Full Disk Access is needed by whatever runs this sync (Photo Sync.app); the rest are not read this run (first: $rel)"
                  continue ;;
              esac
-             [ "$hyd_err" -eq 1 ] && log "  an online-only file could not be read (the first of this run): $rel"; continue ;;
+             [ "$hyd_err" -eq 1 ] && log "  an online-only file could not be read (the first of this run): $rel: ${HYDRATE_ERR:-no error text}"; continue ;;
         *)   hyd_tried=1; hyd_stub=$((hyd_stub + 1)); evicted=$((evicted + 1))
              [ "$hyd_stub" -eq 1 ] && log "  still online-only after a full read (the first of this run): $rel"; continue ;;
       esac
