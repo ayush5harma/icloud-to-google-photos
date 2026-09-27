@@ -267,6 +267,20 @@ check "the counts keep their meanings, and the refused ones are their own" \
   grep -q '0 still online-only after a full read, 1 unreadable, 0 not tried (.*), 2 not read because reading was refused' <<<"$LOGGED"
 check "the staging-access line says denied, with macOS's words" \
   test "$(cut -f2,3 "$MAC_ACCESS")" = "denied$(printf '\t')Operation not permitted"
+echo "online-only files this process may not materialize"
+# Measured 2026-09-27 on Caraxes: a launchd job runs with dataless
+# materialization OFF (getiopolicy_np 1; a terminal reads 2), and a read of a
+# Drive stub then fails with EDEADLK -- 2441 "unreadable" per run, fast enough
+# to spend the whole budget. Every stub fails alike, so it stops the reading.
+: > "$READS"
+hydrate_read() { printf '%s\n' "$1" >> "$READS"; printf 'cat: %s: Resource deadlock avoided\n' "$1" >&2; return 1; }
+LOGGED=""; MAC_HANDED=0
+printf 'hyd/P1.JPG\nhyd/P2.JPG\nhyd/P3.JPG\n' > "$T/hyd.list"
+mac_handoff "$T/hyd.list"
+check "EDEADLK stops hydration for the run too: one read, not three" test "$(grep -c . "$READS")" = 1
+check "one line names the materialization policy and the launchd key" \
+  test "$(grep -c 'dataless materialization is off for this process; set MaterializeDatalessFiles in its launchd job' <<<"$LOGGED")" = 1
+check "nothing is handed over" test "$MAC_HANDED" = 0
 # shellcheck disable=SC1091
 . "$HERE/../lib/fs.sh"   # the real reader back, which brings the real flag test too
 is_dataless() { grep -qxF "$1" "$DATALESS" 2>/dev/null; }
